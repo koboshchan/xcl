@@ -226,8 +226,8 @@ struct State {
     /// decommits and commits again thousands of tiles a second, and each `UpdateTileMappings`
     /// took ~0.15 ms.)
     parked: FxHashMap<usize, (u32, u32)>,
-    /// placed buffers → the pool tiles they use
-    buffers: FxHashMap<usize, Vec<(u32, u32)>>,
+    /// generation of this `State` (matches `PLACED.state_gen` so stale deferred unpins are ignored)
+    state_gen: u64,
     /// reused tiles / decommitted partial pages to clear: (address, bytes)
     to_zero: Vec<(usize, usize)>,
     /// ring-buffered upload staging heap (`STAGING` bytes, persistently mapped)
@@ -405,6 +405,26 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 /// (a list's `Reset`, with `XCL_DRED=1` on every start): the two then waited for each other.
 static QUEUE: Mutex<Option<ID3D12CommandQueue>> = Mutex::new(None);
 
+/// Placed buffers and deferred unpins, outside `STATE` (`forget_buffer`). `STATE` is held
+/// around D3D12 calls (`begin_slot`'s allocator `Reset`), and `res_release` calls `forget_buffer`
+/// from inside D3D12 calls (such as a list's `Reset` with `XCL_DRED=1`), so `forget_buffer` must
+/// never block on `STATE`.
+struct PlacedBuffers {
+    state_gen: u64,
+    buffers: Option<FxHashMap<usize, Vec<(u32, u32)>>>,
+    pending_unpins: Vec<(u32, u32)>,
+}
+
+static PLACED: Mutex<PlacedBuffers> = Mutex::new(PlacedBuffers {
+    state_gen: 0,
+    buffers: None,
+    pending_unpins: Vec::new(),
+});
+
+/// Sparse UMA reservations whose `res_release` could not lock `STATE` without blocking: kept
+/// reserved until drained under `STATE` so their addresses are still decommitted before reuse.
+static PENDING_FREES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
 /// (bytes of video memory in pool heaps, of those mapped) – `XCL_ACTIVITY`
 pub fn pool_bytes() -> (usize, usize) {
     let g = STATE.lock().unwrap();
@@ -546,7 +566,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             mapped: FxHashMap::default(),
             pinned: FxHashMap::default(),
             parked: FxHashMap::default(),
-            buffers: FxHashMap::default(),
+            state_gen: 0,
             to_zero: Vec::new(),
             staging: None,
             ring_write: 0,
@@ -566,13 +586,21 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
         })
     })();
     match made {
-        Ok(s) => {
+        Ok(mut s) => {
             crate::xlog_info!("D3D12.X: {} sparse window(s) for the title's own memory (tiled buffers on video memory)", out.len());
             // a state this replaces (the windows set up again) goes after the lock: the release of
-            // its last buffers reaches `forget_buffer`, which takes the lock (#344)
+            // its last buffers reaches `forget_buffer`, which may lock `PLACED` (#344)
             // (the queue first: `queue()` never answers with one older than the state's)
             let old_queue = QUEUE.lock().unwrap().replace(s.queue.clone());
-            let old = STATE.lock().unwrap().replace(s);
+            let old = {
+                let mut g = STATE.lock().unwrap();
+                let mut p = PLACED.lock().unwrap();
+                p.state_gen = p.state_gen.wrapping_add(1);
+                p.buffers = None;
+                p.pending_unpins.clear();
+                s.state_gen = p.state_gen;
+                g.replace(s)
+            };
             drop(old);
             drop(old_queue);
             for (a, b) in std::mem::take(&mut *EARLY.lock().unwrap()) {
@@ -594,6 +622,7 @@ impl State {
     }
 
     unsafe fn take_tile(&mut self) -> Option<((u32, u32), bool)> {
+        self.drain_unpins();
         if self.free.is_empty() {
             self.flush_parked();
         }
@@ -1222,6 +1251,36 @@ pub unsafe fn free(p: usize) -> bool {
     u.sparse_release(p).is_some()
 }
 
+/// Like [`free`], without blocking on `STATE`: called from `res_release`, which D3D12 can invoke
+/// while holding its own lock (such as a list's `Reset` with `XCL_DRED=1`). If `STATE` is busy,
+/// the reservation stays held until drained under `STATE` so its pages are still decommitted
+/// before the address can be reused.
+pub unsafe fn free_nonblocking(p: usize) {
+    let Some(u) = crate::gpu::uma::get() else { return };
+    if !u.is_sparse(p) {
+        return;
+    }
+    let Some((start, len)) = u.sparse_reservation(p).filter(|&(start, _)| start == p) else { return };
+    match STATE.try_lock() {
+        Ok(mut g) => {
+            if let Some(s) = g.as_mut() {
+                s.drain_deferred();
+                s.decommit_range(start, len);
+            } else {
+                let (a, b) = page_span(start, len);
+                early_remove(&mut EARLY.lock().unwrap(), a, b);
+            }
+            drop(g);
+            VirtualFree(p as *mut c_void, len, MEM_DECOMMIT);
+            u.sparse_release(p);
+        }
+        Err(std::sync::TryLockError::WouldBlock) => {
+            PENDING_FREES.lock().unwrap().push((start, len));
+        }
+        Err(std::sync::TryLockError::Poisoned(_)) => {}
+    }
+}
+
 /// After `queue.ExecuteCommandLists`: copy GPU-written sparse ranges (e.g. `Write32/64`,
 /// `FillMemoryWith32BitValueX`, `CopyMemoryToMemoryX`) back to their CPU view so CPU reads
 /// and spin-waits see the GPU writes without clobbering `sent` hashes.
@@ -1334,6 +1393,7 @@ pub unsafe fn decommitted(a: usize, n: usize) {
         early_remove(&mut EARLY.lock().unwrap(), start, end);
         return;
     };
+    s.drain_deferred();
     s.decommit_range(a, n);
 }
 
@@ -1395,6 +1455,44 @@ impl State {
     fn release_if_unused(&mut self, tile: (u32, u32)) {
         if !self.pinned.contains_key(&tile) && !self.mapped.values().any(|e| e.pool == tile) && !self.parked.values().any(|&p| p == tile) {
             self.free.push(tile);
+        }
+    }
+
+    fn unpin_tiles(&mut self, tiles: &[(u32, u32)]) {
+        for &tile in tiles {
+            if let Some(c) = self.pinned.get_mut(&tile) {
+                *c -= 1;
+                if *c == 0 {
+                    self.pinned.remove(&tile);
+                    self.release_if_unused(tile);
+                }
+            }
+        }
+    }
+
+    fn drain_unpins(&mut self) {
+        let tiles = {
+            let mut p = PLACED.lock().unwrap();
+            if p.state_gen != self.state_gen || p.pending_unpins.is_empty() {
+                return;
+            }
+            std::mem::take(&mut p.pending_unpins)
+        };
+        self.unpin_tiles(&tiles);
+    }
+
+    unsafe fn drain_deferred(&mut self) {
+        self.drain_unpins();
+        let frees = std::mem::take(&mut *PENDING_FREES.lock().unwrap());
+        if !frees.is_empty() {
+            let u = crate::gpu::uma::get();
+            for (p, len) in frees {
+                self.decommit_range(p, len);
+                VirtualFree(p as *mut c_void, len, MEM_DECOMMIT);
+                if let Some(u) = u {
+                    u.sparse_release(p);
+                }
+            }
         }
     }
 
@@ -1460,6 +1558,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let t0 = std::time::Instant::now();
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else { return };
+    s.drain_deferred();
     // the title's work sees what was decommitted unmapped, as it was
     if s.flush_parked() {
         s.retire_free_pools();
@@ -1548,6 +1647,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
 pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<(crate::util::HRESULT, usize)> {
     let mut g = STATE.lock().unwrap();
     let s = g.as_mut()?;
+    s.drain_deferred();
     let start = va & !(TILE - 1);
     let delta = va - start;
     let bytes = desc.Width as usize;
@@ -1579,24 +1679,41 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     for &(_, tile) in &tiles {
         *s.pinned.entry(tile).or_default() += 1;
     }
-    s.buffers.insert(raw as usize, tiles.iter().map(|x| x.1).collect());
+    {
+        let mut p = PLACED.lock().unwrap();
+        p.buffers
+            .get_or_insert_with(FxHashMap::default)
+            .insert(raw as usize, tiles.iter().map(|x| x.1).collect());
+    }
     s.signal();
     Some((hr, delta))
 }
 
 /// A placed buffer is gone: its tiles are not pinned by it any more.
+/// Never blocks on `STATE`: `res_release` calls this from inside D3D12 calls (such as a list's
+/// `Reset` with `XCL_DRED=1`) while another thread may hold `STATE` across a D3D12 call.
 pub fn forget_buffer(res: usize) {
-    let mut g = STATE.lock().unwrap();
-    let Some(s) = g.as_mut() else { return };
-    let Some(tiles) = s.buffers.remove(&res) else { return };
-    for tile in tiles {
-        if let Some(c) = s.pinned.get_mut(&tile) {
-            *c -= 1;
-            if *c == 0 {
-                s.pinned.remove(&tile);
-                s.release_if_unused(tile);
+    let (state_gen, tiles) = {
+        let mut p = PLACED.lock().unwrap();
+        let Some(tiles) = p.buffers.as_mut().and_then(|m| m.remove(&res)) else { return };
+        (p.state_gen, tiles)
+    };
+    match STATE.try_lock() {
+        Ok(mut g) => {
+            if let Some(s) = g.as_mut() {
+                if s.state_gen == state_gen {
+                    s.unpin_tiles(&tiles);
+                    s.drain_unpins();
+                }
             }
         }
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let mut p = PLACED.lock().unwrap();
+            if p.state_gen == state_gen {
+                p.pending_unpins.extend(tiles);
+            }
+        }
+        Err(std::sync::TryLockError::Poisoned(_)) => {}
     }
 }
 
@@ -1619,6 +1736,41 @@ mod tests {
         drop(held);
         asked.join().unwrap();
         assert!(answered, "queue() waited for the sparse state's lock");
+    }
+
+    /// `forget_buffer` and `free_nonblocking` return without waiting for `STATE`: `res_release`
+    /// calls both from inside D3D12 calls (such as a list's `Reset` with `XCL_DRED=1`) while
+    /// another thread may hold `STATE` across a D3D12 call (an upload's allocator `Reset`).
+    #[test]
+    fn forget_buffer_and_free_do_not_wait_while_the_state_is_locked() {
+        const FAKE_RES: usize = 0xDEAD_BEEF;
+        const FAKE_TILE: (u32, u32) = (999, 999);
+        let held = STATE.lock().unwrap();
+        let saved_gen = {
+            let mut p = PLACED.lock().unwrap();
+            p.buffers.get_or_insert_with(FxHashMap::default).insert(FAKE_RES, vec![FAKE_TILE]);
+            p.state_gen
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let released = std::thread::spawn(move || {
+            forget_buffer(FAKE_RES);
+            unsafe { free_nonblocking(0) };
+            let _ = tx.send(());
+        });
+        let finished = rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+        let queued = {
+            let mut p = PLACED.lock().unwrap();
+            let had = p.state_gen == saved_gen && p.pending_unpins.contains(&FAKE_TILE);
+            p.pending_unpins.retain(|&t| t != FAKE_TILE);
+            if let Some(m) = p.buffers.as_mut() {
+                m.remove(&FAKE_RES);
+            }
+            had
+        };
+        drop(held);
+        released.join().unwrap();
+        assert!(finished, "forget_buffer / free_nonblocking waited for the sparse state's lock");
+        assert!(queued, "deferred unpin was not queued while STATE was locked");
     }
 
     /// A block freed on one thread while another allocates: its address goes back to the
@@ -1684,7 +1836,7 @@ mod tests {
                 parked: FxHashMap::default(),
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
-                buffers: FxHashMap::default(),
+                state_gen: 0,
                 to_zero: Vec::new(),
                 staging: None,
                 ring_write: 0,
@@ -1890,7 +2042,7 @@ mod tests {
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
-                buffers: FxHashMap::default(),
+                state_gen: 0,
                 to_zero: Vec::new(),
                 staging: None,
                 ring_write: 0,
@@ -1985,7 +2137,7 @@ mod tests {
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
-                buffers: FxHashMap::default(),
+                state_gen: 0,
                 to_zero: Vec::new(),
                 staging: None,
                 ring_write: 0,
