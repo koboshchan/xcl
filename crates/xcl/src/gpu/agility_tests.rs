@@ -243,3 +243,11 @@ fn resolve_dir_handles_explicit_override_and_implicit_fallback() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn relative_sdk_path_computes_same_drive_paths() {
+    assert_eq!(relative_sdk_path(Path::new(r"C:\xcl\bin"), Path::new(r"C:\xcl\d3d12")), Some(PathBuf::from(r"..\d3d12")));
+    assert_eq!(relative_sdk_path(Path::new(r"C:\xcl\bin"), Path::new(r"C:\xcl\bin\D3D12")), Some(PathBuf::from("D3D12")));
+    assert_eq!(relative_sdk_path(Path::new(r"C:\xcl\bin"), Path::new(r"C:\xcl\bin")), Some(PathBuf::from(".")));
+    assert_eq!(relative_sdk_path(Path::new(r"C:\xcl\bin"), Path::new(r"D:\d3d12")), None);
+}

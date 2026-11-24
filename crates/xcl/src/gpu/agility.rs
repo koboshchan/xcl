@@ -32,9 +32,10 @@ pub const ENV: &str = "XCL_D3D12_DIR";
 /// Result of attempting to load the Agility SDK once for this process.
 #[derive(Debug)]
 pub enum State {
-    /// Loaded through `ID3D12SDKConfiguration1::CreateDeviceFactory`.
+    /// Loaded through `ID3D12SDKConfiguration1::CreateDeviceFactory` (`Some(factory)`)
+    /// or `ID3D12SDKConfiguration::SetSDKVersion` (`None`, global D3D12 state).
     Loaded {
-        factory: ID3D12DeviceFactory,
+        factory: Option<ID3D12DeviceFactory>,
         version: u32,
         dir: PathBuf,
     },
@@ -225,7 +226,7 @@ fn init() -> State {
     let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
     let local_app_data = clean_env_path(std::env::var_os("LOCALAPPDATA"));
 
-    let (dir, version) = match resolve_dir(env_dir, exe_dir, local_app_data) {
+    let (dir, version) = match resolve_dir(env_dir, exe_dir.clone(), local_app_data) {
         DirResolution::Found { dir, version } => (dir, version),
         DirResolution::NotFound => return State::NotFound,
         DirResolution::Unavailable(reason) => return State::Unavailable(reason),
@@ -239,10 +240,52 @@ fn init() -> State {
         Err(err) => return State::Unavailable(err),
     };
 
-    match create_factory(version, &abs_dir, &path_cstr) {
+    match create_factory(version, &abs_dir, exe_dir.as_deref(), &path_cstr) {
         Ok(factory) => State::Loaded { factory, version, dir: abs_dir },
         Err(err) => State::Unavailable(err),
     }
+}
+
+/// Compute a relative path from `from_dir` to `to_dir` when both share the same root/prefix,
+/// as required by `ID3D12SDKConfiguration::SetSDKVersion` (pre-KB5029331 Windows 10).
+pub(crate) fn relative_sdk_path(from_dir: &Path, to_dir: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let from_c: Vec<Component<'_>> = from_dir.components().collect();
+    let to_c: Vec<Component<'_>> = to_dir.components().collect();
+    let mut common = 0;
+    while common < from_c.len() && common < to_c.len() {
+        let eq = match (&from_c[common], &to_c[common]) {
+            (Component::Prefix(a), Component::Prefix(b)) => {
+                a.as_os_str().to_string_lossy().eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+            }
+            (Component::Normal(a), Component::Normal(b)) => {
+                a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+            }
+            (a, b) => a == b,
+        };
+        if !eq {
+            break;
+        }
+        common += 1;
+    }
+    // Must share at least prefix + root (or prefix) so the result stays relative on the same drive.
+    if common == 0 || matches!(to_c.first(), Some(Component::Prefix(_))) && common < 2 {
+        return None;
+    }
+    let mut rel = PathBuf::new();
+    for c in &from_c[common..] {
+        if matches!(c, Component::Normal(_)) {
+            rel.push("..");
+        }
+    }
+    for c in &to_c[common..] {
+        rel.push(c.as_os_str());
+    }
+    if rel.as_os_str().is_empty() {
+        rel.push(".");
+    }
+    Some(rel)
 }
 
 type D3D12GetInterfaceFn = unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut std::ffi::c_void) -> windows::core::HRESULT;
@@ -260,7 +303,12 @@ unsafe fn resolve_d3d12_get_interface() -> Result<D3D12GetInterfaceFn, String> {
     Ok(std::mem::transmute::<_, D3D12GetInterfaceFn>(sym))
 }
 
-fn create_factory(version: u32, dir: &Path, path_cstr: &CString) -> Result<ID3D12DeviceFactory, String> {
+fn create_factory(
+    version: u32,
+    dir: &Path,
+    exe_dir: Option<&Path>,
+    path_cstr: &CString,
+) -> Result<Option<ID3D12DeviceFactory>, String> {
     // SAFETY: `D3D12GetInterface` (resolved dynamically so pre-2004 Windows 10 builds do not
     // fail at IAT load time) writes a COM interface pointer on success into `cfg_raw`.
     // `ID3D12SDKConfiguration1::CreateDeviceFactory` takes a valid NUL-terminated ANSI path
@@ -268,9 +316,32 @@ fn create_factory(version: u32, dir: &Path, path_cstr: &CString) -> Result<ID3D1
     unsafe {
         let get_iface = resolve_d3d12_get_interface()?;
         let mut cfg_raw: *mut std::ffi::c_void = std::ptr::null_mut();
-        get_iface(&CLSID_D3D12SDKConfiguration, &ID3D12SDKConfiguration1::IID, &mut cfg_raw)
-            .ok()
-            .map_err(|e| format!("ID3D12SDKConfiguration1 unavailable (update Windows 10 to 22H2 KB5029331+): {e}"))?;
+        if let Err(err1) = get_iface(&CLSID_D3D12SDKConfiguration, &ID3D12SDKConfiguration1::IID, &mut cfg_raw).ok() {
+            // Pre-KB5029331 Windows 10 (2004..22H2) only exposes ID3D12SDKConfiguration, which
+            // requires Developer Mode and a path relative to the executable directory.
+            let mut cfg0_raw: *mut std::ffi::c_void = std::ptr::null_mut();
+            if get_iface(&CLSID_D3D12SDKConfiguration, &ID3D12SDKConfiguration::IID, &mut cfg0_raw).is_ok()
+                && !cfg0_raw.is_null()
+            {
+                let cfg0 = ID3D12SDKConfiguration::from_raw(cfg0_raw);
+                let rel_dir = exe_dir
+                    .and_then(|e| relative_sdk_path(e, dir))
+                    .ok_or_else(|| {
+                        format!(
+                            "ID3D12SDKConfiguration1 unavailable ({err1}); fallback requires Agility SDK on the same drive as xcl.exe"
+                        )
+                    })?;
+                let rel_cstr = format_sdk_path(&rel_dir)?;
+                cfg0.SetSDKVersion(version, PCSTR(rel_cstr.as_ptr().cast())).map_err(|e| {
+                    format!(
+                        "SetSDKVersion(v{version}, {}): {e} (enable Windows Developer Mode or update Windows 10 to 22H2 KB5029331+)",
+                        rel_dir.display()
+                    )
+                })?;
+                return Ok(None);
+            }
+            return Err(format!("ID3D12SDKConfiguration1 unavailable (update Windows 10 to 22H2 KB5029331+): {err1}"));
+        }
         if cfg_raw.is_null() {
             return Err("D3D12GetInterface returned null ID3D12SDKConfiguration1".into());
         }
@@ -288,7 +359,7 @@ fn create_factory(version: u32, dir: &Path, path_cstr: &CString) -> Result<ID3D1
         factory
             .ApplyToGlobalState()
             .map_err(|e| format!("ID3D12DeviceFactory::ApplyToGlobalState: {e}"))?;
-        Ok(factory)
+        Ok(Some(factory))
     }
 }
 
@@ -322,7 +393,7 @@ where
 {
     let mut device: Option<ID3D12Device> = None;
     match state() {
-        State::Loaded { factory, .. } => {
+        State::Loaded { factory: Some(factory), .. } => {
             // SAFETY: `factory` is a valid `ID3D12DeviceFactory` kept alive for `'static`,
             // and `device` is a valid out-pointer for `ID3D12Device`.
             unsafe { factory.CreateDevice(adapter, feature_level, &mut device)? };
@@ -340,7 +411,7 @@ where
 /// loaded, otherwise from inbox `D3D12GetDebugInterface`.
 pub fn configuration_interface<T: Interface>(clsid: &GUID) -> windows::core::Result<T> {
     match state() {
-        State::Loaded { factory, .. } => {
+        State::Loaded { factory: Some(factory), .. } => {
             // SAFETY: `factory` is a valid `ID3D12DeviceFactory` kept alive for `'static`
             // and `clsid` is a valid GUID ref. Do not fall back to global
             // `D3D12GetDebugInterface`, which configures inbox singleton state rather than
