@@ -219,6 +219,17 @@ fn sanitize(s: &str) -> String {
     }
 }
 
+pub(crate) fn strip_verbatim_prefix(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        p.to_path_buf()
+    }
+}
+
 /// The package folder of `exe`: the nearest folder above it (up to 4 levels) whose
 /// MicrosoftGame.config names it – Unreal titles keep theirs in `<Game>/Binaries/XSX`, and the
 /// package root is what the title's paths (and its D: drive) start from.
@@ -226,7 +237,7 @@ fn config_root(exe: &Path) -> Option<PathBuf> {
     let mut dir = exe.parent()?;
     for _ in 0..5 {
         let (exes, _) = read_game_config(dir);
-        if exes.iter().any(|e| std::fs::canonicalize(dir.join(e)).ok().is_some_and(|p| PathBuf::from(p.to_string_lossy().trim_start_matches("\\\\?\\")) == exe)) {
+        if exes.iter().any(|e| std::fs::canonicalize(dir.join(e)).ok().is_some_and(|p| strip_verbatim_prefix(&p) == exe)) {
             return Some(dir.to_path_buf());
         }
         dir = dir.parent()?;
@@ -236,7 +247,7 @@ fn config_root(exe: &Path) -> Option<PathBuf> {
 
 fn resolve_location(target: &Path) -> Result<(PathBuf, Option<PathBuf>, String), String> {
     let target = std::fs::canonicalize(target).map_err(|e| format!("{}: {e}", target.display()))?;
-    let target = PathBuf::from(target.to_string_lossy().trim_start_matches("\\\\?\\"));
+    let target = strip_verbatim_prefix(&target);
     let (root, exe) = if target.is_dir() {
         (target, None)
     } else {
@@ -699,6 +710,13 @@ mod tests {
             missing_zen2_subset,
             vec!["SSE4.2", "POPCNT", "AVX2", "FMA", "BMI1", "BMI2", "LZCNT"]
         );
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_preserves_unc_shares() {
+        assert_eq!(strip_verbatim_prefix(Path::new(r"\\?\UNC\172.30.0.1\gta6")), PathBuf::from(r"\\172.30.0.1\gta6"));
+        assert_eq!(strip_verbatim_prefix(Path::new(r"\\?\C:\Games\Title")), PathBuf::from(r"C:\Games\Title"));
+        assert_eq!(strip_verbatim_prefix(Path::new(r"C:\Games\Title")), PathBuf::from(r"C:\Games\Title"));
     }
 
     #[test]
