@@ -721,8 +721,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
                 let size = e.tex.size() as usize;
                 (0..16usize)
                     .map(|k| e.src + (size.saturating_sub(4096)) * k / 15)
-                    .filter(|&a| crate::gpu::shader::readable(a, 4096))
-                    .map(|a| std::slice::from_raw_parts(a as *const u8, 4096).iter().filter(|&&b| b != 0).count())
+                    .map(|a| read_committed(a, 4096).into_iter().filter(|&b| b != 0).count())
                     .sum()
             };
             let (mut with, mut without) = (0, 0);
@@ -1156,10 +1155,14 @@ unsafe fn subresources_on(picked: &[(usize, &xg::Texture)], threads: usize) -> V
     out
 }
 
-/// The title's bytes at `at`: where they are when all of them are readable (a copy first cost
-/// as much as the detile of a video frame), else read page run by page run.
+/// The title's bytes at `at`: borrowed in place inside a permanently-committed UMA window
+/// (never decommitted, avoiding a copy for coherent video/UI planes), and copied safely via
+/// `read_committed` otherwise so concurrent page decommits in streaming pools cannot fault.
 unsafe fn title_bytes(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> {
-    if crate::gpu::shader::readable(at, len) {
+    if len == 0 {
+        return std::borrow::Cow::Borrowed(&[]);
+    }
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
         std::borrow::Cow::Borrowed(std::slice::from_raw_parts(at as *const u8, len))
     } else {
         std::borrow::Cow::Owned(read_committed(at, len))
@@ -1515,12 +1518,23 @@ mod tests {
         assert!(LIST_NOTES.lock().unwrap().get(&l1).is_none());
     }
 
-    /// The title's bytes are used where they are when all of them are readable, and read with the
-    /// pages that are not committed as zeros otherwise – the same bytes either way.
+    /// `title_bytes` borrows permanently-committed UMA window memory in place (zero-copy) and
+    /// safely copies title-managed VirtualAlloc memory via `read_committed` so concurrent page
+    /// decommits cannot fault.
     #[test]
-    fn title_bytes_are_used_in_place_when_all_are_readable() {
+    fn title_bytes_borrows_committed_uma_and_copies_dynamic_memory() {
         use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
         unsafe {
+            if let Some(u) = crate::gpu::uma::get() {
+                if let Some(p) = u.alloc(1 << 12, 1 << 12) {
+                    std::ptr::write_bytes(p, 0x5B, 1 << 12);
+                    let uma = title_bytes(p as usize, 1 << 12);
+                    assert!(matches!(uma, std::borrow::Cow::Borrowed(_)), "a committed UMA window range is not copied");
+                    assert_eq!(uma.as_ptr(), p);
+                    assert!(uma.iter().all(|&b| b == 0x5B));
+                    u.free(p as usize);
+                }
+            }
             let base = VirtualAlloc(std::ptr::null(), 3 << 12, MEM_RESERVE, PAGE_READWRITE) as usize;
             assert_ne!(base, 0);
             for page in [0usize, 2] {
@@ -1528,8 +1542,7 @@ mod tests {
                 std::ptr::write_bytes((base + (page << 12)) as *mut u8, 0xA0 + page as u8, 1 << 12);
             }
             let whole = title_bytes(base, 1 << 12);
-            assert!(matches!(whole, std::borrow::Cow::Borrowed(_)), "a committed page is not copied");
-            assert_eq!(whole.as_ptr() as usize, base);
+            assert!(matches!(whole, std::borrow::Cow::Owned(_)), "dynamic title memory copies safely via read_committed");
             assert!(whole.iter().all(|&b| b == 0xA0));
             let holed = title_bytes(base, 3 << 12);
             assert!(matches!(holed, std::borrow::Cow::Owned(_)), "a range with a reserved page is read");
@@ -1984,8 +1997,9 @@ mod tests {
             let off = 0x0B00;
             let len = (PAGES - 1) * PAGE + 0x0500;
             for _ in 0..400 {
-                let out = read_committed(base + off, len);
+                let out = title_bytes(base + off, len);
                 assert_eq!(out.len(), len);
+                let _ = content_hash(&out);
                 assert!(out[..PAGE - off].iter().all(|&b| b == 0x5A));
                 assert!(out[len - (off + 0x0500)..].iter().all(|&b| b == 0xA5));
             }
