@@ -3670,7 +3670,6 @@ fn mesh_passthrough_strips_rdna2_edge_flag_bits() {
     assert!(split.contains("uint3(p & 0x1FFu, (p >> 10) & 0x1FFu, (p >> 20) & 0x1FFu)"), "{split}");
     assert!(!split.contains("0x3FFu"), "{split}");
 }
-
 /// The mesh output budget with wide vertices: DXC accounts whole chunks of 32 vertices even
 /// when fewer are declared, so 78 vertices with 22 float4 rows are accounted as 96 (33792 B >
 /// 32768) and the record must go out in split groups. A retail title's NGG transform programs
