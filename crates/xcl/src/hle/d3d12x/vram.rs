@@ -2051,6 +2051,24 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
 #[cfg(test)]
 pub(super) static VRAM_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// A tile mapping on `dev`'s page queue, as `map` leaves it (the fence advanced and signalled
+/// there): the value a queue must wait for before work that uses the pages. None: no pages on
+/// this device (no tiled resources).
+#[cfg(test)]
+pub(super) unsafe fn note_mapping_for_test(dev: &ID3D12Device) -> Option<u64> {
+    let mut g = PAGES.lock().unwrap();
+    let pages = g.entry(dev.as_raw() as usize).or_insert_with(|| Pages::new(dev)).as_mut()?;
+    pages.value += 1;
+    pages.queue.Signal(&pages.fence, pages.value).ok()?;
+    Some(pages.value)
+}
+
+/// The page mapping value `queue` was last made to wait for on `dev` (`before_execute`).
+#[cfg(test)]
+pub(super) fn waited_for_test(dev: usize, queue: usize) -> u64 {
+    let g = PAGES.lock().unwrap();
+    g.get(&dev).and_then(|p| p.as_ref()).and_then(|p| p.waited.get(&queue).copied()).unwrap_or(0)
+}
 /// Tile identities of one mapped resource: title pages, then extra pages.
 /// A device-wide byte count also falls when unrelated idle pages are swept.
 #[cfg(test)]
