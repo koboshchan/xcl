@@ -74,6 +74,14 @@ pub fn dispatch_piece_limit() -> usize {
     std::env::var("XCL_DIRECT_SPLIT_INSTRUCTIONS").ok().and_then(|s| s.parse().ok()).unwrap_or(12_500)
 }
 
+/// `XCL_WINDOW_NO_CARRY=1`: memory accesses take their base's window (`lower_window::no_carry`).
+pub fn window_no_carry() -> bool {
+    super::lower_window::no_carry()
+}
+
+#[cfg(test)]
+pub use super::lower_window::with_no_carry;
+
 /// `XCL_DIRECT_COMPACT`: `1` forces the compact form, `0` forbids it, unset leaves it to `compact::wanted`.
 pub fn compact_mode() -> Option<bool> {
     match std::env::var("XCL_DIRECT_COMPACT").as_deref() {
@@ -159,10 +167,12 @@ fn translate_entry(
     // SSA construction recurses along the CFG (one level per guarded memory access between
     // a register's definition and its use): a thread with a large stack for big programs
     let code = code.to_vec();
+    // the caller's `no_carry` (a test may set it for its own thread)
+    let no_carry = super::lower_window::no_carry();
     std::thread::Builder::new()
         .name("xcl-dxil-translate".into())
         .stack_size(256 << 20)
-        .spawn(move || translate_on_this_thread(&code, o, entry, compact, nest, tables))
+        .spawn(move || super::lower_window::with_no_carry(no_carry, || translate_on_this_thread(&code, o, entry, compact, nest, tables)))
         .map_err(|e| format!("translator thread: {e}"))?
         .join()
         .map_err(|e| {
