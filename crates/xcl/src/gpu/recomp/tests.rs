@@ -4258,6 +4258,84 @@ fn memory_windows_reject_out_of_uma_aliasing(heap: bool) {
     assert_eq!(*word(w1 + 0x3000), CANARY1, "out-of-UMA global_atomic_inc must not clobber w1");
 }
 
+/// Heap windows read without a branch (`HEAP_FLAT`, the direct translator): over 4 windows, the
+/// same registers as the switch over root UAVs and as the guarded heap form, for scalar loads,
+/// a V# load and per-lane global loads whose lanes pick different windows, some outside UMA
+/// (read 0) and some not active (keep their old values).
+#[test]
+fn gpu_heap_flat_reads_match_the_switch_form() {
+    use crate::gpu::dxil::kernel::{translate, KernelOptions};
+    if !gpu_ready() {
+        return;
+    }
+    let arena = crate::gpu::uma::Uma::with_windows(4, 1 << 20).unwrap();
+    let w: Vec<u64> = (0..4).map(|k| arena.window(k).0 as u64).collect();
+    let base_hi = (w[0] >> 32) as u32;
+    let word = |a: u64| unsafe { &mut *(a as *mut u32) };
+    for (k, &wk) in w.iter().enumerate() {
+        *word(wk + 0x40) = 0xA0 + k as u32;
+        // 65 words: lane 63's dwordx2 reads the 65th
+        for l in 0..65u64 {
+            *word(wk + 0x100 + 4 * l) = (k as u32 + 1) * 1000 + l as u32;
+        }
+    }
+    let glbl = |n: &'static str, f: &[(&str, u64)]| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
+        (n, "ENC_FLAT_GLBL", f.iter().map(|&(a, b)| (unsafe { std::mem::transmute::<&str, &'static str>(a) }, b)).collect(), None)
+    };
+    let list = vec![
+        ("S_LOAD_DWORD", "ENC_SMEM", vec![("SDATA", 30), ("SBASE", 1), ("OFFSET", 0)], None), // s[2:3] → window 2
+        ("S_LOAD_DWORD", "ENC_SMEM", vec![("SDATA", 31), ("SBASE", 2), ("OFFSET", 0)], None), // s[4:5] → outside UMA: 0
+        ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", vec![("SDATA", 24), ("SBASE", 4), ("OFFSET", 4)], None), // V# s[8:11] in window 3
+        // lanes 33.. active from here
+        ("V_CMPX_LT_U32", "ENC_VOPC", vec![("SRC0", 160), ("VSRC1", 0)], None),
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", vec![("VDATA", 7), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None), // V# s[12:15] in window 1
+        glbl("GLOBAL_LOAD_DWORD", &[("VDST", 6), ("ADDR", 4), ("SADDR", 0x7D), ("OFFSET", 0)]), // v[4:5]: window lane % 4, or outside
+        glbl("GLOBAL_LOAD_DWORDX2", &[("VDST", 8), ("ADDR", 10), ("SADDR", 16), ("OFFSET", 0)]), // s[16:17] + v10: window 0
+    ];
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let p = prog(&refs);
+    let mut st = KernelState::default();
+    st.sgpr[2..4].copy_from_slice(&[0x40, base_hi + 2]);
+    st.sgpr[4..6].copy_from_slice(&[0x40, base_hi + 6]);
+    st.sgpr[8..12].copy_from_slice(&[0x100, (base_hi + 3) & 0xFFFF, 0x400, 0]);
+    st.sgpr[12..16].copy_from_slice(&[0x100, (base_hi + 1) & 0xFFFF | 4 << 16, 64, 0]);
+    st.sgpr[16..18].copy_from_slice(&[0x100, base_hi]);
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let l = l as u32;
+        r[0] = l;
+        r[4] = 0x100 + 4 * l;
+        r[5] = if l % 8 == 7 { base_hi + 5 } else { base_hi + l % 4 };
+        for k in 6..10 {
+            r[k] = 0x7777_7777;
+        }
+        r[10] = 4 * l;
+    }
+    let split = runner::split_wave64();
+    let run = |windows: u32| {
+        let dxil = translate(&p, KernelOptions { wave64: true, split, mem_windows: windows, sampler_base: 0 }).unwrap_or_else(|e| panic!("windows {windows:#x}: {e}"));
+        runner::run_in_arena(&dxil, &st, &arena).unwrap()
+    };
+    let switch = run(4);
+    let flat = run(4 | super::HEAP_WINDOWS | super::HEAP_FLAT);
+    let guarded = run(4 | super::HEAP_WINDOWS);
+    assert_eq!((switch.sgpr[30], switch.sgpr[31]), (0xA2, 0), "s_load: window 2, outside UMA");
+    assert_eq!(switch.sgpr[24..28], [4001, 4002, 4003, 4004], "s_buffer_load_dwordx4 from window 3");
+    for l in 0..64u32 {
+        let v = &switch.vgpr[l as usize];
+        let (old, active) = (0x7777_7777, l > 32);
+        assert_eq!(v[7], if active { 2000 + l } else { old }, "lane {l}: buffer_load from window 1");
+        let global = if l % 8 == 7 { 0 } else { (l % 4 + 1) * 1000 + l };
+        assert_eq!(v[6], if active { global } else { old }, "lane {l}: global_load from window {}", l % 4);
+        assert_eq!(v[8..10], if active { [1000 + l, 1001 + l] } else { [old, old] }, "lane {l}: global_load_dwordx2 from window 0");
+    }
+    for (name, r) in [("heap flat", &flat), ("heap guarded", &guarded)] {
+        assert_eq!(r.sgpr[..32], switch.sgpr[..32], "{name}: SGPRs");
+        for l in 0..64 {
+            assert_eq!(r.vgpr[l][..10], switch.vgpr[l][..10], "{name}: lane {l}");
+        }
+    }
+}
+
 #[test]
 fn gpu_window_at_32bit_carry_edge_cases() {
     if !gpu_ready() {

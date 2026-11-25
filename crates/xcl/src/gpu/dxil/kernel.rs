@@ -178,7 +178,7 @@ fn translate_entry(
 fn mem_windows(s: &mut Shader, mem_windows: u32, coherent: bool) -> (Vec<RawUav>, Option<bool>) {
     let heap = mem_windows & crate::gpu::recomp::HEAP_WINDOWS != 0;
     let max = if heap { crate::gpu::uma::MAX_HEAP_WINDOWS as u32 } else { crate::gpu::uma::MAX_WINDOWS as u32 };
-    let n = (mem_windows & !crate::gpu::recomp::HEAP_WINDOWS).clamp(1, max);
+    let n = (mem_windows & !(crate::gpu::recomp::HEAP_WINDOWS | crate::gpu::recomp::HEAP_FLAT)).clamp(1, max);
     if heap && n > 1 {
         let z = s.m.i32c(0);
         return (vec![RawUav { handle: z, binding: None }; n as usize], Some(coherent));
@@ -513,6 +513,7 @@ impl Lw {
             half: z,
             mems,
             heap_mem,
+            heap_flat: heap_mem.is_some() && !gfx && o.mem_windows & crate::gpu::recomp::HEAP_FLAT != 0,
             res,
             fmt_table: None,
             fmt_desc_cache: HashMap::new(),

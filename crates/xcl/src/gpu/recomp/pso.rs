@@ -79,7 +79,7 @@ pub fn fspx(blob: &[u8]) -> Option<Fspx<'_>> {
 pub fn mem_windows() -> u32 {
     let n = crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32);
     if n > 1 && heap_windows() && !SWITCH_FORM.with(|s| s.get()) {
-        n | super::HEAP_WINDOWS
+        n | super::HEAP_WINDOWS | if heap_flat() { super::HEAP_FLAT } else { 0 }
     } else {
         n
     }
@@ -113,6 +113,13 @@ pub fn in_switch_form<R>(f: impl FnOnce() -> R) -> R {
 pub fn heap_windows() -> bool {
     static ENV: OnceLock<bool> = OnceLock::new();
     *ENV.get_or_init(|| std::env::var("XCL_HEAP_WINDOWS").is_ok_and(|v| v.trim() == "1")) && !crate::hle::d3d12x::console_heap::window_views_failed()
+}
+
+/// `XCL_HEAP_FLAT=1` (with heap windows): the direct DXIL translator reads a compute stage's heap
+/// windows without a branch per access (`HEAP_FLAT`). Opt-in while it is measured.
+pub fn heap_flat() -> bool {
+    static ENV: OnceLock<bool> = OnceLock::new();
+    *ENV.get_or_init(|| std::env::var("XCL_HEAP_FLAT").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// A static sampler of a translated program: (S#, comparison) – see `Translation`.
