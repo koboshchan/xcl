@@ -65,6 +65,8 @@ pub struct MeshCtx {
     pub vtx: Value,
     pub prm: Value,
     pub outputs: Vec<crate::gpu::dxbc::SigElement>,
+    /// the console's output table (`MsInterface::params`)
+    pub params: Option<Vec<crate::gpu::recomp::OutParam>>,
 }
 
 /// Initial register values: loaded from `io` in the entry block on first use.

@@ -14,7 +14,7 @@ use super::lower::{err, LResult, Lw};
 use super::module::{Pred, Value};
 use crate::gpu::dxbc::SigElement;
 use crate::gpu::rdna2::{self, Decoded};
-use crate::gpu::recomp::{elements_at, ps_attribute_slot, ps_input_vgpr, ps_slot_attribute, ranked, vs_param_register, PsInterface, VsInterface};
+use crate::gpu::recomp::{out_param_elements, ps_attribute_f16, ps_attribute_slot, ps_f16_slot, ps_input_vgpr, ps_slot_attribute, ranked, PsInterface, VsInterface};
 
 /// An output element: its signature handle, components and the temporaries holding them.
 pub struct GfxOut {
@@ -119,7 +119,7 @@ impl Lw {
                 _ => SemKind::Arbitrary,
             };
             let s = io.output(GSig::new(&e.name, e.index, kind, gct(e.component_type), n));
-            outs.push((s, n, e.component_type == 3));
+            outs.push((s, n, matches!(e.component_type, 3 | 6)));
         }
         // initial VGPRs: v0 = vertex id, v3 = instance id, the fetch shader's attribute VGPRs
         let mut vgpr = HashMap::new();
@@ -166,7 +166,8 @@ impl Lw {
         for (k, e) in ranked(&ps.inputs, false).iter().enumerate() {
             let attr = ps_slot_attribute(ps, k);
             let m = attr.and_then(|a| modes.get(&(a as u32))).cloned().unwrap_or_default();
-            let float = e.component_type == 3;
+            // float16 read through a packed attribute interpolates like a float
+            let float = e.component_type == 3 || (e.component_type == 6 && attr.is_some_and(|a| ps_attribute_f16(ps, a).is_some()));
             let interp = if !float {
                 Interp::Constant
             } else {
@@ -326,15 +327,22 @@ impl Lw {
                 32..=63 => {
                     let vs = self.gfx().vs.clone().expect("vs");
                     let k = (tgt - 32) as usize;
-                    let at = vs_param_register(&vs, k).map(|r| elements_at(&vs.outputs, true, r)).unwrap_or_default();
-                    for j in at {
+                    let (at, f16) = out_param_elements(&vs.outputs, vs.params.as_deref(), k);
+                    for (j, first) in at {
                         let (vars, n) = {
                             let o = &self.gfx().params[j];
                             (o.vars.clone(), o.comps)
                         };
                         for c in 0..n as usize {
-                            if enabled(c) {
-                                let v = comp(self, c);
+                            // packed float16: component c is half c & 1 of dword first + c / 2
+                            let dw = if f16 { first + c / 2 } else { c };
+                            if dw < 4 && enabled(dw) {
+                                let mut v = comp(self, dw);
+                                if f16 {
+                                    let h = self.lshrc(v, 16 * (c as u32 & 1));
+                                    let x = self.s.f16_to_f32(h);
+                                    v = self.bits(x);
+                                }
                                 self.set_out(vars[c], v);
                             }
                         }
@@ -401,11 +409,20 @@ impl Lw {
             let s1 = f("SRC1");
             (f("VDST"), if s1 >= 256 { s1 - 256 } else { s1 }, f("SRC0") & 0x3F, f("SRC0") >> 6 & 3)
         };
-        let Some(slot) = ps_attribute_slot(&ps, attr as usize, chan as usize) else { return err(d, "attribute outside ISG1") };
+        // a float16-packed attribute: the PC input is the component itself (SRC0 bit 8: the
+        // high half of the dword); a half nothing declares reads 0
+        let place = match ps_attribute_f16(&ps, attr as usize).filter(|_| name.ends_with("_f16")) {
+            Some(regs) => ps_f16_slot(&ps, &regs, chan as usize, d.enc.name != "ENC_VINTRP" && f("SRC0") >> 8 & 1 == 1),
+            None => match ps_attribute_slot(&ps, attr as usize, chan as usize) {
+                Some(slot) => Some((slot, chan as usize)),
+                None => return err(d, "attribute outside ISG1"),
+            },
+        };
         let load = |lw: &mut Lw| -> Value {
+            let Some((slot, comp)) = place else { return lw.c(0) };
             let g = lw.gfx.as_mut().expect("gfx");
             let (sig, _) = g.ps_in[slot];
-            let x = g.io.load_input(&mut lw.s, sig, 0, chan as u8);
+            let x = g.io.load_input(&mut lw.s, sig, 0, comp as u8);
             let i32 = lw.s.m.i32();
             lw.s.m.bitcast(x, i32)
         };

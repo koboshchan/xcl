@@ -3563,7 +3563,7 @@ fn gpu_mesh_mode_two_passes() {
         rw_mask: 0xF,
         stream: 0,
     };
-    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0), sig("TEXCOORD", 0, 1)], threads: 128, max_vertices: 128, max_primitives: 128 };
+    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0), sig("TEXCOORD", 0, 1)], threads: 128, max_vertices: 128, max_primitives: 128, params: None };
     let exp = |tgt: u64, en: u64, v: [u64; 4], done: u64| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
         ("EXP", "ENC_EXP", vec![("TGT", tgt), ("EN", en), ("VSRC0", v[0]), ("VSRC1", v[1]), ("VSRC2", v[2]), ("VSRC3", v[3]), ("DONE", done)], None)
     };
@@ -3641,6 +3641,100 @@ fn gpu_mesh_mode_two_passes() {
     assert!(px16 == px, "split pass-through draws the same pixels");
 }
 
+/// A mesh (NGG) program whose param 0 packs two float16 registers, two components per dword
+/// (TEXCOORD1.xy in dword 0, TEXCOORD4.xyzw in dwords 1 and 2 – a retail title's transform
+/// programs): the record keeps every component as a float in its own element's slot, the
+/// pass-through hands them to the pixel shader by semantic, and the float param after the
+/// pair lands in its own register. Before: param 0 went raw into TEXCOORD1 alone and param 1
+/// into TEXCOORD4.
+#[test]
+fn gpu_mesh_f16_packed_params() {
+    if !gpu_ready() || !mesh_ready() {
+        return;
+    }
+    use super::{dxc, mesh_passthrough, MsInterface, OutParam, MESH_HEADER};
+    let ms = MsInterface {
+        outputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF), el("TEXCOORD", 1, 0, 6, 1, 0x3), el("TEXCOORD", 4, 0, 6, 2, 0xF), el("TEXCOORD", 3, 0, 3, 3, 0xF)],
+        threads: 128,
+        max_vertices: 128,
+        max_primitives: 128,
+        params: Some(vec![OutParam { register: 1, f16: true, pair: true }, OutParam { register: 3, f16: false, pair: false }]),
+    };
+    let exp = |tgt: u64, en: u64, v: [u64; 4], done: u64| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
+        ("EXP", "ENC_EXP", vec![("TGT", tgt), ("EN", en), ("VSRC0", v[0]), ("VSRC1", v[1]), ("VSRC2", v[2]), ("VSRC3", v[3]), ("DONE", done)], None)
+    };
+    // as `gpu_mesh_mode_two_passes`: v20 = group, v15 = thread in the group (floats)
+    let mut list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
+        ("S_BFE_U32", "ENC_SOP2", vec![("SDST", 0), ("SSRC0", 3), ("SSRC1", 255)], Some(0x40018)),
+        ("V_MBCNT_LO_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", 128)], None),
+        ("V_MBCNT_HI_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", V)], None),
+        ("V_LSHL_ADD_U32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 0), ("SRC1", 134), ("SRC2", V)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", vec![("VDST", 1), ("SRC0", V + 5)], None),
+        ("S_LSHR_B32", "ENC_SOP2", vec![("SDST", 1), ("SSRC0", 1), ("SSRC1", 135)], None),
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 124), ("SSRC0", 255)], Some(1 << 12 | 3)),
+        ("S_SENDMSG", "ENC_SOPP", vec![("SIMM16", 9)], None),
+        ("S_BARRIER", "ENC_SOPP", vec![], None),
+        ("V_CMPX_GT_U32", "ENC_VOPC", vec![("SRC0", 131), ("VSRC1", 0)], None),
+        ("BUFFER_LOAD_DWORDX4", "ENC_MUBUF", vec![("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("V_CVT_F32_U32", "ENC_VOP1", vec![("VDST", 20), ("SRC0", 1)], None),
+        ("V_ADD_F32", "ENC_VOP2", vec![("VDST", 10), ("SRC0", V + 20), ("VSRC1", 10)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 14), ("SRC0", V + 20)], None),
+        ("V_CVT_F32_U32", "ENC_VOP1", vec![("VDST", 15), ("SRC0", V)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 16), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 17), ("SRC0", 242)], None),
+        // halves: v22 = group, v23 = thread, v24 = 0.5, v25 = 2.0
+        ("V_CVT_F16_F32", "ENC_VOP1", vec![("VDST", 22), ("SRC0", V + 20)], None),
+        ("V_CVT_F16_F32", "ENC_VOP1", vec![("VDST", 23), ("SRC0", V + 15)], None),
+        ("V_CVT_F16_F32", "ENC_VOP1", vec![("VDST", 24), ("SRC0", 240)], None),
+        ("V_CVT_F16_F32", "ENC_VOP1", vec![("VDST", 25), ("SRC0", 244)], None),
+        // TEXCOORD1 = (group, thread); TEXCOORD4 = (0.5, group, thread, 2.0)
+        ("V_PACK_B32_F16", "ENC_VOP3", vec![("VDST", 26), ("SRC0", V + 22), ("SRC1", V + 23)], None),
+        ("V_PACK_B32_F16", "ENC_VOP3", vec![("VDST", 27), ("SRC0", V + 24), ("SRC1", V + 22)], None),
+        ("V_PACK_B32_F16", "ENC_VOP3", vec![("VDST", 28), ("SRC0", V + 23), ("SRC1", V + 25)], None),
+    ];
+    list.push(exp(12, 0xF, [10, 11, 12, 13], 1));
+    list.push(exp(32, 0x7, [26, 27, 28, 0], 0));
+    list.push(exp(33, 0xF, [14, 15, 16, 17], 0));
+    list.push(("S_MOV_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 193)], None));
+    list.push(("V_CMPX_EQ_U32", "ENC_VOPC", vec![("SRC0", 128), ("VSRC1", 0)], None));
+    list.push(("V_MOV_B32", "ENC_VOP1", vec![("VDST", 21), ("SRC0", 255)], Some(1 << 10 | 2 << 20)));
+    list.push(exp(20, 1, [21, 0, 0, 0], 1));
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let code = prog(&refs);
+    let opt = on_gpu(Options { mode: Mode::Mesh(ms.clone()), wave64: true, ..Default::default() });
+    let t = translate(&code, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let cs = direct_or(&code, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl)));
+    let pass = mesh_passthrough(&ms);
+    let msb = dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
+    let ps_src = "struct V { float4 pos : SV_Position; float4 a : TEXCOORD1; float4 b : TEXCOORD4; float4 c : TEXCOORD3; };\nfloat4 main(V v) : SV_Target0 { return float4(v.a.x, v.b.x, v.b.w, v.c.w); }\n";
+    let ps = dxc::compile(ps_src, "main", "ps_6_6", &[]).unwrap();
+    let mut mem = vec![0u32; 256];
+    for (i, (x, y)) in [(-1.0f32, -1.0f32), (-1.0, 1.0), (0.0, -1.0)].iter().enumerate() {
+        mem[0x40 + 4 * i..0x40 + 4 * i + 4].copy_from_slice(&[f(*x), f(*y), f(0.0), f(1.0)]);
+    }
+    let mut sg = vec![0u32; 128];
+    sg[16..20].copy_from_slice(&[0x100, 16 << 16, 3, 0]);
+    let (px, rec) = runner::mesh_draw(&cs, &msb, &ps, 2, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
+    let (rd, vd) = (ms.record_dwords(), ms.vert_dwords());
+    for g in 0..2usize {
+        let r = &rec[g * rd..(g + 1) * rd];
+        assert_eq!((r[0], r[1]), (3, 1), "group {g}: GS_ALLOC_REQ counts");
+        for v in 0..3usize {
+            let b = MESH_HEADER + v * vd;
+            let at = |k: usize| f32::from_bits(r[b + k]);
+            let (gf, vf) = (g as f32, v as f32);
+            assert_eq!([at(4), at(5)], [gf, vf], "group {g} vertex {v}: TEXCOORD1.xy");
+            assert_eq!([at(8), at(9), at(10), at(11)], [0.5, gf, vf, 2.0], "group {g} vertex {v}: TEXCOORD4");
+            assert_eq!([at(12), at(13), at(14), at(15)], [gf, vf, 0.0, 1.0], "group {g} vertex {v}: TEXCOORD3 (param 1)");
+        }
+    }
+    let at = |x: usize, y: usize| px[y * 32 + x];
+    assert_eq!(at(3, 29), [0.0, 0.5, 2.0, 1.0], "group 0 triangle (left)");
+    assert_eq!(at(19, 29), [1.0, 0.5, 2.0, 1.0], "group 1 triangle (right)");
+    assert_eq!(at(29, 3), [-1.0; 4], "outside both triangles");
+}
+
 #[test]
 fn mesh_passthrough_strips_rdna2_edge_flag_bits() {
     use super::{mesh_passthrough, MsInterface};
@@ -3659,6 +3753,7 @@ fn mesh_passthrough_strips_rdna2_edge_flag_bits() {
         threads: 128,
         max_vertices: 128,
         max_primitives: 128,
+        params: None,
     };
     let unsplit = mesh_passthrough(&ms);
     assert!(unsplit.contains("uint3(p & 0x1FFu, (p >> 10) & 0x1FFu, (p >> 20) & 0x1FFu)"), "{unsplit}");
@@ -3699,7 +3794,7 @@ fn mesh_split_accounts_vertex_chunks() {
         outputs.push(sig("TEXCOORD", 0, k + 1, k));
     }
     outputs.push(sig("SV_ClipDistance", 2, 21, 0));
-    let ms = MsInterface { outputs, threads: 128, max_vertices: 128, max_primitives: 128 };
+    let ms = MsInterface { outputs, threads: 128, max_vertices: 128, max_primitives: 128, params: None };
     let elems = passthrough_elements(&ms, None);
     assert_eq!(elems, 21);
     // 22 rows * 16 B = 352 B/vertex: 64 accounted vertices fit (96 would be 33792 B), so at
@@ -3756,7 +3851,7 @@ fn mesh_layout_independent_of_group_count() {
     }
     outputs.push(sig("SV_ClipDistance", 2, 21, 0));
     // 22 rows * 16 B = 352 B/vertex: 64 accounted vertices fit; 80 declared do not
-    let ms = MsInterface { outputs, threads: 128, max_vertices: 80, max_primitives: 1 };
+    let ms = MsInterface { outputs, threads: 128, max_vertices: 80, max_primitives: 1, params: None };
     let elems = passthrough_elements(&ms, None);
     assert_eq!(elems, 21);
     // one triangle: its 3 copies fit one compact group, so the dispatch count is 1
@@ -4012,7 +4107,7 @@ fn gpu_mesh_mode_reads_memory_windows() {
         rw_mask: 0xF,
         stream: 0,
     };
-    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0)], threads: 64, max_vertices: 64, max_primitives: 64 };
+    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0)], threads: 64, max_vertices: 64, max_primitives: 64, params: None };
     let list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
         ("V_MBCNT_LO_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", 128)], None),
         ("V_MBCNT_HI_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", V)], None), // thread
@@ -7103,7 +7198,7 @@ fn far_jumps_are_direct_branches() {
 /// programs with cross-half operations included; native wave64 and wave32 programs unchanged.
 #[test]
 fn mesh_split_wave64_form() {
-    let ms = super::MsInterface { threads: 128, max_vertices: 64, max_primitives: 64, outputs: vec![] };
+    let ms = super::MsInterface { threads: 128, max_vertices: 64, max_primitives: 64, outputs: vec![], params: None };
     let lane = prog(&[("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V)], None)]);
     let branch = prog(&[("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 0)], None)]);
     for code in [&lane, &branch] {

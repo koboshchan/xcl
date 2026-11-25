@@ -5843,7 +5843,7 @@ pub(super) fn register_two_pass_for_test(pso: usize, kind: &'static str) {
                 compute: 0,
                 compute_rs: 0,
                 mesh_rs: 0,
-                record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 64, max_vertices: 64, max_primitives: 64 },
+                record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 64, max_vertices: 64, max_primitives: 64, params: None },
                 mesh_groups_per_record: 1,
                 kind,
             }),
@@ -8667,7 +8667,7 @@ mod mesh_stream_tests {
         let make_tp = || crate::gpu::recomp::pso::TwoPass {
             cs: vec![0; 16],
             ms: vec![0; 16],
-            record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 32, max_vertices: 3, max_primitives: 1 },
+            record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 32, max_vertices: 3, max_primitives: 1, params: None },
             mesh_groups_per_record: 1,
             samplers: vec![sampler],
         };

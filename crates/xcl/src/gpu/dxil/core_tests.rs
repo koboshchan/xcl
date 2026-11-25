@@ -153,6 +153,130 @@ fn direct_and_hlsl_graphics_stages_link() {
     assert_eq!(draw(&hvs, &dps), want, "HLSL VS + direct PS");
 }
 
+/// Float16 interpolants packed two per dword, two registers in one attribute (TEXCOORD1.xyz
+/// and TEXCOORD4.xyzw in attribute 0, as a retail title's world shaders have them): the PS
+/// reads each half with `v_interp_p2_f16` (SRC0 bit 8: the high half) and gets that component
+/// of its own element interpolated across the triangle; the float attribute after the pair
+/// keeps its register. The console VS exports the packed dwords as param 0 and unpacks them
+/// into the same components. Every combination of the direct and the HLSL stages, and a PC VS.
+/// Before: the tables were refused, the PS converted the raw packed dword of a
+/// `nointerpolation` input and attribute 1 was read from TEXCOORD4.
+#[test]
+fn f16_packed_attributes_interpolate_per_half() {
+    use crate::gpu::dxbc::SigElement as S;
+    use crate::gpu::recomp::{runner, translate, Mode, Options, OutParam, PsAttr, PsInterface, VsInterface};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32_FLOAT};
+    if !super::graphics::tests::draw_ready() {
+        return;
+    }
+    if crate::gpu::recomp::dxc::location().is_err() {
+        return runner::skip_test("no DXC");
+    }
+    let el = |name: &str, index: u32, sv: u32, ct: u32, reg: u32, mask: u8| S { name: name.into(), index, system_value: sv, component_type: ct, register: reg, mask, rw_mask: mask, stream: 0 };
+    const V: u64 = 256;
+    // COLOR c in v8..v11 -> halves h0..h3 in v12..v15; param 0 = (h0 | h1 << 16, h2, h3 | h0 << 16,
+    // h1 | h2 << 16): TEXCOORD1 = (c0, c1, c2), TEXCOORD4 = (c3, c0, c1, c2); param 1 = c reversed
+    let mut vs_ops: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 0), ("SRC0", V + 4)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 1), ("SRC0", V + 5)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 2), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 3), ("SRC0", 242)], None),
+        ("EXP", "ENC_EXP", vec![("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1)], None),
+    ];
+    for i in 0..4u64 {
+        vs_ops.push(("V_CVT_F16_F32", "ENC_VOP1", vec![("VDST", 12 + i), ("SRC0", V + 8 + i)], None));
+    }
+    for (dst, lo, hi) in [(16u64, 12u64, 13u64), (18, 15, 12), (19, 13, 14)] {
+        vs_ops.push(("V_PACK_B32_F16", "ENC_VOP3", vec![("VDST", dst), ("SRC0", V + lo), ("SRC1", V + hi)], None));
+    }
+    vs_ops.push(("EXP", "ENC_EXP", vec![("TGT", 32), ("EN", 0xF), ("VSRC0", 16), ("VSRC1", 14), ("VSRC2", 18), ("VSRC3", 19)], None));
+    vs_ops.push(("EXP", "ENC_EXP", vec![("TGT", 33), ("EN", 0xF), ("VSRC0", 11), ("VSRC1", 10), ("VSRC2", 9), ("VSRC3", 8)], None));
+    let vs_list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = vs_ops.iter().map(|(n, e, f, l)| (*n, *e, f.as_slice(), *l)).collect();
+    let vs_code = prog(&vs_list);
+    let user = vec![el("TEXCOORD", 1, 0, 6, 1, 0x7), el("TEXCOORD", 4, 0, 6, 2, 0xF), el("TEXCOORD", 3, 0, 3, 3, 0xF)];
+    let vsi = VsInterface {
+        inputs: vec![el("POSITION", 0, 0, 3, 0, 3), el("COLOR", 0, 0, 3, 1, 0xF)],
+        outputs: std::iter::once(el("SV_Position", 0, 1, 3, 0, 0xF)).chain(user.iter().cloned()).collect(),
+        attr_base: 4,
+        params: Some(vec![OutParam { register: 1, f16: true, pair: true }, OutParam { register: 3, f16: false, pair: false }]),
+    };
+    // a PC VS handing over each component as a float: COLOR c -> TEXCOORD1 = (c0, c1, c2, 0),
+    // TEXCOORD4 = (c3, c0, c1, c2), TEXCOORD3 = c reversed
+    let pc_vs = "struct I { float2 pos : POSITION; float4 c : COLOR0; };\nstruct O { float4 pos : SV_Position; float4 t1 : TEXCOORD1; float4 t4 : TEXCOORD4; float4 t3 : TEXCOORD3; };\nO main(I i) { O o; o.pos = float4(i.pos, 0.0, 1.0); o.t1 = float4(i.c.xyz, 0.0); o.t4 = float4(i.c.w, i.c.xyz); o.t3 = i.c.wzyx; return o; }\n";
+    let pvs = crate::gpu::recomp::dxc::compile(pc_vs, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pc_vs}"));
+    let psi = PsInterface {
+        inputs: std::iter::once(el("SV_Position", 0, 1, 3, 0, 0xF)).chain(user.iter().cloned()).collect(),
+        outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
+        input_ena: 0x302,
+        attrs: Some(vec![
+            PsAttr { kind: 6, register: 1, mask: 3, flat: false, f16: true, pair: Some(2) },
+            PsAttr { kind: 6, register: 3, mask: 0xF, flat: false, f16: false, pair: None },
+        ]),
+    };
+    // a PS returning four values: Some((dword, high)) of attribute 0, None: attr1[k] as f32
+    let ps_code = |sel: [Option<(u64, u64)>; 4]| {
+        let mut ops: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = Vec::new();
+        for (k, s) in sel.iter().enumerate() {
+            let k = k as u64;
+            match *s {
+                Some((chan, high)) => {
+                    let attr = chan << 6 | high << 8;
+                    ops.push(("V_INTERP_P1LL_F16", "ENC_VOP3", vec![("VDST", 8 + k), ("SRC1", V), ("SRC0", attr)], None));
+                    ops.push(("V_INTERP_P2_F16", "ENC_VOP3", vec![("VDST", 4 + k), ("SRC1", V + 1), ("SRC0", attr), ("SRC2", V + 8 + k)], None));
+                    ops.push(("V_CVT_F32_F16", "ENC_VOP1", vec![("VDST", 4 + k), ("SRC0", V + 4 + k)], None));
+                }
+                None => {
+                    ops.push(("V_INTERP_P1_F32", "ENC_VINTRP", vec![("VDST", 4 + k), ("VSRC", 0), ("ATTR", 1), ("ATTRCHAN", k)], None));
+                    ops.push(("V_INTERP_P2_F32", "ENC_VINTRP", vec![("VDST", 4 + k), ("VSRC", 1), ("ATTR", 1), ("ATTRCHAN", k)], None));
+                }
+            }
+        }
+        ops.push(("EXP", "ENC_EXP", vec![("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)], None));
+        let list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = ops.iter().map(|(n, e, f, l)| (*n, *e, f.as_slice(), *l)).collect();
+        prog(&list)
+    };
+    let ko = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    let vt = translate(&vs_code, &Options { mode: Mode::Vertex(vsi.clone()), wave64: true, ..Default::default() }).unwrap();
+    assert!(vt.complete(), "{:?}", vt.unsupported_why);
+    let hvs = crate::gpu::recomp::dxc::compile(&vt.hlsl, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", vt.hlsl));
+    let dvs = super::kernel::translate_vertex(&vs_code, ko, &vsi).unwrap().dxil;
+    // COLOR = (x, y, x / 4 + 1 / 2, y / 2 - 1 / 4) at each vertex: exact in float16, and linear
+    // in the pixel's position
+    let color = |x: f32, y: f32| [x, y, 0.25 * x + 0.5, 0.5 * y - 0.25];
+    let verts: Vec<f32> = [[-1.0f32, -1.0], [-1.0, 3.0], [3.0, -1.0]].iter().flat_map(|p| [p[0], p[1]].into_iter().chain(color(p[0], p[1]))).collect();
+    let layout = [
+        runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 },
+        runner::VertexElement { semantic: "COLOR", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 8 },
+    ];
+    // what each selection reads, as indices into COLOR (4: nothing declared there, 0)
+    let cases: [([Option<(u64, u64)>; 4], [usize; 4], &str); 4] = [
+        ([Some((0, 0)), Some((0, 1)), Some((1, 0)), Some((2, 0))], [0, 1, 2, 3], "TEXCOORD1.xyz, TEXCOORD4.x"),
+        ([Some((2, 1)), Some((3, 0)), Some((3, 1)), Some((1, 1))], [0, 1, 2, 4], "TEXCOORD4.yzw, TEXCOORD1.w"),
+        ([Some((3, 1)), Some((2, 0)), Some((0, 1)), Some((0, 0))], [2, 3, 1, 0], "both registers, mixed halves"),
+        ([None, None, None, None], [3, 2, 1, 0], "the float attribute after the pair"),
+    ];
+    for (sel, want, what) in cases {
+        let code = ps_code(sel);
+        let pt = translate(&code, &Options { mode: Mode::Pixel(psi.clone()), wave64: true, ..Default::default() }).unwrap();
+        assert!(pt.complete(), "{what}: {:?}", pt.unsupported_why);
+        assert!(!pt.hlsl.contains("nointerpolation"), "{what}: the float16 inputs interpolate\n{}", pt.hlsl);
+        let hps = crate::gpu::recomp::dxc::compile(&pt.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", pt.hlsl));
+        let dps = super::kernel::translate_pixel(&code, ko, &psi).unwrap().dxil;
+        let pairs = [("PC VS + HLSL PS", &pvs, &hps), ("PC VS + direct PS", &pvs, &dps), ("HLSL VS + HLSL PS", &hvs, &hps), ("direct VS + direct PS", &dvs, &dps), ("direct VS + HLSL PS", &dvs, &hps), ("HLSL VS + direct PS", &hvs, &dps)];
+        for (stages, vs, ps) in pairs {
+            let px = runner::draw(vs, ps, &layout, &verts, 24, &[], &[], 8, [9.0; 4]).unwrap();
+            for y in 0..8usize {
+                for x in 0..8usize {
+                    let c = color((x as f32 + 0.5) / 4.0 - 1.0, 1.0 - (y as f32 + 0.5) / 4.0);
+                    let expected = want.map(|k| if k == 4 { 0.0 } else { c[k] });
+                    let got = px[y * 8 + x];
+                    assert!(got.iter().zip(expected).all(|(a, b)| (a - b).abs() < 1e-3), "{what}, {stages}: pixel ({x},{y}) = {got:?}, expected {expected:?}");
+                }
+            }
+        }
+    }
+}
+
 fn sig(name: &str, index: u32, sv: u32, ct: u32, reg: u32, mask: u8) -> crate::gpu::dxbc::SigElement {
     crate::gpu::dxbc::SigElement { name: name.into(), index, system_value: sv, component_type: ct, register: reg, mask, rw_mask: mask, stream: 0 }
 }

@@ -2570,13 +2570,23 @@ impl Lw {
             13..=15 | 9 => {}
             32..=63 => {
                 let k = (tgt - 32) as usize;
-                let outputs = self.mesh.as_ref().expect("mesh").outputs.clone();
-                let at = crate::gpu::recomp::param_registers(&outputs, true).get(k).map(|&r| crate::gpu::recomp::elements_at(&outputs, true, r)).unwrap_or_default();
-                for j in at {
+                let (at, f16) = {
+                    let m = self.mesh.as_ref().expect("mesh");
+                    crate::gpu::recomp::out_param_elements(&m.outputs, m.params.as_deref(), k)
+                };
+                for (j, first) in at {
                     for c in 0..4 {
-                        if enabled(c) {
+                        // packed float16: component c is half c & 1 of dword first + c / 2; the
+                        // record keeps it as a float
+                        let dw = if f16 { first + c / 2 } else { c };
+                        if dw < 4 && enabled(dw) {
                             let a = self.addc(vtx, (4 * (j + 1) + c) as u32);
-                            let v = comp(self, c);
+                            let mut v = comp(self, dw);
+                            if f16 {
+                                let h = self.lshrc(v, 16 * (c as u32 & 1));
+                                let x = self.s.f16_to_f32(h);
+                                v = self.bits(x);
+                            }
                             st.push((a, v));
                         }
                     }

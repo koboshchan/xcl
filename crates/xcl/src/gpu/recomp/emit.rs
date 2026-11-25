@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use super::{elements_at, param_registers, ps_attribute_slot, ps_input_vgpr, ps_slot_attribute, ranked, vs_param_register, Mode, MsInterface, Options, KERNEL_EXPORTS, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_SPLIT_MAGIC, KERNEL_SPLIT_SGPRS, KERNEL_VGPRS, MESH_HEADER};
+use super::{out_param_elements, ps_attribute_f16, ps_attribute_slot, ps_f16_slot, ps_input_vgpr, ps_slot_attribute, ranked, Mode, MsInterface, Options, KERNEL_EXPORTS, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_SPLIT_MAGIC, KERNEL_SPLIT_SGPRS, KERNEL_VGPRS, MESH_HEADER};
 use super::upper_lanes::Read;
 use crate::gpu::dxbc::SigElement;
 use crate::gpu::rdna2::{self, Decoded, Encoding, Operand, Variant};
@@ -2329,18 +2329,26 @@ impl Em {
                 // param N is a register: channel c goes to component c of every element there
                 let k = (tgt - 32) as usize;
                 let params = ranked(&vs.outputs, true);
-                let at = vs_param_register(vs, k).map(|r| elements_at(&vs.outputs, true, r)).unwrap_or_default();
+                let (at, f16) = out_param_elements(&vs.outputs, vs.params.as_deref(), k);
                 if at.is_empty() {
                     self.line("/* param without an OSG1 element (dummy) */");
                     return Ok(());
                 }
-                for j in at {
+                for (j, first) in at {
                     let e = params[j];
                     let n = out_comps(e);
                     for c in 0..n {
-                        if enabled(c) {
-                            let v = Self::exp_comp(srcs, compr, c);
-                            let v = if e.component_type == 3 { format!("asfloat({v})") } else { format!("{v}") };
+                        // packed float16: component c is half c & 1 of dword first + c / 2
+                        let dw = if f16 { first + c / 2 } else { c };
+                        if dw < 4 && enabled(dw) {
+                            let v = Self::exp_comp(srcs, compr, dw);
+                            let v = if f16 {
+                                format!("f16tof32({v} >> {}u)", 16 * (c & 1))
+                            } else if e.component_type == 3 {
+                                format!("asfloat({v})")
+                            } else {
+                                format!("{v}")
+                            };
                             let comp = if n == 1 { String::new() } else { format!("[{c}]") };
                             st.push(format!("xo.p{j}{comp} = {v};"));
                         }
@@ -2391,15 +2399,19 @@ impl Em {
                 // param N is a register: its record slot is that of every element there (the
                 // pass-through reads an element's slot as the whole register, as for the GS)
                 let k = (tgt - 32) as usize;
-                let at = param_registers(&ms.outputs, true).get(k).map(|&r| elements_at(&ms.outputs, true, r)).unwrap_or_default();
+                let (at, f16) = out_param_elements(&ms.outputs, ms.params.as_deref(), k);
                 if at.is_empty() {
                     self.line("/* param without an OSG1 element (dummy) */");
                     return Ok(());
                 }
-                for j in at {
+                for (j, first) in at {
                     for c in 0..4 {
-                        if enabled(c) {
-                            st.push(format!("res.Store((xcl_vtx + {}u) * 4u, {});", 4 * (j + 1) + c, Self::exp_comp(srcs, compr, c)));
+                        // packed float16 (as in the VS): the record keeps each half as a float
+                        let dw = if f16 { first + c / 2 } else { c };
+                        if dw < 4 && enabled(dw) {
+                            let v = Self::exp_comp(srcs, compr, dw);
+                            let v = if f16 { format!("asuint(f16tof32({v} >> {}u))", 16 * (c & 1)) } else { v };
+                            st.push(format!("res.Store((xcl_vtx + {}u) * 4u, {v});", 4 * (j + 1) + c));
                         }
                     }
                 }
@@ -2440,10 +2452,21 @@ impl Em {
     fn interp(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let Mode::Pixel(ps) = &self.opt.mode else { return Err("interpolation outside PS") };
         let (vdst, ij, attr, chan) = Self::interp_fields(d);
-        let Some(slot) = ps_attribute_slot(ps, attr as usize, chan as usize) else {
-            return Err("attribute outside ISG1");
+        // a float16-packed attribute (two registers, two components per dword): the PC input
+        // is the component itself, interpolated as a float – SRC0 bit 8 picks the high half
+        let high = d.enc.name != "ENC_VINTRP" && rdna2::field_value(d.enc, &d.words, "SRC0").unwrap_or(0) >> 8 & 1 == 1;
+        let src = match ps_attribute_f16(ps, attr as usize).filter(|_| name.ends_with("_f16")) {
+            Some(regs) => match ps_f16_slot(ps, &regs, chan as usize, high) {
+                Some((slot, comp)) => format!("xi.a{slot}[{comp}]"),
+                None => "0.0f".to_string(),
+            },
+            None => {
+                let Some(slot) = ps_attribute_slot(ps, attr as usize, chan as usize) else {
+                    return Err("attribute outside ISG1");
+                };
+                format!("xi.a{slot}[{chan}]")
+            }
         };
-        let src = format!("xi.a{slot}[{chan}]");
         let act = self.act();
         match name {
             "v_interp_p1_f32" | "v_interp_p1ll_f16" | "v_interp_p1lv_f16" => {
@@ -5253,7 +5276,9 @@ impl Em {
                     // the mode of the attribute this input is read through (none: never read)
                     let attr = ps_slot_attribute(ps, k);
                     let mut m = attr.and_then(|a| self.ps_modes.get(&(a as u32))).cloned().unwrap_or_default();
-                    if e.component_type != 3 {
+                    // float16 read through a packed attribute interpolates like a float
+                    let f16 = e.component_type == 6 && attr.is_some_and(|a| ps_attribute_f16(ps, a).is_some());
+                    if e.component_type != 3 && !f16 {
                         m = "nointerpolation".into();
                     }
                     let _ = writeln!(h, "    {m} {}4 a{k} : {};", hlsl_type(e), e.semantic());
