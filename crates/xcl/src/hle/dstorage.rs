@@ -18,7 +18,8 @@
 //! * queue: QueryInterface, AddRef, Release, EnqueueRequest, EnqueueStatus(array, index),
 //!   EnqueueSignal(fence, value), Submit, CancelRequestsWithTag(mask, value), Close,
 //!   GetErrorEvent, RetrieveErrorRecord (0x290 bytes), Query (0x1C: the desc, then empty
-//!   slots u16 @0x18 and requests until the automatic submit u16 @0x1A), then 6 more,
+//!   slots u16 @0x18 and requests until the automatic submit u16 @0x1A), then the X1
+//!   EnqueueSetEvent(handle) method and 5 more,
 //! * file: QueryInterface, AddRef, Release, Close, GetHandle, 2 unknown, GetId, then 4 more;
 //!   status array: QueryInterface, AddRef, Release, IsComplete(index), GetHResult(index),
 //!   then 5 more.
@@ -26,8 +27,9 @@
 //! Each queue has a worker thread: submitted requests run in order (file reads through the
 //! VFS like the title's own, memory copies, zlib, BCPack where `hle::bcpack` rebuilds the
 //! blocks of the mode), a status entry gets the first failure of the requests since the
-//! previous one, a signal sets the fence from the CPU. Methods not listed are logged and
-//! answer E_NOTIMPL; BCPack BC2 and modes above 7, and the hardware swizzle, are refused.
+//! previous one, a signal sets the fence from the CPU, and an event signals a Win32 waiter.
+//! Unlisted methods log and answer E_NOTIMPL. BCPack BC2, modes above 7, and the hardware
+//! swizzle are refused.
 
 #![allow(non_snake_case)]
 
@@ -36,7 +38,7 @@ mod parallel;
 
 use std::ffi::c_void;
 use std::os::windows::fs::FileExt;
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
@@ -45,7 +47,7 @@ use serde::{Deserialize, Serialize};
 use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
 use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
-use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, ResetEvent, SetEvent};
+use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, ResetEvent, SetEvent, EVENT_MODIFY_STATE};
 
 use crate::util::{HRESULT, S_OK};
 
@@ -1033,6 +1035,7 @@ enum Entry {
     Status(Arc<StatusInner>, u32),
     /// a fence (one reference held) and the value it gets
     Signal(FenceRef, u64),
+    SetEvent(OwnedHandle),
     #[cfg(test)]
     /// Test-only barrier to hold the worker deterministically while testing submitted-batch cancellation.
     Gate(Arc<std::sync::Barrier>),
@@ -1196,6 +1199,9 @@ impl QueueInner {
             Entry::Signal(fence, value) => unsafe {
                 fence.signal(value);
             },
+            Entry::SetEvent(event) => unsafe {
+                SetEvent(event.as_raw_handle());
+            },
             #[cfg(test)]
             Entry::Gate(b) => {
                 b.wait();
@@ -1273,6 +1279,7 @@ fn queue_vtbl() -> &'static [usize] {
                 queue_get_error_event as usize,
                 queue_retrieve_error_record as usize,
                 queue_query as usize,
+                queue_enqueue_set_event as usize, // IDStorageQueueX1
             ],
             18,
         )
@@ -1436,6 +1443,19 @@ unsafe extern "system" fn queue_enqueue_signal(p: *mut c_void, fence: *mut c_voi
     let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(1));
     add(fence);
     q.enqueue(Entry::Signal(FenceRef(fence as usize), value));
+}
+
+unsafe extern "system" fn queue_enqueue_set_event(p: *mut c_void, event: HANDLE) {
+    let q = queue(p);
+    if q.closed.load(Ordering::Acquire) || event.is_null() {
+        return;
+    }
+    // Retain a separate handle until the marker reaches the worker or is discarded.
+    let mut duplicate = std::ptr::null_mut();
+    let me = GetCurrentProcess();
+    if DuplicateHandle(me, event, me, &mut duplicate, EVENT_MODIFY_STATE, 0, 0) != 0 {
+        q.enqueue(Entry::SetEvent(OwnedHandle::from_raw_handle(duplicate)));
+    }
 }
 
 unsafe extern "system" fn queue_submit(p: *mut c_void) {
