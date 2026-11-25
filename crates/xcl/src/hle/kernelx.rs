@@ -253,6 +253,12 @@ pub mod mirrors {
         changed: Vec<(usize, usize)>,
     }
     static PAGES: Mutex<Pages> = Mutex::new(Pages { at: BTreeMap::new(), by_page: BTreeMap::new(), changed: Vec::new() });
+    static CHANGED_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// Monotonic generation bumped whenever `CopyPageMappingsBatchX` or physical-page moves change a GPU-view mapping.
+    pub fn changed_gen() -> u64 {
+        CHANGED_GEN.load(std::sync::atomic::Ordering::Acquire)
+    }
 
     impl Pages {
         /// GPU-view page `va` shows `to` from now on: `by_page` follows.
@@ -274,6 +280,7 @@ pub mod mirrors {
 
         /// The page at `va` changed (runs of pages kept together).
         fn note(&mut self, va: usize) {
+            CHANGED_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
             match self.changed.last_mut() {
                 Some((_, end)) if *end == va => *end += PAGE,
                 _ => self.changed.push((va, va + PAGE)),

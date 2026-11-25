@@ -1665,6 +1665,11 @@ pub fn note_watch(t: std::time::Duration, pages: usize) {
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
     let t0 = std::time::Instant::now();
+    // Resolve GPU-view tile sources before taking `STATE` so we never invert lock order
+    // against `kernelx` (`AWAY` -> `sparse::STATE` in `MapTitlePhysicalPages`).
+    if gpu_view::on() {
+        gpu_view::refresh_sources();
+    }
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     s.drain_deferred();

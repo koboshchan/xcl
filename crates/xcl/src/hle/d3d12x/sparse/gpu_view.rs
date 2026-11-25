@@ -107,6 +107,9 @@ impl State {
         for win in std::mem::take(&mut m.fresh) {
             let Some(&title) = m.title_of.get(&win) else { continue };
             let read = m.read[&title];
+            if read == 0 {
+                continue;
+            }
             pages.extend((0..PAGES_PER_TILE).map(|i| (win + i * PAGE, read + i * PAGE)));
         }
         pages.sort_unstable();
@@ -146,6 +149,16 @@ impl State {
     }
 }
 
+/// Where GPU-view tile `t` reads its bytes from (0 = unmapped via `CopyPageMappingsBatchX`).
+/// Must be called without holding `sparse::STATE` or `MIRRORS` to preserve lock ordering with `kernelx`.
+fn tile_source(t: usize) -> usize {
+    match crate::hle::kernelx::mirrors::mapped_source(t) {
+        Some(Some(a)) => a & !(TILE - 1),
+        Some(None) => 0,
+        None => super::super::title_textures::mirror_source(t) & !(TILE - 1),
+    }
+}
+
 /// The address a view of `len` bytes at `va` gets when it lies in a GPU view of the title's and
 /// in no memory window: where the same bytes can be read by a shader. None: it keeps `va`.
 pub fn base_for(va: usize, len: usize) -> Option<usize> {
@@ -162,7 +175,19 @@ pub fn base_for(va: usize, len: usize) -> Option<usize> {
     let (t0, t1) = (va & !(TILE - 1), (last & !(TILE - 1)) + TILE);
     let first = t0 & !(EXTENT - 1);
     let n = (t1 - first).div_ceil(EXTENT);
-    let known = MIRRORS.lock().unwrap().get_or_insert_with(Mirrors::default).extents.get(&(first, n)).copied();
+    let (known, missing_tiles) = {
+        let mut mg = MIRRORS.lock().unwrap();
+        let m = mg.get_or_insert_with(Mirrors::default);
+        if let Some(&w) = m.extents.get(&(first, n)) {
+            let missing: Vec<usize> = (t0..t1).step_by(TILE).filter(|t| !m.title_of.contains_key(&(w + (t - first)))).collect();
+            if missing.is_empty() {
+                return Some(w + (va - first));
+            }
+            (Some(w), missing)
+        } else {
+            (None, (t0..t1).step_by(TILE).collect())
+        }
+    };
     let win = match known {
         Some(w) => w,
         None => {
@@ -170,6 +195,16 @@ pub fn base_for(va: usize, len: usize) -> Option<usize> {
             *MIRRORS.lock().unwrap().get_or_insert_with(Mirrors::default).extents.entry((first, n)).or_insert(w)
         }
     };
+    // Resolve backing sources and hole masks BEFORE taking `sparse::STATE` so we never call into
+    // `kernelx` (which locks `AWAY` -> `sparse::STATE`) while holding `sparse::STATE`.
+    let resolved: FxHashMap<usize, (usize, u16)> = missing_tiles
+        .iter()
+        .map(|&t| {
+            let r = tile_source(t);
+            let holes = if r == 0 { u16::MAX } else { unsafe { query_tile_holes(r) } };
+            (t, (r, holes))
+        })
+        .collect();
     // (held: STATE, then MIRRORS, as in `sync`)
     let mut g = lock_state();
     let s = g.as_mut()?;
@@ -191,11 +226,12 @@ pub fn base_for(va: usize, len: usize) -> Option<usize> {
             }
             let (a, b) = (new[i], win + (new[i] - first));
             // SAFETY: the tiles are address space of a window, with no CPU memory behind them
-            unsafe { s.ensure_mapped(b, (j - i) * TILE, |w| query_tile_holes(super::super::title_textures::mirror_source(a + (w - b)))) };
+            unsafe { s.ensure_mapped(b, (j - i) * TILE, |w| resolved.get(&(a + (w - b))).map_or(u16::MAX, |&(_, h)| h)) };
             for &t in &new[i..j] {
                 let w = win + (t - first);
                 if s.mapped.contains_key(&w) {
-                    m.show(w, t, super::super::title_textures::mirror_source(t) & !(TILE - 1));
+                    let read = resolved.get(&t).map_or(0, |&(r, _)| r);
+                    m.show(w, t, read);
                 }
             }
             i = j;
@@ -214,28 +250,43 @@ pub fn base_for(va: usize, len: usize) -> Option<usize> {
 
 /// The pages of the CPU (and pool) side whose writes have to be seen: for the write watch.
 pub fn sources() -> Vec<(usize, usize)> {
-    MIRRORS.lock().unwrap().as_ref().map_or(Vec::new(), |m| m.by_read.keys().map(|&r| (r, r + TILE)).collect())
+    MIRRORS.lock().unwrap().as_ref().map_or(Vec::new(), |m| m.by_read.keys().copied().filter(|&r| r != 0).map(|r| (r, r + TILE)).collect())
 }
 
-/// `State::mirror_up` for a submit (`before_execute`; `s` is the locked state). A page the title
-/// mapped elsewhere or now has no mapping at all is looked at again when the mappings of a GPU
-/// view change, and a few tiles in turn otherwise.
+/// Refresh tile backing addresses outside `sparse::STATE` (called before `lock_state()` in `before_execute`).
+pub(super) fn refresh_sources() {
+    let look: Vec<usize> = {
+        let mut g = MIRRORS.lock().unwrap();
+        let Some(m) = g.as_mut().filter(|m| m.tiles() != 0) else { return };
+        let gen = crate::hle::kernelx::gpu_view_map_gen().wrapping_add(crate::hle::kernelx::mirrors::changed_gen());
+        let titles: Vec<usize> = m.read.keys().copied().collect();
+        let look = if std::mem::replace(&mut m.gen, gen) != gen {
+            titles
+        } else {
+            let n = titles.len().max(1);
+            (0..8.min(titles.len())).map(|i| titles[(m.turn + i) % n]).collect()
+        };
+        m.turn = m.turn.wrapping_add(8);
+        look
+    };
+    if look.is_empty() {
+        return;
+    }
+    let updates: Vec<(usize, usize)> = look.into_iter().map(|t| (t, tile_source(t))).collect();
+    let mut g = MIRRORS.lock().unwrap();
+    if let Some(m) = g.as_mut() {
+        for (t, r) in updates {
+            if m.read.contains_key(&t) {
+                m.set_read(t, r);
+            }
+        }
+    }
+}
+
+/// `State::mirror_up` for a submit (`before_execute`; `s` is the locked state).
 pub(super) unsafe fn sync(s: &mut State, dirty: &[usize]) {
     let mut g = MIRRORS.lock().unwrap();
     let Some(m) = g.as_mut().filter(|m| m.tiles() != 0) else { return };
-    let gen = crate::hle::kernelx::gpu_view_map_gen();
-    let titles: Vec<usize> = m.read.keys().copied().collect();
-    let look: Vec<usize> = if std::mem::replace(&mut m.gen, gen) != gen {
-        titles
-    } else {
-        let n = titles.len().max(1);
-        (0..8.min(titles.len())).map(|i| titles[(m.turn + i) % n]).collect()
-    };
-    m.turn = m.turn.wrapping_add(8);
-    for t in look {
-        let r = super::super::title_textures::mirror_source(t) & !(TILE - 1);
-        m.set_read(t, r);
-    }
     let n = s.mirror_up(m, dirty);
     static SENT: AtomicU64 = AtomicU64::new(0);
     static CALLS: AtomicU64 = AtomicU64::new(0);
@@ -270,6 +321,31 @@ mod tests {
         assert_eq!(m.shown_at(&[0xDD_2000]), vec![(0x30_2000, 0xDD_2000)]);
         m.set_read(0xBB_0000, 0xDD_0000);
         assert_eq!(m.fresh, vec![0x30_0000], "the same place again is nothing new");
+    }
+
+    #[test]
+    fn refresh_sources_tracks_copy_page_mappings_without_locking_sparse_state() {
+        use crate::hle::kernelx::mirrors::{apply_batches, changed_gen, reserved, released, PAGE};
+        let (cpu, gpu, size) = (0x7190_0000_0000usize, 0x7196_0000_0000usize, 4 * PAGE);
+        let pool = 0x719A_0000_0000usize;
+        reserved(cpu, size, 0x2040_2000, PAGE_READWRITE);
+        reserved(gpu, size, 0x2040_2000, 0x801);
+        let tile = gpu + PAGE;
+        assert_eq!(tile_source(tile), cpu + PAGE);
+        #[repr(C)]
+        struct Batch { dest: u64, ranges_n: u32, _pad: u32, ranges: u64 }
+        let g0 = changed_gen();
+        let r_map = [[0u32, 2, 1]]; // map 1 page to pool + 2*PAGE
+        let b_map = [Batch { dest: tile as u64, ranges_n: 1, _pad: 0, ranges: r_map.as_ptr() as u64 }];
+        unsafe { assert!(apply_batches(1, b_map.as_ptr() as usize, pool, 8).is_some()) };
+        assert!(changed_gen() > g0);
+        assert_eq!(tile_source(tile), pool + 2 * PAGE);
+        // Unmap the page -> tile_source returns 0 (never read as address 0)
+        let r_unmap = [[2u32, 0, 1]];
+        let b_unmap = [Batch { dest: tile as u64, ranges_n: 1, _pad: 0, ranges: r_unmap.as_ptr() as u64 }];
+        unsafe { assert!(apply_batches(1, b_unmap.as_ptr() as usize, pool, 8).is_some()) };
+        assert_eq!(tile_source(tile), 0);
+        released(cpu);
     }
 
     /// The bytes of the title's pages reach the window tiles mapped for them, and again when the
