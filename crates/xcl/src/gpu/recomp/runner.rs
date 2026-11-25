@@ -1617,7 +1617,7 @@ pub fn dispatch(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32]) -> Re
         })
     }
     .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
-    dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pso, &gpu.rs, groups, sgprs, mem, 1, false, None).map(|(m, _)| m)
+    dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pso, &gpu.rs, groups, sgprs, mem, 1, false, None, None).map(|(m, _)| m)
 }
 
 #[cfg(test)]
@@ -1643,8 +1643,89 @@ pub(crate) fn dispatch_split_by(
         }).map_err(e)
     }).collect::<Result<_,_>>()?;
     dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pieces[0], &rs, groups, &[], mem, 1, false,
-                  Some((&pieces, chain.dwords_per_group, most))).map(|(m,_)| m)
+                  Some((&pieces, chain.dwords_per_group, most)), None).map(|(m,_)| m)
 }
+
+/// A split program's ExecuteIndirect: the title's commands (one Dispatch, `stride` bytes each, as
+/// words), their count, the rounds, and the whole form for the predicated fallback.
+#[cfg(test)]
+pub(crate) struct ChainIndirect<'a> {
+    pub args: &'a [u32],
+    pub stride: u32,
+    pub commands: u32,
+    pub count: Option<u32>,
+    pub rounds: u32,
+    pub whole: Option<&'a [u8]>,
+}
+
+/// `dispatch_split_by` through ExecuteIndirect as the runtime records it (`pso::record_slicer`,
+/// the ABI bound again, `record_dispatch_chain_indirect`, the predicated whole form): the memory
+/// and the slicer's words after its commands (predicate, 0, slabs, 0).
+#[cfg(test)]
+pub(crate) fn dispatch_split_indirect(
+    chain: &crate::gpu::dxil::kernel::DispatchChain, ind: &ChainIndirect, mem: &[u32], most: u64,
+) -> Result<(Vec<u32>, [u32; 4]), String> {
+    let mut g = GPU.lock().unwrap();
+    let gpu = g.get_or_insert_with(init).as_mut().map_err(|e| e.clone())?;
+    let dev = gpu.dev.clone();
+    let rs = super::pso::dispatch_chain_root_signature(&dev, &[])?;
+    let make = |dxil: &[u8]| unsafe {
+        dev.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: transmute_copy(&rs),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() },
+            ..Default::default()
+        }).map_err(e)
+    };
+    let pieces: Vec<ID3D12PipelineState> = chain.pieces.iter().map(|d| make(d)).collect::<Result<_, _>>()?;
+    let whole = ind.whole.map(make).transpose()?;
+    let n = pieces.len() as u32;
+    let mut words = ind.args.to_vec();
+    words.push(ind.count.unwrap_or(0));
+    let count_at = ind.args.len() as u64 * 4;
+    let args = buffer(&dev, words.len() as u64 * 4, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?;
+    let commands = unsafe { super::pso::chain_commands_buffer(&dev, ind.rounds, n) }.ok_or("chain command buffer")?;
+    let sig = super::pso::chain_command_signature(&dev, &rs)?;
+    let arg = D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, ..Default::default() };
+    let mut title: Option<ID3D12CommandSignature> = None;
+    unsafe {
+        let mut p = std::ptr::null_mut();
+        args.Map(0, None, Some(&mut p)).map_err(e)?;
+        std::ptr::copy_nonoverlapping(words.as_ptr(), p as *mut u32, words.len());
+        args.Unmap(0, None);
+        dev.CreateCommandSignature(&D3D12_COMMAND_SIGNATURE_DESC { ByteStride: ind.stride, NumArgumentDescs: 1, pArgumentDescs: &arg, NodeMask: 0 }, None, &mut title).map_err(e)?;
+    }
+    let title = title.ok_or("command signature")?;
+    let mut record = |list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource, views: [u64; 3]| unsafe {
+        let va = args.GetGPUVirtualAddress();
+        super::pso::record_slicer(list, va, ind.stride, ind.commands, ind.count.map(|_| va + count_at), ind.rounds, most, n, &commands)?;
+        list.SetComputeRootSignature(&rs);
+        for (i, v) in views.into_iter().enumerate() {
+            list.SetComputeRootUnorderedAccessView(i as u32, v);
+        }
+        super::pso::record_dispatch_chain_indirect(list, &sig, &commands, ind.rounds, whole.is_some(), scratch, &pieces);
+        if let Some(whole) = &whole {
+            list.SetPredication(&commands, super::pso::chain_predicate_offset(ind.rounds, n), D3D12_PREDICATION_OP_EQUAL_ZERO);
+            list.SetPipelineState(whole);
+            list.ExecuteIndirect(&title, ind.commands, &args, 0, ind.count.map(|_| &args), ind.count.map_or(0, |_| count_at));
+            list.SetPredication(None::<&ID3D12Resource>, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+        }
+        Ok(())
+    };
+    let mem = dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pieces[0], &rs, [1, 1, 1], &[], mem, 1, false,
+                            Some((&pieces, chain.dwords_per_group, most)), Some(&mut record)).map(|(m, _)| m)?;
+    let at = super::pso::chain_predicate_offset(ind.rounds, n) as usize;
+    unsafe {
+        let mut p = std::ptr::null_mut();
+        commands.Map(0, None, Some(&mut p)).map_err(e)?;
+        let tail = std::ptr::read_volatile((p as *const u8).add(at) as *const [u32; 4]);
+        commands.Unmap(0, None);
+        Ok((mem, tail))
+    }
+}
+
+/// Records a chain's dispatch in `dispatch_with` instead of `record_dispatch_chain`: the list,
+/// the scratch (`most` groups) and the addresses of root views 0-2.
+type RecordChain<'a> = &'a mut dyn FnMut(&ID3D12GraphicsCommandList, &ID3D12Resource, [u64; 3]) -> Result<(), String>;
 
 /// `dispatch` run `reps` times in one command list (a UAV barrier between them, memory not
 /// reset), each between two GPU timestamps: GPU milliseconds per dispatch – no pipeline,
@@ -1660,7 +1741,7 @@ pub fn dispatch_timed(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32],
         })
     }
     .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
-    dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pso, &gpu.rs, groups, sgprs, mem, reps.max(1), true, None).map(|(_, t)| t)
+    dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pso, &gpu.rs, groups, sgprs, mem, reps.max(1), true, None, None).map(|(_, t)| t)
 }
 
 /// Dispatch with an existing compute pipeline on `dev` (its own queue), e.g. one the D3D12.X
@@ -1670,7 +1751,7 @@ pub fn dispatch_on(dev: &ID3D12Device, pso: &ID3D12PipelineState, rs: &ID3D12Roo
     unsafe {
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
-        dispatch_with(dev, &queue, &fence, &mut 0, pso, rs, groups, sgprs, mem, 1, false, None).map(|(m, _)| m)
+        dispatch_with(dev, &queue, &fence, &mut 0, pso, rs, groups, sgprs, mem, 1, false, None, None).map(|(m, _)| m)
     }
 }
 
@@ -1688,6 +1769,7 @@ fn dispatch_with(
     reps: usize,
     timed: bool,
     chain: Option<(&[ID3D12PipelineState], u32, u64)>,
+    mut record: Option<RecordChain>,
 ) -> Result<(Vec<u32>, Vec<f64>), String> {
     let mut io = sgprs.to_vec();
     io.resize(KERNEL_SGPRS, 0);
@@ -1741,7 +1823,7 @@ fn dispatch_with(
         list.SetComputeRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
         let scratch = chain.map(|(_, words, most)| {
             let first = super::pso::dispatch_slabs(groups, most)[0].1;
-            let bytes = first.iter().fold(4 * u64::from(words), |n, &g| n * u64::from(g));
+            let bytes = if record.is_some() { most * 4 * u64::from(words) } else { first.iter().fold(4 * u64::from(words), |n, &g| n * u64::from(g)) };
             buffer(dev, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true)
         }).transpose()?;
         // `reps` dispatches, each between two timestamps when `timed`
@@ -1762,7 +1844,9 @@ fn dispatch_with(
             if let Some((heap, _)) = &queries {
                 list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * k);
             }
-            if let (Some((pieces, _, most)), Some(scratch)) = (chain, &scratch) {
+            if let (Some(record), Some(scratch)) = (record.as_mut(), &scratch) {
+                record(&list, scratch, [io_buf.GetGPUVirtualAddress(), res_buf.GetGPUVirtualAddress(), mem_buf.GetGPUVirtualAddress()])?;
+            } else if let (Some((pieces, _, most)), Some(scratch)) = (chain, &scratch) {
                 super::pso::record_dispatch_chain(&list, groups, most, scratch, k > 0, pieces);
             } else {
                 list.Dispatch(groups[0], groups[1], groups[2]);
