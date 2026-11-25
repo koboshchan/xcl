@@ -253,7 +253,8 @@ fn signature_dispatches(sig: usize) -> bool {
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
-    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
+    let raw_pso = with(this, |s| s.pso);
+    let pso = super::pso_async::resolve_wait(raw_pso);
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if !gfx && !compute {
@@ -262,7 +263,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // call with that pair is invalid (debug layer 953, "the currently set Root Signature
         // doesn't match the currently set Pipeline State Object"; a retail title's world then
         // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
-        if super::pso_async::is_pending(with(this, |s| s.pso)) {
+        if super::pso_async::is_pending(raw_pso) {
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -270,15 +271,32 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             }
             return;
         }
+        // A finished two-pass MS/GS pipeline is a PC mesh shader pipeline (MS+PS) registered in
+        // TWO_PASS rather than TRANSLATED_GRAPHICS. Falling through to raw PC ExecuteIndirect
+        // with the title's graphics root signature (e.g. a non-DispatchMesh indirect draw or a
+        // root-changing signature) invalidates the command list (Close → E_INVALIDARG).
+        if let Some(tp) = super::real::two_pass_of(pso) {
+            count(DRAWS_SKIPPED);
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!(
+                    "D3D12.X: ExecuteIndirect with two-pass {} pipeline ({pso:#x}) skipped – PC pipeline is a mesh shader",
+                    tp.kind
+                );
+            }
+            return;
+        }
         // a console compute program without a translation (its build failed): nothing to run,
         // as for Dispatch. The PC call would run it with the list's compute root signature, which
         // can still be XCL's ABI one from a translated dispatch before it (debug layer 953).
         // A native PC compute pipeline is not one of these and still goes to the PC call.
-        if signature_dispatches(sig) && super::real::is_console_compute(pso) {
+        // (`CONSOLE_COMPUTE` holds the title's object, which for a shared stand-in differs from
+        // the driver pipeline `resolve_wait` returned.)
+        if signature_dispatches(sig) && (super::real::is_console_compute(raw_pso) || super::real::is_console_compute(pso)) {
             count(DISPATCHES_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
-                crate::xlog_warn!("D3D12.X: ExecuteIndirect dispatch with a pipeline that has no translated console shader ({pso:#x}) skipped");
+                crate::xlog_warn!("D3D12.X: ExecuteIndirect dispatch with a pipeline that has no translated console shader ({raw_pso:#x}) skipped");
             }
             return;
         }
@@ -299,6 +317,17 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
+            if compute {
+                match super::real::dispatch_chain::whole(pso) {
+                    Ok(Some(whole)) => list.SetPipelineState(&whole),
+                    Ok(None) => {}
+                    Err(e) => {
+                        crate::xlog_warn!("D3D12.X: ExecuteIndirect whole compute PSO: {e}");
+                        count(DISPATCHES_SKIPPED);
+                        return;
+                    }
+                }
+            }
             count(if gfx { DRAWS } else { DISPATCHES });
             fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off))
         }
@@ -496,7 +525,23 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?.clone();
     let pso = with(this, |s| s.pso);
     // a pipeline still being built in the background is waited for (its stand-in draws nothing)
-    if !super::real::is_translated_graphics(super::pso_async::resolve_wait(pso)) {
+    let real = super::pso_async::resolve_wait(pso);
+    if !super::real::is_translated_graphics(real) {
+        // A finished two-pass MS/GS pipeline is a PC mesh shader pipeline (MS+PS) registered in
+        // TWO_PASS rather than TRANSLATED_GRAPHICS. Binding the title's graphics RS and issuing
+        // DrawInstanced / DrawIndexedInstanced against a mesh PSO invalidates the command list
+        // (Close → E_INVALIDARG).
+        if let Some(tp) = super::real::two_pass_of(real) {
+            count(DRAWS_SKIPPED);
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!(
+                    "D3D12.X: draw with two-pass {} pipeline ({real:#x}) skipped – PC pipeline is a mesh shader",
+                    tp.kind
+                );
+            }
+            return None;
+        }
         count(DRAWS_PC);
         if super::present::trace_frame() {
             // which pipelines draw without a translation (first 12 distinct)
@@ -516,6 +561,9 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         // a PC pipeline (also a stand-in or fallback: made with the title's root signature):
         // the title's root signature, which nothing else binds on the PC list – a draw without
         // one is invalid (the debug layer reports it on every GPU; WARP faults on it)
+        if super::pso_async::is_pending(pso) {
+            super::list_x::note_dropped_draw(this);
+        }
         let rs = with(this, |s| s.rs_gfx) as *mut c_void;
         if let Some(r) = ID3D12RootSignature::from_raw_borrowed(&rs) {
             list.SetGraphicsRootSignature(r);
@@ -531,6 +579,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
             Some(list)
         }
         Err(e) => {
+            super::list_x::note_dropped_draw(this);
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
@@ -935,8 +984,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
         trace_fullscreen(this, pso, [x, y, z]);
     }
     bind_abi(this, list, pso, false)?;
-    list.Dispatch(x, y, z);
-    Ok(())
+    super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z])
 }
 
 /// XCL's ABI for a translated pipeline: its root signature, the user SGPRs (`io`, the kept
@@ -1438,6 +1486,205 @@ void main(uint t : SV_GroupIndex) {
         real::forget_pso_for_test(real_ok);
         real::forget_pso_for_test(standin_fail);
         assert!(!real::is_console_compute(standin_fail), "a released pipeline's address does not stay a console one");
+    }
+
+    #[test]
+    fn execute_indirect_skips_failed_shared_console_compute_standin() {
+        let mut orig_vt = [0usize; 64];
+        orig_vt[1] = fake_add_ref as usize;
+        orig_vt[2] = fake_release as usize;
+        orig_vt[14] = fake_dispatch as usize;
+        orig_vt[25] = fake_set_pso as usize;
+        orig_vt[29] = fake_set_compute_rs as usize;
+        orig_vt[41] = fake_set_compute_uav as usize;
+        orig_vt[59] = fake_execute_indirect as usize;
+
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+
+        let fake = Box::new(FakeAdoptedList {
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            refs: AtomicUsize::new(1),
+            dispatch_calls: AtomicUsize::new(0),
+            set_compute_rs_calls: AtomicUsize::new(0),
+            set_compute_uav_calls: AtomicUsize::new(0),
+            set_pso_calls: AtomicUsize::new(0),
+            execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let list_ptr = &*fake as *const FakeAdoptedList as *mut c_void;
+
+        // With shared stand-ins (`standin::shell`), `dev_create_compute_pso` registers the
+        // title-facing shell in `CONSOLE_COMPUTE`, while `pso_async::resolve_wait` returns the
+        // shared driver pipeline when the background build fails.
+        let shell_fail = 0x7210_0001usize;
+        let shell_ok = 0x7210_0002usize;
+        let shared_driver = 0x7210_0003usize;
+        let real_ok = 0x7210_0004usize;
+        let sig_dispatch = 0x7210_00F8usize;
+        let sig_root_changing = 0x7210_00F0usize;
+        note_signature_dispatches(sig_dispatch, true);
+        note_root_changing_signature(sig_root_changing);
+
+        pso_async::submit_lazy(shell_fail, true, Box::new(|| 0), 0);
+        pso_async::shared(shell_fail, shared_driver);
+        real::register_console_compute_for_test(shell_fail);
+
+        pso_async::submit_lazy(
+            shell_ok,
+            true,
+            Box::new(move || {
+                real::register_translated_compute_for_test(real_ok);
+                real_ok
+            }),
+            0,
+        );
+        pso_async::shared(shell_ok, shared_driver);
+        real::register_console_compute_for_test(shell_ok);
+
+        assert_eq!(pso_async::resolve_wait(shell_fail), shared_driver);
+        assert!(!pso_async::is_pending(shell_fail));
+        assert!(real::is_console_compute(shell_fail));
+        assert!(!real::is_console_compute(shared_driver));
+
+        // 1. Failed shared console compute stand-in with a Dispatch signature must be skipped,
+        // never forwarded to PC ExecuteIndirect with the shared driver pipeline.
+        reset(list_ptr, 0x7210_0100, shell_fail);
+        let before = counts_snapshot();
+        unsafe {
+            execute_indirect(list_ptr, sig_dispatch, 1, 0, 0, 0, 0);
+        }
+        let after = counts_snapshot();
+        assert_eq!(
+            fake.execute_indirect_calls.load(Ordering::Relaxed),
+            0,
+            "failed shared console compute stand-in must not reach PC ExecuteIndirect"
+        );
+        assert!(after[DISPATCHES_SKIPPED] > before[DISPATCHES_SKIPPED]);
+
+        // 2. Another shell sharing the same driver pipeline whose build succeeds still takes the
+        // translated path (caught here by the root-changing guard rather than falling through to PC).
+        reset(list_ptr, 0x7210_0100, shell_ok);
+        unsafe {
+            execute_indirect(list_ptr, sig_root_changing, 1, 0, 0, 0, 0);
+        }
+        assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 0);
+
+        // 3. Releasing `shell_fail` forgets its `CONSOLE_COMPUTE` entry so a native PC compute
+        // pipeline later allocated at the same address still reaches PC ExecuteIndirect.
+        let _ = pso_async::released(shell_fail);
+        real::forget_pso_for_test(shell_fail);
+        assert!(!real::is_console_compute(shell_fail));
+        reset(list_ptr, 0x7210_0100, shell_fail);
+        unsafe {
+            execute_indirect(list_ptr, sig_dispatch, 1, 0, 0, 0, 0);
+        }
+        assert_eq!(
+            fake.execute_indirect_calls.load(Ordering::Relaxed),
+            1,
+            "native PC pipeline at a released shell's address must still reach PC ExecuteIndirect"
+        );
+
+        forget(list_ptr);
+        note_signature_dispatches(sig_dispatch, false);
+        let _ = pso_async::released(shell_ok);
+        real::forget_pso_for_test(shell_ok);
+        real::forget_pso_for_test(real_ok);
+    }
+
+    #[test]
+    fn two_pass_pso_skips_direct_draw_and_unmatched_execute_indirect() {
+        #[repr(C)]
+        struct FakeTwoPassList {
+            vt: *const usize,
+            refs: AtomicUsize,
+            set_graphics_rs_calls: AtomicUsize,
+            execute_indirect_calls: AtomicUsize,
+        }
+        unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+            (*(this as *const FakeTwoPassList)).refs.fetch_add(1, Ordering::Relaxed) as u32 + 1
+        }
+        unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+            (*(this as *const FakeTwoPassList)).refs.fetch_sub(1, Ordering::Relaxed) as u32 - 1
+        }
+        unsafe extern "system" fn set_graphics_rs(this: *mut c_void, _rs: *mut c_void) {
+            (*(this as *const FakeTwoPassList)).set_graphics_rs_calls.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe extern "system" fn exec_indirect(
+            this: *mut c_void,
+            _sig: usize,
+            _max: u32,
+            _args: usize,
+            _args_off: u64,
+            _count_buf: usize,
+            _count_off: u64,
+        ) {
+            (*(this as *const FakeTwoPassList)).execute_indirect_calls.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let mut orig_vt = [0usize; 64];
+        orig_vt[1] = add_ref as usize;
+        orig_vt[2] = release as usize;
+        orig_vt[30] = set_graphics_rs as usize;
+        orig_vt[59] = exec_indirect as usize;
+
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+
+        let fake = Box::new(FakeTwoPassList {
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            refs: AtomicUsize::new(1),
+            set_graphics_rs_calls: AtomicUsize::new(0),
+            execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let list_ptr = &*fake as *const FakeTwoPassList as *mut c_void;
+
+        // Register a finished two-pass GS/MS PSO behind an async stand-in (registered in TWO_PASS,
+        // not TRANSLATED_GRAPHICS).
+        let standin_tp = 0x7250_0001usize;
+        let real_tp = 0x7250_0002usize;
+        pso_async::submit(
+            standin_tp,
+            false,
+            Box::new(move || {
+                real::register_two_pass_for_test(real_tp, "GS");
+                real_tp
+            }),
+        );
+        assert_eq!(pso_async::resolve_wait(standin_tp), real_tp);
+        assert!(real::two_pass_of(real_tp).is_some());
+        assert!(!real::is_translated_graphics(real_tp));
+
+        reset(list_ptr, 0x7250_0100, standin_tp);
+        unsafe {
+            // Seed a non-null title graphics RS so a fallthrough would visibly call SetGraphicsRootSignature.
+            set_graphics_root_signature(list_ptr, list_ptr);
+        }
+
+        // 1. Direct draw (`graphics_bound`) must return None without binding the title's RS.
+        let before = counts_snapshot();
+        let bound = unsafe { graphics_bound(list_ptr) };
+        let after = counts_snapshot();
+        assert!(bound.is_none(), "two-pass MS/GS PSO must not fall through to PC DrawInstanced");
+        assert!(after[DRAWS_SKIPPED] > before[DRAWS_SKIPPED]);
+        assert_eq!(after[DRAWS_PC], before[DRAWS_PC]);
+        assert_eq!(fake.set_graphics_rs_calls.load(Ordering::Relaxed), 0);
+
+        // 2. Unmatched `ExecuteIndirect` must skip without binding the title's RS or calling PC ExecuteIndirect.
+        let before = counts_snapshot();
+        unsafe {
+            execute_indirect(list_ptr, 0x7250_00F0, 1, 0, 0, 0, 0);
+        }
+        let after = counts_snapshot();
+        assert!(after[DRAWS_SKIPPED] > before[DRAWS_SKIPPED]);
+        assert_eq!(fake.set_graphics_rs_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 0);
+
+        forget(list_ptr);
+        let _ = pso_async::released(standin_tp);
+        real::forget_pso_for_test(real_tp);
+        assert!(real::two_pass_of(real_tp).is_none());
     }
 
     #[test]

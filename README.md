@@ -239,8 +239,29 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - XCL works on **unpacked** game files you own; it contains nothing for decrypting or
   circumventing DRM.
 - **The game folder is never modified** – writes go to the overlay.
+- **Switches for how a title runs** (set them in the environment of `xcl run`):
+  - `XCL_SKIP_BINK`: skips the Bink 2 movies of a title that ships a `bink2*.dll` (its logos and
+    intros), by taking them straight to their last frame without decoding. Off when unset or `0`,
+    `off`, `false` or `no`; `all` also skips looping movies; any other value (`1`, `intro` …)
+    skips the ones that do not loop.
+  - `XCL_MUTE_TTS`: the title gets no Windows speech synthesis: its XAccessibility requests are
+    answered by XCL's own object, which has closed captions and high contrast only. Off by
+    default; any value except empty, `0`, `off` or `false` (in any case) turns it on.
+  - `XCL_FRAME_INTERVAL_US`: changes the console frame clock. Unset, the title's own frame
+    interval (`SetFrameIntervalX`) is kept. `0`, `off` or `uncapped` removes the cap, so
+    `WaitFrameEventX` returns at once with a fresh token. A number of microseconds is an upper
+    bound on the interval, never below 1000: `8333` for 120 Hz, `4167` for 240 Hz.
+  - `XCL_WAIT_TIMEOUT_MS` and `XCL_GPU_WAIT_TIMEOUT_MS`, for diagnostics: the longest XCL waits
+    for a `Wait32BitValueX` / `Wait64BitValueX` that nothing satisfies (2000 ms) and the
+    watchdog for a GPU queue wait (5000 ms). A value that is not a number above 0 keeps the
+    default.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
+- Direct compute dispatches can split large programs into pipelines built in parallel.
+  `XCL_DIRECT_SPLIT_INSTRUCTIONS` sets the target instructions per piece (default 12500,
+  zero disables splitting). Loops stay in one piece. A strongly connected component over the
+  target gets its own piece, up to four times the target. Larger components and indirect
+  dispatches use the whole pipeline.
 - Huge pipelines (translated DXIL of `XCL_HUGE_PSO_BYTES` or more, default 262144) built on the
   background `xcl-pso*` workers take turns in the driver's compiler: `XCL_HUGE_PSO_CONCURRENCY`
   at once (default 1, maximum 64). Pipelines of 4 MiB or more use a separate one-wide lane so
@@ -255,7 +276,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   0x…`): its dispatches are skipped.
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
-  those on which the GPU completed at least one operation.
+  those on which the GPU completed at least one operation. For each, it names the translated
+  pipeline bound at the last operation DRED saw complete and those bound after it, by their
+  console shaders' hashes (`cs`, `vs` / `ps`, `ms` / `ps`, `vs` / `gs` / `ps`).
 - `XCL_DSTORAGE_PARALLEL_DECOMPRESS=1` enables parallel CPU decompression for file-backed zlib
   requests with virtual destinations. Defaults: four workers and a shared 32 MiB staging budget
   (`XCL_DSTORAGE_WORKERS`, `XCL_DSTORAGE_MEMORY_BUDGET_MIB`). Requests retire in queue order.
