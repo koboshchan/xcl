@@ -168,6 +168,22 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
     console_list::hold_until_reset(old, blocks);
 }
 
+/// A submit is about to wait for the pipeline `this` has bound.
+pub(super) fn want_bound(this: *mut c_void) {
+    super::pso_async::want(with(this, |s| s.pso));
+}
+
+/// A put-off dispatch that could not be recorded.
+pub(super) fn dispatch_dropped() {
+    count(DISPATCHES_SKIPPED);
+}
+
+/// `to` goes on in the arena `from` took its pieces from (`from` takes no more).
+pub(super) fn pass_arena(from: *mut c_void, to: *mut c_void) {
+    let arena = with(from, |s| std::mem::take(&mut s.arena));
+    with(to, |s| s.arena = arena);
+}
+
 /// The list is gone.
 pub(super) fn forget(list: *mut c_void) {
     if let Some(mut s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
@@ -705,6 +721,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let raw_pso = with(this, |s| s.pso);
+    let unbuilt_compute = signature_dispatches(sig) && super::pso_async::is_pending(raw_pso) && super::real::is_console_compute(raw_pso);
+    if unbuilt_compute && super::list_x::defer(this, super::list_x::Deferred::Indirect(sig, max, args, args_off, count_buf, count_off)) {
+        return super::pso_async::need_by_submit(raw_pso);
+    }
     let pso = super::pso_async::resolve_wait(raw_pso);
     // where the commands are in unified memory (a console buffer's offsets are the title's)
     let commands_at = super::real::console_buffer(args).map(|(p, n)| (p + args_off as usize, n.saturating_sub(args_off as usize)));
@@ -1367,7 +1387,11 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
-    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
+    let pso = with(this, |s| s.pso);
+    if super::pso_async::is_pending(pso) && super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z)) {
+        return super::pso_async::need_by_submit(pso);
+    }
+    let pso = super::pso_async::resolve_wait(pso);
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
         // a console pipeline without a translation (including a background build that
@@ -1538,7 +1562,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let rs = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
     let rs = rs as *mut c_void;
     let rs = ID3D12RootSignature::from_raw_borrowed(&rs).ok_or("root signature")?;
-    let views = [va(io_at), va(res_at)].into_iter().chain((0..4).map(|k| windows.get(k).copied().unwrap_or(first)));
+    let views = [va(io_at), va(res_at)].into_iter().chain((0..4).map(|k| windows.get(k).copied().filter(|&v| v != 0).unwrap_or(first)));
     if gfx {
         list.SetGraphicsRootSignature(rs);
         for (k, v) in views.enumerate() {
@@ -1626,6 +1650,7 @@ mod tests {
         use std::mem::{transmute_copy, ManuallyDrop};
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, IDXGIAdapter1, IDXGIFactory6, DXGI_CREATE_FACTORY_FLAGS};
 
         const TRIES: u32 = 40;
         // mode 0: write (x, 1, 1) at a[0..12]; mode 1: count the groups
@@ -1641,11 +1666,35 @@ void main(uint t : SV_GroupIndex) {
     if (mode == 0u) a.Store3(0, uint3(x, 1u, 1u)); else c.InterlockedAdd(0, 1u);
 }
 "#;
+        if crate::gpu::recomp::dxc::location().is_err() {
+            skip_test("no DXC");
+            return;
+        }
         unsafe {
-            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
-                skip_test("no GPU");
-                return;
+            let setup = || -> Result<(ID3D12Device, String), String> {
+                let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("DXGI factory unavailable: {e}"))?;
+                let sel = crate::gpu::adapter::Selector::from_env_or("auto");
+                let (adapter, name): (IDXGIAdapter1, String) = if sel == crate::gpu::adapter::Selector::Warp {
+                    (factory.EnumWarpAdapter().map_err(|e| format!("WARP unavailable: {e}"))?, "WARP (software renderer)".into())
+                } else {
+                    let (adapter, desc) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next()
+                        .ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
+                    (adapter, crate::gpu::adapter::name(&desc))
+                };
+                let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_11_0).map_err(|e| format!("{name}: D3D12 device unavailable ({e})"))?;
+                let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: D3D_SHADER_MODEL_6_6 };
+                dev.CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &mut sm as *mut _ as _, std::mem::size_of_val(&sm) as u32)
+                    .map_err(|e| format!("{name}: cannot query SM 6.6 ({e})"))?;
+                if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+                    return Err(crate::gpu::agility::format_no_sm66_message(&name, crate::gpu::agility::state()));
+                }
+                Ok((dev, name))
             };
+            let (dev, name) = match setup() {
+                Ok(selected) => selected,
+                Err(reason) => { skip_test(&reason); return; }
+            };
+            println!("ExecuteIndirect adapter: {name}");
             let dxil = crate::gpu::recomp::dxc::compile(src, "main", "cs_6_6", &[]).unwrap();
             let rs: ID3D12RootSignature = dev.CreateRootSignature(0, &dxil).unwrap();
             let cs = D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() };
