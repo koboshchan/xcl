@@ -950,7 +950,15 @@ unsafe fn refresh_once(queue: *mut c_void) {
             .collect()
     });
     seed_stream_recheck(&todo, &ranges, recheck_frame);
+    let uploaded = !todo.is_empty();
     upload_all(todo);
+    // Ensure the submitting queue waits for any `vram::map_levels` tile mappings queued inside
+    // `upload_all`, even if an upload batch failed or exited early before its upload-queue wait.
+    if uploaded {
+        if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
+            super::vram::before_execute(q);
+        }
+    }
 }
 
 /// texture → `content_hash` of its memory at its last upload
