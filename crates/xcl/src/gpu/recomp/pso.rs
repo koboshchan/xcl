@@ -954,6 +954,21 @@ fn direct_fallback(stage: &str, err: &str) {
     crate::xlog_info!("[SHADER] direct DXIL fallback stage={stage} reason=\"{reason}\" detail=\"{}\" – HLSL path", err.lines().next().unwrap_or(""));
 }
 
+/// Whether the program takes an address in its code region for something else than a far jump
+/// (`rdna2::resolve_far_jumps`): an `s_getpc_b64` the compiler emits to reach the constant
+/// data after the program.
+fn takes_code_address(code: &[u8]) -> bool {
+    let mut insts = Vec::new();
+    let mut off = 0usize;
+    while off + 4 <= code.len() {
+        let Ok(d) = crate::gpu::rdna2::decode(&code[off..], off as u64) else { return false };
+        off += d.len;
+        insts.push(d);
+    }
+    crate::gpu::rdna2::resolve_far_jumps(&mut insts);
+    (0..insts.len()).any(|i| insts[i].inst.name == "S_GETPC_B64" && !insts.get(i + 3).is_some_and(|s| s.far_target.is_some()))
+}
+
 /// A console compute shader through the direct DXIL translator (`gpu::dxil::kernel`).
 /// FSPX (driver) containers are left to the HLSL path.
 fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
@@ -962,10 +977,13 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
     let Some(Mode::Compute(cs)) = interface(blob, &sh, f) else { return Err("not a compute interface".into()) };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
+    // the constant data the program reads from its own code region (`Options::rodata`)
+    let rodata = f.rodata(p);
     let wave64 = super::fssm_wave64(f, code);
     let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: windows, sampler_base };
     // `XCL_PER_LANE=1`: the per-lane form first, #1426's per-instruction form where it refuses
-    if super::lower_dxil::enabled() {
+    // (and for a program that reads constant data in its code: the per-lane form has no table)
+    if super::lower_dxil::enabled() && !(!rodata.is_empty() && takes_code_address(code)) {
         match super::lower_dxil::compute_with(code, &cs, o) {
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("CS per-lane");
@@ -978,7 +996,7 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
             }
         }
     }
-    let k = crate::gpu::dxil::kernel::translate_compute_on(code, o, &cs, split_wave64)?;
+    let k = crate::gpu::dxil::kernel::translate_entry_rodata(code, o, crate::gpu::dxil::kernel::Entry::Compute(cs), split_wave64, &rodata)?;
     dump_direct(blob, &k.dxil);
     Ok(Compiled { dispatch_chain: k.dispatch_chain, dxil: k.dxil, samplers: k.static_samplers })
 }
@@ -1009,11 +1027,12 @@ fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32) -
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
     let o = crate::gpu::dxil::kernel::KernelOptions { wave64: super::fssm_wave64(f, code), split: false, mem_windows: windows, sampler_base };
-    let k = match (&mode, stage) {
-        (Mode::Vertex(vs), Stage::Vertex) => crate::gpu::dxil::kernel::translate_vertex(code, o, vs)?,
-        (Mode::Pixel(ps), Stage::Pixel) => crate::gpu::dxil::kernel::translate_pixel(code, o, ps)?,
+    let entry = match (&mode, stage) {
+        (Mode::Vertex(vs), Stage::Vertex) => crate::gpu::dxil::kernel::Entry::Vertex(vs.clone()),
+        (Mode::Pixel(ps), Stage::Pixel) => crate::gpu::dxil::kernel::Entry::Pixel(ps.clone()),
         _ => return Err("the shader stage does not match its slot in the PSO".into()),
     };
+    let k = crate::gpu::dxil::kernel::translate_entry_rodata(code, o, entry, false, &f.rodata(p))?;
     dump_direct(blob, &k.dxil);
     Ok(Compiled { dispatch_chain: None, dxil: k.dxil, samplers: k.static_samplers })
 }
@@ -1053,7 +1072,7 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, rodata: f.rodata(p), ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -1096,6 +1115,7 @@ fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option
 fn compile_console_mesh(
     blob: &[u8],
     code: &[u8],
+    rodata: Vec<(u32, Vec<u32>)>,
     ms: &super::MsInterface,
     wave64: bool,
     windows: u32,
@@ -1112,7 +1132,7 @@ fn compile_console_mesh(
             mem_windows: windows,
             sampler_base: 0,
         };
-        match crate::gpu::dxil::kernel::translate_mesh(code, o, ms) {
+        match crate::gpu::dxil::kernel::translate_entry_rodata(code, o, crate::gpu::dxil::kernel::Entry::Mesh(ms.clone()), false, &rodata) {
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("MS");
                 dump_direct(blob, &k.dxil);
@@ -1121,7 +1141,7 @@ fn compile_console_mesh(
             Err(e) => direct_fallback("MS", &e),
         }
     }
-    let t = super::translate_mesh(code, ms.clone(), wave64, split_wave64, windows)?;
+    let t = translate(code, &Options { mode: Mode::Mesh(ms.clone()), wave64, split_wave64, mem_windows: windows, rodata, ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -1137,7 +1157,7 @@ fn console_mesh_with(
     windows: u32,
     cache_dir: &std::path::Path,
     cache: &Mutex<ShaderCache>,
-    compile: impl FnOnce(&[u8], &super::MsInterface, bool) -> Result<Compiled, String>,
+    compile: impl FnOnce(&[u8], Vec<(u32, Vec<u32>)>, &super::MsInterface, bool) -> Result<Compiled, String>,
 ) -> Result<TwoPass, String> {
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)).ok_or("no NGG hardware variant")?;
@@ -1148,7 +1168,7 @@ fn console_mesh_with(
     let code = &f.data[p.offset..p.offset + p.len];
     let wave64 = super::fssm_wave64(f, code);
     let split = wave64 && split_wave64;
-    let compile_one = || compile(code, ms, wave64);
+    let compile_one = || compile(code, f.rodata(p), ms, wave64);
     // Cache the mesh compute pass in RAM (`ShaderCache` + in-flight coalescing) and on disk
     // (`translated/v2`, namespaced by backend) across all `(MS, PS)` pipelines that share it.
     let cs = if cache_allowed(Stage::Mesh, |name| std::env::var_os(name).is_some()) {
@@ -1173,8 +1193,8 @@ fn console_mesh_with(
 pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
     let windows = mem_windows();
     let dir = dxc::cache_dir();
-    console_mesh_with(blob, ps, split_wave64, windows, &dir, shader_cache(), |code, ms, wave64| {
-        compile_console_mesh(blob, code, ms, wave64, windows, split_wave64)
+    console_mesh_with(blob, ps, split_wave64, windows, &dir, shader_cache(), |code, rodata, ms, wave64| {
+        compile_console_mesh(blob, code, rodata, ms, wave64, windows, split_wave64)
     })
 }
 
@@ -1965,9 +1985,9 @@ mod shader_cache_tests {
         let compiles = AtomicUsize::new(0);
 
         let run = |c: &Mutex<ShaderCache>| {
-            console_mesh_with(&blob, None, false, 1, &dir, c, |code, ms, wave64| {
+            console_mesh_with(&blob, None, false, 1, &dir, c, |code, rodata, ms, wave64| {
                 compiles.fetch_add(1, Ordering::SeqCst);
-                compile_console_mesh(&blob, code, ms, wave64, 1, false)
+                compile_console_mesh(&blob, code, rodata, ms, wave64, 1, false)
             })
         };
 

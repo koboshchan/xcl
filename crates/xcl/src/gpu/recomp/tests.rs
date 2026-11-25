@@ -4648,6 +4648,88 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
     }
 }
 
+/// Constant data after the program (`Options::rodata`): `s_getpc_b64` plus the compiler's
+/// offset is its address, and `s_load` / `global_load` read it from the shader. The memory
+/// does not hold the code (a retail tone-map LUT bake read zeros for its spline coefficients
+/// there and wrote one colour to every texel); any other address still reads the memory.
+#[test]
+fn gpu_loads_read_the_constant_data_after_the_program() {
+    let body = |table: u32| {
+        prog(&[
+            ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 0)], None), // s[0:1] = 4
+            ("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 255)], Some(table.wrapping_sub(4))),
+            ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 128)], None),
+            ("GLOBAL_LOAD_DWORDX3", "ENC_FLAT_GLBL", &[("VDST", 5), ("ADDR", 10), ("SADDR", 0), ("OFFSET", 0)], None),
+            ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 0), ("OFFSET", 4), ("SOFFSET", 125)], None),
+            ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 24), ("SBASE", 0), ("OFFSET", 8), ("SOFFSET", 125)], None),
+            // memory, not the data: v[12:13] and s[2:3]
+            ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 8), ("ADDR", 12), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+            ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 28), ("SBASE", 1), ("OFFSET", 0), ("SOFFSET", 125)], None),
+        ])
+    };
+    // as in retail data: program, guard s_endpgm, block (u32 N, N dwords, s_endpgm)
+    let block = body(0).len() as u32 + 4;
+    let code = body(block + 4);
+    let table: Vec<u32> = (0..8).map(|i| 0x7AB1_E000 + i).collect();
+    let mut data = vec![table.len() as u32];
+    data.extend(&table);
+    data.push(0xBF81_0000);
+    let rodata = vec![(block, data)];
+    assert!(!translate(&code, &Options::default()).unwrap().hlsl.contains("xcl_gload"), "no data, no loader");
+    if !gpu_ready() {
+        return;
+    }
+    let check = |r: &runner::KernelResult, what: &str| {
+        assert_eq!(r.sgpr[20], table[1], "{what}: s_load_dword of the table");
+        assert_eq!(r.sgpr[24..28], table[2..6], "{what}: s_load_dwordx4 of the table");
+        assert_eq!(r.sgpr[28..30], [4242, 4343], "{what}: s_load from memory");
+        for l in 0..64usize {
+            let k = l % 6;
+            assert_eq!(r.vgpr[l][5..8], table[k..k + 3], "{what}, lane {l}: three dwords of the table from {k}");
+            assert_eq!(r.vgpr[l][8], 7000 + l as u32, "{what}, lane {l}: memory outside the data");
+        }
+    };
+    // one window: nothing of the code is in the memory
+    let mut st = KernelState::default();
+    st.sgpr[2] = 0x900;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[10] = 4 * (l as u32 % 6);
+        r[12] = 0x800 + 4 * l as u32;
+    }
+    let mut mem = vec![0u32; 1024];
+    mem[0x240..0x242].copy_from_slice(&[4242, 4343]);
+    for l in 0..64 {
+        mem[0x200 + l] = 7000 + l as u32;
+    }
+    let t = translate(&code, &Options { rodata: rodata.clone(), ..runner::options(Mode::Kernel) }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported);
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    check(&runner::run(&dxil, &st, &mem).unwrap(), "one window");
+    // several windows: a code address is in none of them, and window 0 holds other bytes at
+    // the table's offset
+    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
+    let (w0, w1) = (arena.window(0).0 as u64, arena.window(1).0 as u64);
+    let word = |a: u64| unsafe { &mut *(a as *mut u32) };
+    for k in 0..16u64 {
+        *word(w0 + block as u64 + 4 * k) = 0xBAD0_0000 + k as u32;
+    }
+    *word(w1 + 0x900) = 4242;
+    *word(w1 + 0x904) = 4343;
+    st.sgpr[2..4].copy_from_slice(&[(w1 + 0x900) as u32, (w1 >> 32) as u32]);
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        *word(w1 + 0x800 + 4 * l as u64) = 7000 + l as u32;
+        r[12] = (w1 + 0x800 + 4 * l as u64) as u32;
+        r[13] = (w1 >> 32) as u32;
+    }
+    for heap in [false, true] {
+        let t = translate(&code, &on_gpu(Options { mem_windows: 2, heap_windows: heap, rodata: rodata.clone(), ..Default::default() })).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported);
+        assert!(t.hlsl.contains(&format!("if (xcl_w == 0xC0DEu - xcl_uma_base && a - {block}u < 40u)")), "the data is at code addresses only:\n{}", t.hlsl);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+        check(&runner::run_in_arena(&dxil, &st, &arena).unwrap(), if heap { "heap windows" } else { "two windows" });
+    }
+}
+
 /// Experiment: does OpenExistingHeapFromAddress accept a reservation with only part committed?
 #[test]
 #[ignore]
