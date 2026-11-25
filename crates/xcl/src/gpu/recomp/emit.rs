@@ -72,10 +72,30 @@ pub(super) struct Em {
     /// LDS arrival barrier (`xcl_s_barrier`) so RDNA2 early `s_endpgm`, `LOOP_GUARD` exits,
     /// or split-wave64 desyncs cannot permanently hang an NVIDIA SM at `bar.sync`.
     safe_barrier: bool,
+    /// program writes/atomics global or image UAVs or uses `GLC=1`: `s_barrier` must also flush
+    /// global device memory (`AllMemoryBarrierWithGroupSync` / `AllMemoryBarrier`) on RDNA4.
+    barrier_uav_fence: bool,
     /// the T# SGPRs of the program's image stores and atomics (`image_write_srsrcs`)
     img_writes: Vec<u64>,
     /// compute program needs `globallycoherent` on flat memory windows (`needs_coherent_mem`)
     pub coherent_mem: bool,
+}
+
+/// True when the program writes or atomically updates global/image memory or performs a
+/// globally-coherent (`GLC=1`) memory access. On RDNA4, `s_barrier` in such shaders must emit
+/// a global UAV fence (`AllMemoryBarrierWithGroupSync` / `barrier::ALL_SYNC`) so L0/L1 caches
+/// become visible across waves/workgroups alongside LDS/TGSM.
+pub fn has_uav_write_or_glc(insts: &[Decoded]) -> bool {
+    insts.iter().any(|d| {
+        if !matches!(d.enc.name, "ENC_MUBUF" | "ENC_MTBUF" | "ENC_MIMG" | "ENC_FLAT" | "ENC_FLAT_GLBL" | "ENC_SMEM") {
+            return false;
+        }
+        if rdna2::field_value(d.enc, &d.words, "GLC") == Some(1) {
+            return true;
+        }
+        let n = d.inst.name;
+        n.contains("STORE") || n.contains("ATOMIC")
+    })
 }
 
 /// The T# SGPRs (SRSRC) of a program's image stores and atomics, at most 16, sorted. An
@@ -624,6 +644,7 @@ impl Em {
             dynamic_f16_rm: false,
             track_frexp_denorm: false,
             safe_barrier: false,
+            barrier_uav_fence: false,
             img_writes: Vec::new(),
             coherent_mem: false,
         }
@@ -645,6 +666,7 @@ impl Em {
     pub fn configure_round_modes(&mut self, insts: &[Decoded], stop_at_endpgm: bool) {
         self.track_frexp_denorm = tracks_frexp_f32_denorm(insts);
         self.img_writes = image_write_srsrcs(insts);
+        self.barrier_uav_fence = has_uav_write_or_glc(insts);
         let mut writes_nonzero_dp = false;
         let mut has_s_barrier = false;
         for d in insts {
@@ -1300,20 +1322,26 @@ impl Em {
         match name {
             "s_endpgm" | "s_endpgm_saved" | "s_endpgm_ordered_ps_done" => Flow::End,
             "s_barrier" => {
+                let sync_fn = if self.barrier_uav_fence { "AllMemoryBarrierWithGroupSync" } else { "GroupMemoryBarrierWithGroupSync" };
+                let mem_fn = if self.barrier_uav_fence { "AllMemoryBarrier" } else { "GroupMemoryBarrier" };
                 if self.x64() && matches!(self.opt.mode, Mode::Geometry(_)) {
                     // split ES+GS: the GS phase runs in the lower hardware wave alone (one console
                     // wave: nothing to wait for), a group barrier there would wait for the other
-                    self.line("if (xcl_es_phase) GroupMemoryBarrierWithGroupSync();");
+                    self.line(&format!("if (xcl_es_phase) {sync_fn}();"));
                 } else if matches!(self.opt.mode, Mode::Compute(_) | Mode::Mesh(_)) {
                     if self.safe_barrier {
-                        self.line("xcl_s_barrier();");
+                        if self.barrier_uav_fence {
+                            self.line("AllMemoryBarrier(); xcl_s_barrier(); AllMemoryBarrier();");
+                        } else {
+                            self.line("xcl_s_barrier();");
+                        }
                     } else if self.compute_or_mesh_hw_waves() == Some(1) {
-                        self.line("GroupMemoryBarrier();");
+                        self.line(&format!("{mem_fn}();"));
                     } else {
-                        self.line("GroupMemoryBarrierWithGroupSync();");
+                        self.line(&format!("{sync_fn}();"));
                     }
                 } else if matches!(self.opt.mode, Mode::Kernel | Mode::Geometry(_)) {
-                    self.line("GroupMemoryBarrierWithGroupSync();");
+                    self.line(&format!("{sync_fn}();"));
                 }
                 Flow::Next
             }

@@ -1069,3 +1069,41 @@ fn scratch_reads_addr_only_in_the_sv_form() {
     assert!(kernel(0x7D, 2) != kernel(0x7D, 3), "SV (SADDR 0x7d) addresses VADDR + offset");
     assert!(kernel(0x7F, 2) != kernel(0x7D, 2), "ST is not the SV form");
 }
+
+#[test]
+fn s_barrier_emits_all_sync_when_shader_writes_uav_or_uses_glc() {
+    let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+
+    // Pure ALU + s_barrier keeps GROUP_SYNC (mode 9 = SYNC_THREAD_GROUP | TGSM_FENCE).
+    let lds_only = prog(&[
+        ("S_BARRIER", "ENC_SOPP", &[], None),
+    ]);
+    let dxil_lds = translate(&lds_only, ko).expect("lds-only barrier translates");
+    super::validate::validate(&dxil_lds).expect("lds-only validates");
+    if let Ok(dis) = super::validate::disassemble(&dxil_lds) {
+        assert!(dis.contains("dx.op.barrier(i32 80, i32 9)"), "expected GROUP_SYNC (9):\n{dis}");
+        assert!(!dis.contains("dx.op.barrier(i32 80, i32 11)"), "unexpected ALL_SYNC (11):\n{dis}");
+    }
+
+    // Shader with a global store upgrades s_barrier to ALL_SYNC (mode 11 = GROUP_SYNC | UAV_FENCE_GLOBAL).
+    let with_store = prog(&[
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 1), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+        ("S_BARRIER", "ENC_SOPP", &[], None),
+    ]);
+    let dxil_store = translate(&with_store, ko).expect("store + barrier translates");
+    super::validate::validate(&dxil_store).expect("store + barrier validates");
+    if let Ok(dis) = super::validate::disassemble(&dxil_store) {
+        assert!(dis.contains("dx.op.barrier(i32 80, i32 11)"), "expected ALL_SYNC (11):\n{dis}");
+    }
+
+    // Shader with a GLC=1 load also upgrades s_barrier to ALL_SYNC (mode 11).
+    let with_glc = prog(&[
+        ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 1), ("ADDR", 0), ("SADDR", 0x7D), ("OFFSET", 0), ("GLC", 1)], None),
+        ("S_BARRIER", "ENC_SOPP", &[], None),
+    ]);
+    let dxil_glc = translate(&with_glc, ko).expect("glc load + barrier translates");
+    super::validate::validate(&dxil_glc).expect("glc load + barrier validates");
+    if let Ok(dis) = super::validate::disassemble(&dxil_glc) {
+        assert!(dis.contains("dx.op.barrier(i32 80, i32 11)"), "expected ALL_SYNC (11) for GLC load:\n{dis}");
+    }
+}

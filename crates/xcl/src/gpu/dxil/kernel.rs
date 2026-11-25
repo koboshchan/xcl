@@ -574,6 +574,7 @@ impl Lw {
             track_frexp_denorm: crate::gpu::recomp::emit::tracks_frexp_f32_denorm(insts),
             has_f64_round_op: false,
             img_writes: crate::gpu::recomp::emit::image_write_srsrcs(insts),
+            barrier_uav_fence: crate::gpu::recomp::emit::has_uav_write_or_glc(insts),
             exec_cache: HashMap::new(),
             xs: None,
             xw: None,
