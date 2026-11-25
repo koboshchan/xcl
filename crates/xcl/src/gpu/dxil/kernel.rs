@@ -591,6 +591,7 @@ impl Lw {
             gfx: None,
             gfx_half: None,
             whole_live: Default::default(),
+            ps_masks: Default::default(),
             guard_override: None,
             mask_override: None,
             local_masks: false,
@@ -638,6 +639,9 @@ impl Lw {
         }
         if split && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
             lw.whole_live = crate::gpu::recomp::x64_masks::by_pc(insts, kernel);
+        }
+        if matches!(entry, Entry::Pixel(_)) && !split {
+            lw.ps_masks = crate::gpu::recomp::ps_masks::forms(insts);
         }
         lw.setup_storage(uses_lds, if split { slot } else { 1 });
         if let (Some(t), true) = (group_threads, split) {

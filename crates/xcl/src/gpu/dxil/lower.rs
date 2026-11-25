@@ -259,6 +259,8 @@ pub struct Lw {
     pub gfx_half: Option<Value>,
     /// split form: SGPRs whole-live after each instruction (`recomp::x64_masks::by_pc`)
     pub whole_live: std::collections::BTreeMap<u64, u128>,
+    /// pixel shaders: compares whose mask needs less than the per-quad form (`recomp::ps_masks`)
+    pub ps_masks: std::collections::BTreeMap<u64, crate::gpu::recomp::ps_masks::Form>,
     /// set when an exchange was needed where it is not supported
     pub exchange_error: Option<String>,
     pub pc: u64,

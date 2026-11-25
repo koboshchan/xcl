@@ -5,6 +5,7 @@ use super::lower::{err, ext_encoding, Dst, LResult, Lw, Mods, VAR_VGPR};
 use super::module::{BinOp, Pred, Value};
 use super::ops_core::op;
 use crate::gpu::rdna2::{self, Decoded, Encoding, Operand, Variant};
+use crate::gpu::recomp::ps_masks::Form as PsForm;
 
 /// A source operand: one dword, or a mask pair (SGPR pair / VCC).
 #[derive(Clone, Copy)]
@@ -1244,6 +1245,26 @@ impl Lw {
             if matches!(dst, Dst::Null) && matches!(ty, "f32" | "i32" | "u32") {
                 return Ok(());
             }
+            // the forms `recomp::ps_masks` found enough for this mask
+            let form = if self.split { None } else { self.ps_masks.get(&d.pc).copied() };
+            if let Some(form) = form {
+                let c = self.vopc_cond(d, opn, ty, ua, ub, m)?;
+                let (lo, hi) = if form == PsForm::Uniform {
+                    let (el, eh) = self.exec_mask();
+                    let z = self.c(0);
+                    (self.sel(c, el, z), self.sel(c, eh, z))
+                } else {
+                    let a = self.act();
+                    let c = self.land(a, c);
+                    self.ballot_ps_local(c, form == PsForm::Own)
+                };
+                if self.wave64 {
+                    self.write64(&dst, lo, hi);
+                } else {
+                    self.write32(&dst, lo);
+                }
+                return Ok(());
+            }
             let is_vgpr = |o: &Operand| match o.field {
                 Some("LITERAL") | None => false,
                 Some(f) => {
@@ -1279,7 +1300,17 @@ impl Lw {
                 let sh = self.shlc(up, p);
                 q = self.or(q, sh);
             }
-            let (lo, hi) = self.ballot_ps_quad(q);
+            let (mut lo, mut hi) = self.ballot_ps_quad(q);
+            // the quad's live lanes read this lane's EXEC bit from their own copy of EXEC,
+            // which a compare in the local form may have left without it (`recomp::ps_masks`)
+            if !self.ps_masks.is_empty() && !self.split {
+                let c = self.vopc_cond(d, opn, ty, ua, ub, m)?;
+                let a = self.act();
+                let c = self.land(a, c);
+                let (ol, oh) = self.ballot_ps_local(c, true);
+                lo = self.or(lo, ol);
+                hi = self.or(hi, oh);
+            }
             if self.wave64 {
                 self.write64(&dst, lo, hi);
             } else {
