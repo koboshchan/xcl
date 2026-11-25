@@ -401,12 +401,35 @@ impl Lw {
         out
     }
 
+    /// `with_mem_many_tys` of `n` dwords for a read (`f` only loads). With `heap_flat`, no branch:
+    /// `f` reads window `w`, or window 0 when `w` is outside the windows or the lane is not in
+    /// `guard`, and those lanes then take 0 (a raw buffer read out of the view's range gives 0,
+    /// so the read of window 0 is harmless). One path per access, as #1695 makes the HLSL heap
+    /// form: no handle phi, no block per read.
     pub(crate) fn with_mem_i32s(
         &mut self,
         guard: Option<Value>,
         n: usize,
         f: &mut dyn FnMut(&mut Lw, RawUav) -> Vec<Value>,
     ) -> Vec<Value> {
+        if let (Some(coherent), true) = (self.heap_mem, self.heap_flat) {
+            let z = self.c(0);
+            if guard.is_some_and(|g| self.s.m.const_u64(g) == Some(0)) {
+                return vec![z; n];
+            }
+            let w = self.rd(super::lower::VAR_WIN);
+            let inside = self.cmpc(Pred::ULt, w, self.mems.len() as u32);
+            let ok = match guard {
+                Some(g) if self.s.m.const_u64(g) != Some(1) => self.and(g, inside),
+                _ => inside,
+            };
+            let w = self.sel(ok, w, z);
+            let i = self.addc(w, crate::gpu::recomp::MEM_HEAP_BASE);
+            let m = self.s.heap_raw_buffer_uav(i, coherent);
+            let vals = f(self, m);
+            debug_assert_eq!(vals.len(), n);
+            return vals.into_iter().map(|v| self.sel(ok, v, z)).collect();
+        }
         let i32 = self.s.m.i32();
         let tys = vec![i32; n];
         self.with_mem_many_tys(guard, &tys, f)

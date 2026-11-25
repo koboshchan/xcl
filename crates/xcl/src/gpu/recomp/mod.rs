@@ -83,6 +83,11 @@ pub const MEM_HEAP_BASE: u32 = 4;
 /// `Options::heap_windows`. `translate` takes it out of `mem_windows`.
 pub const HEAP_WINDOWS: u32 = 0x100;
 
+/// Flag in a memory-windows count next to `HEAP_WINDOWS` (`pso::mem_windows`, the caches' keys):
+/// the direct DXIL translator reads the heap windows of compute stages without a branch
+/// (`Lw::with_mem_i32s`). The HLSL path ignores it.
+pub const HEAP_FLAT: u32 = 0x200;
+
 pub(crate) fn valid_window_count(windows: usize, heap: bool) -> bool {
     windows <= crate::gpu::uma::MAX_WINDOWS
         || (heap && windows.is_power_of_two() && windows <= crate::gpu::uma::MAX_HEAP_WINDOWS)
@@ -1499,7 +1504,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let program = code;
     let normalized;
     let opt = if opt.mem_windows & HEAP_WINDOWS != 0 {
-        normalized = Options { mem_windows: opt.mem_windows & !HEAP_WINDOWS, heap_windows: true, ..opt.clone() };
+        normalized = Options { mem_windows: opt.mem_windows & !(HEAP_WINDOWS | HEAP_FLAT), heap_windows: true, ..opt.clone() };
         &normalized
     } else {
         opt
