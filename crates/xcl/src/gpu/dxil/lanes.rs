@@ -180,6 +180,19 @@ impl Lw {
 
     /// This lane's bit of the mask (lo, hi), cached per block.
     pub fn lanebit(&mut self, lo: Value, hi: Value) -> Value {
+        if self.wave64 {
+            match (self.s.m.const_u64(lo), self.s.m.const_u64(hi)) {
+                (Some(0xFFFF_FFFF), Some(0xFFFF_FFFF)) => return self.b(true),
+                (Some(0), Some(0)) => return self.b(false),
+                _ => {}
+            }
+        } else {
+            match self.s.m.const_u64(lo) {
+                Some(0xFFFF_FFFF) => return self.b(true),
+                Some(0) => return self.b(false),
+                _ => {}
+            }
+        }
         let key = (self.cur(), lo, hi);
         if let Some(&v) = self.exec_cache.get(&key) {
             return v;
@@ -190,6 +203,14 @@ impl Lw {
         } else {
             lo
         };
+        if let Some(k) = self.s.m.const_u64(w) {
+            if k == 0xFFFF_FFFF {
+                return self.b(true);
+            }
+            if k == 0 {
+                return self.b(false);
+            }
+        }
         let l = self.lane31;
         let sh = self.bin(BinOp::LShr, w, l);
         let b = self.andc(sh, 1);

@@ -1182,5 +1182,4 @@ mod tests {
             println!("CHAIN_BRANCH threads={threads} pieces={} scratch_words_per_group={} checked_words={words} guards=16", chain.pieces.len(), chain.dwords_per_group);
         }
     }
-
 }

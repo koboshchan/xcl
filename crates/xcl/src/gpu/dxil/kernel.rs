@@ -593,6 +593,8 @@ impl Lw {
             img_writes: crate::gpu::recomp::emit::image_write_srsrcs(insts),
             barrier_uav_fence: crate::gpu::recomp::emit::has_uav_write_or_glc(insts),
             exec_cache: HashMap::new(),
+            compact_blk_pc: None,
+            compact_lit: None,
             xs: None,
             xw: None,
             xc: None,
