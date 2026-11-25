@@ -3237,6 +3237,11 @@ pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, n: u32, ba
             super::depth_uav::on_global_uav_barrier();
         }
     }
+    let mut alias_writers = Vec::new();
+    super::format_alias::filter_enhanced_barriers(n, barriers, &mut alias_writers);
+    if !alias_writers.is_empty() {
+        super::format_alias::sync_title_writers(this, &alias_writers);
+    }
     super::format_alias::on_uav_barrier(this, None);
 }
 
@@ -4683,6 +4688,7 @@ unsafe fn trace_resolve(what: &str, dst: usize, src: usize, format: i32, extra: 
 
 /// command list #19 ResolveSubresource(dst, dst sub, src, src sub, format) (PC #19)
 pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, dst: usize, dst_sub: u32, src: usize, src_sub: u32, format: i32) {
+    let format = super::device_x::pc_target_format(format as u32) as i32;
     super::present::note_use(dst, super::present::USE_COPY);
     trace_resolve("ResolveSubresource", dst, src, format, "");
     pc::<unsafe extern "system" fn(*mut c_void, usize, u32, usize, u32, i32)>(this, PC_RESOLVE_SUBRESOURCE)(this, dst, dst_sub, src, src_sub, format)
@@ -4692,6 +4698,7 @@ pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, ds
 /// mode) (PC #64)
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_void, dst: usize, dst_sub: u32, x: u32, y: u32, src: usize, src_sub: u32, rect: *const windows::Win32::Foundation::RECT, format: i32, mode: i32) {
+    let format = super::device_x::pc_target_format(format as u32) as i32;
     super::present::note_use(dst, super::present::USE_COPY);
     if super::present::trace_frame() {
         trace_resolve("ResolveSubresourceRegion", dst, src, format, &format!(" mode {mode} at ({x}, {y}) rect {:?}", rect.as_ref().map(|r| (r.left, r.top, r.right, r.bottom))));

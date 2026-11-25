@@ -754,6 +754,109 @@ pub(super) fn note_title_transition(res: usize, subresource: u32, before: u32, a
     }
 }
 
+/// Inspect enhanced `D3D12_BARRIER_GROUP` texture barriers (`#146`) and collect any tracked
+/// `TitlePlaced` writers leaving write access so their format-aliased readers receive a copy.
+pub(super) unsafe fn filter_enhanced_barriers(n: u32, groups: *const c_void, writers_to_sync: &mut Vec<(usize, u32)>) {
+    if TRACKED_TITLE_TEX.load(Ordering::Relaxed) == 0
+        || ACTIVE_PAIRS.load(Ordering::Relaxed) == 0
+        || n == 0
+        || groups.is_null()
+    {
+        return;
+    }
+    let group_count = (n as usize).min(256);
+    let group_bytes = group_count.saturating_mul(std::mem::size_of::<D3D12_BARRIER_GROUP>());
+    if !crate::gpu::shader::readable(groups as usize, group_bytes) {
+        return;
+    }
+    let write_access = (D3D12_BARRIER_ACCESS_RENDER_TARGET.0 as u32)
+        | (D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32)
+        | (D3D12_BARRIER_ACCESS_COPY_DEST.0 as u32);
+    let read_access = (D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0 as u32)
+        | (D3D12_BARRIER_ACCESS_COPY_SOURCE.0 as u32);
+    let is_write_layout = |l: D3D12_BARRIER_LAYOUT| {
+        matches!(
+            l,
+            D3D12_BARRIER_LAYOUT_RENDER_TARGET
+                | D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS
+                | D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_UNORDERED_ACCESS
+                | D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_UNORDERED_ACCESS
+                | D3D12_BARRIER_LAYOUT_COPY_DEST
+                | D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COPY_DEST
+                | D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COPY_DEST
+        )
+    };
+    let is_common_layout = |l: D3D12_BARRIER_LAYOUT| {
+        matches!(
+            l,
+            D3D12_BARRIER_LAYOUT_COMMON
+                | D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COMMON
+                | D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COMMON
+        )
+    };
+    let is_read_layout = |l: D3D12_BARRIER_LAYOUT| {
+        matches!(
+            l,
+            D3D12_BARRIER_LAYOUT_SHADER_RESOURCE
+                | D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_SHADER_RESOURCE
+                | D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_SHADER_RESOURCE
+                | D3D12_BARRIER_LAYOUT_GENERIC_READ
+                | D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_GENERIC_READ
+                | D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_GENERIC_READ
+                | D3D12_BARRIER_LAYOUT_COPY_SOURCE
+                | D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COPY_SOURCE
+                | D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COPY_SOURCE
+        )
+    };
+    let slice = std::slice::from_raw_parts(groups as *const D3D12_BARRIER_GROUP, group_count);
+    for grp in slice {
+        if grp.Type != D3D12_BARRIER_TYPE_TEXTURE {
+            continue;
+        }
+        let count = (grp.NumBarriers as usize).min(4096);
+        if count == 0 {
+            continue;
+        }
+        let ptr = grp.Anonymous.pTextureBarriers;
+        let bytes = count.saturating_mul(std::mem::size_of::<D3D12_TEXTURE_BARRIER>());
+        if ptr.is_null() || !crate::gpu::shader::readable(ptr as usize, bytes) {
+            continue;
+        }
+        let tbs = std::slice::from_raw_parts(ptr, count);
+        let g = TABLE.lock().unwrap();
+        let Some(t) = g.as_ref() else {
+            continue;
+        };
+        for tb in tbs {
+            let discard = (tb.Flags.0 as u32) & (D3D12_TEXTURE_BARRIER_FLAG_DISCARD.0 as u32) != 0
+                || tb.LayoutBefore == D3D12_BARRIER_LAYOUT_UNDEFINED;
+            if discard {
+                continue;
+            }
+            let res: usize = std::mem::transmute_copy(&tb.pResource);
+            if res == 0 {
+                continue;
+            }
+            let Some(tex) = t.by_res.get(&res) else {
+                continue;
+            };
+            if tex.owner != Owner::TitlePlaced || !tex.is_writer || !t.pairs.iter().any(|p| p.writer == res) {
+                continue;
+            }
+            let ab = tb.AccessBefore.0 as u32;
+            let aa = tb.AccessAfter.0 as u32;
+            let before_write = (ab & write_access != 0) || is_write_layout(tb.LayoutBefore);
+            let after_write = (aa & write_access != 0) || is_write_layout(tb.LayoutAfter);
+            let common_to_read = ab == 0 && is_common_layout(tb.LayoutBefore) && ((aa & read_access != 0) || is_read_layout(tb.LayoutAfter));
+            if (before_write && !after_write) || common_to_read {
+                if let Some(st) = tex.uniform_state() {
+                    writers_to_sync.push((res, st));
+                }
+            }
+        }
+    }
+}
+
 /// Copy all subresources of `src` into `dst` through an intermediate buffer (`CopyTextureRegion`),
 /// preserving raw texel bits across incompatible DXGI format families (e.g. `R32_UINT` ->
 /// `R9G9B9E5_SHAREDEXP` or `BCn` <-> `R32G32B32A32_UINT`).
