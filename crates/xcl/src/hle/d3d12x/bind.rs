@@ -29,6 +29,8 @@ struct State {
     /// untranslated pipeline – created with it – since SetGraphicsRootSignature binds nothing
     rs_gfx: usize,
     pso: usize,
+    /// 32-bit addresses of the view heap and the sampler heap set (0: none)
+    heaps: [u32; 2],
     allocator: usize,
     /// unified memory of this recording (io, argument tables)
     uma: Vec<usize>,
@@ -122,6 +124,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.layout_gfx = None;
         s.args_gfx.clear();
         s.rs_gfx = 0;
+        s.heaps = [0; 2];
         // (the scratch blocks are in `res_retired` already)
         (s.scratch, s.scratch_used, s.scratch_taken) = (None, 0, 0);
         let mut res_bufs = std::mem::take(&mut s.res_retired);
@@ -144,6 +147,7 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
         s.layout_gfx = None;
         s.args_gfx.clear();
         s.rs_gfx = 0;
+        s.heaps = [0; 2];
     });
 }
 
@@ -151,8 +155,8 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
 /// deferred mid-list split (`to` records into `allocator` with its own fresh UMA arena while
 /// `from` retains its previously allocated blocks until `allocator` resets).
 pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: usize) {
-    let (layout, args, layout_gfx, args_gfx, rs_gfx, pso) = with(from, |s| {
-        (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso)
+    let (layout, args, layout_gfx, args_gfx, rs_gfx, pso, heaps) = with(from, |s| {
+        (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso, s.heaps)
     });
     let (old, blocks) = with(to, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
@@ -163,6 +167,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         s.args_gfx = args_gfx;
         s.rs_gfx = rs_gfx;
         s.pso = pso;
+        s.heaps = heaps;
         (old, std::mem::take(&mut s.uma))
     });
     console_list::hold_until_reset(old, blocks);
@@ -216,6 +221,16 @@ pub(crate) fn reset_state_for_test(list: *mut c_void) -> (usize, usize, Vec<u8>,
 #[cfg(test)]
 pub(crate) fn remove_state_for_test(list: *mut c_void) {
     STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize)));
+}
+
+/// SetDescriptorHeaps: the console addresses of `heaps`, for shaders that index them themselves
+/// (`Layout::heaps`).
+pub(super) fn set_heaps(list: *mut c_void, heaps: &[usize]) {
+    let mut bases = [0u32; 2];
+    for (sampler, base) in heaps.iter().filter_map(|&h| super::console_heap::base(h)) {
+        bases[sampler as usize] = base;
+    }
+    with(list, |s| s.heaps = bases);
 }
 
 /// bytes of parameter `i` at constant `offset` (of the compute or the graphics arguments)
@@ -449,10 +464,10 @@ unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D1
 /// The `io` block of a two-pass stage: its user SGPRs (`compute_pass`: the MS layout) with the
 /// argument table at `table_at`, and the high dword of unified memory's base, as the other binds
 /// write it (the translated pair picks each access's memory window from it).
-fn two_pass_io(layout: Option<&Layout>, args: &[u8], table_at: u64, compute_pass: bool, uma_base: usize) -> Vec<u32> {
+fn two_pass_io(layout: Option<&Layout>, args: &[u8], table_at: u64, compute_pass: bool, uma_base: usize, heaps: [u32; 2]) -> Vec<u32> {
     let mut io = match layout {
-        Some(l) if compute_pass => console_list::user_data_ms(l, args, table_at),
-        Some(l) => console_list::user_data_gfx(l, args, table_at),
+        Some(l) if compute_pass => console_list::with_heaps(l, None, console_list::user_data_ms(l, args, table_at), heaps),
+        Some(l) => console_list::with_heaps(l, None, console_list::user_data_gfx(l, args, table_at), heaps),
         None if compute_pass => {
             let mut v = vec![0u32; 16];
             v[8] = table_at as u32;
@@ -479,7 +494,7 @@ unsafe fn bind_two_pass_stage(
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
     let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
-    let (layout, args) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone()));
+    let (layout, args, heaps) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone(), s.heaps));
     let copy = |bytes: &[u8]| -> Result<usize, String> {
         let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
@@ -490,7 +505,7 @@ unsafe fn bind_two_pass_stage(
         .map_or(0, |l| if compute_pass { l.inline_ms } else { l.inline_gfx } as usize)
         .min(args.len());
     let table_at = copy(&args[inline..])?;
-    let io = two_pass_io(layout.as_deref(), &args, table_at as u64, compute_pass, u.base());
+    let io = two_pass_io(layout.as_deref(), &args, table_at as u64, compute_pass, u.base(), heaps);
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
     let rs_raw = if compute_pass { tp.compute_rs } else { tp.mesh_rs } as *mut c_void;
@@ -1536,7 +1551,10 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
     let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
-    let (layout, args) = with(this, |s| if gfx { (s.layout_gfx.clone(), s.args_gfx.clone()) } else { (s.layout.clone(), s.args.clone()) });
+    let (layout, args, heaps) = with(this, |s| {
+        let (layout, args) = if gfx { (&s.layout_gfx, &s.args_gfx) } else { (&s.layout, &s.args) };
+        (layout.clone(), args.clone(), s.heaps)
+    });
     // 32-bit console addresses: window 0; pieces of the list's arena (not a 64 KiB grain each)
     let copy = |bytes: &[u8]| -> Result<usize, String> {
         let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
@@ -1550,8 +1568,8 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let inline = layout.as_ref().map_or(0, |l| if gfx { l.inline_gfx } else { console_list::inline_for(l, user_sgprs) } as usize).min(args.len());
     let table_at = copy(&args[inline..])?;
     let mut io = match layout.as_ref() {
-        Some(l) if gfx => console_list::user_data_gfx(l, &args, table_at as u64),
-        Some(l) => console_list::user_data_for(l, user_sgprs, &args, table_at as u64),
+        Some(l) if gfx => console_list::with_heaps(l, None, console_list::user_data_gfx(l, &args, table_at as u64), heaps),
+        Some(l) => console_list::with_heaps(l, user_sgprs, console_list::user_data_for(l, user_sgprs, &args, table_at as u64), heaps),
         None => vec![table_at as u32, (table_at >> 32) as u32],
     };
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
@@ -2360,12 +2378,17 @@ void main(uint t : SV_GroupIndex) {
         use crate::gpu::recomp::{IO_UMA_BASE_HI, KERNEL_SGPRS};
         let base = 0x4_0000_0000usize;
         for compute_pass in [true, false] {
-            let io = two_pass_io(None, &[], 0x4_1234_5600, compute_pass, base);
+            let io = two_pass_io(None, &[], 0x4_1234_5600, compute_pass, base, [0, 0]);
             assert_eq!(io.len(), KERNEL_SGPRS);
             assert_eq!(io[IO_UMA_BASE_HI], 4, "compute pass {compute_pass}");
         }
-        let io = two_pass_io(None, &[], 0x4_1234_5600, true, base);
+        let io = two_pass_io(None, &[], 0x4_1234_5600, true, base, [0, 0]);
         assert_eq!((io[8], io[9]), (0x1234_5600, 4));
+        let layout = Layout { params: Vec::new(), size: 0, inline: 0, inline_gfx: 0, inline_ms: 0, heaps: [true, true] };
+        let ms_io = two_pass_io(Some(&layout), &[], 0x200, true, base, [0xAA00, 0xBB00]);
+        assert_eq!((ms_io[16], ms_io[17]), (0xAA00, 0xBB00));
+        let ps_io = two_pass_io(Some(&layout), &[], 0x200, false, base, [0xAA00, 0xBB00]);
+        assert_eq!((ps_io[8], ps_io[9]), (0xAA00, 0xBB00));
     }
 
     #[test]
