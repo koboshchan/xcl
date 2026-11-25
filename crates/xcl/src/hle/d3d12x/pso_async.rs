@@ -301,6 +301,11 @@ fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
     })
 }
 
+/// Run a background PSO build task on the `xcl-pso-*` worker pool.
+pub(super) fn run_on_worker(work: impl FnOnce() + Send + 'static) {
+    let _ = queue().lock().unwrap().send(Box::new(work));
+}
+
 fn enqueue(p: Arc<Pending>) {
     let _ = queue().lock().unwrap().send(Box::new(move || {
         // (released by the title meanwhile)
@@ -1059,7 +1064,7 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
 /// it is built). A retail game builds compute programs on its own threads: the driver takes up to
 /// 30 s for the biggest translated ones, and the title's watchdog ends it when its main thread
 /// has been held 30 s.
-fn wait_budget() -> Option<std::time::Duration> {
+pub(super) fn wait_budget() -> Option<std::time::Duration> {
     static B: OnceLock<Option<std::time::Duration>> = OnceLock::new();
     *B.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map(std::time::Duration::from_millis))
 }

@@ -1217,7 +1217,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
     }
     p.last = Instant::now();
     if !p.dumps.is_empty() {
-        match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 2000) {
+        match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 15_000) {
             Ok(()) => {
                 for dump in p.dumps.drain(..) {
                     write_frame(&dump.buffer, &dump.footprint, dump.format, &dump.tag);

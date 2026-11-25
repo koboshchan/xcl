@@ -319,8 +319,12 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         Ok(()) => {
             if compute {
                 match super::real::dispatch_chain::whole(pso) {
-                    Ok(Some(whole)) => list.SetPipelineState(&whole),
-                    Ok(None) => {}
+                    Ok(super::real::dispatch_chain::WholePso::Ready(whole)) => list.SetPipelineState(&whole),
+                    Ok(super::real::dispatch_chain::WholePso::None) => {}
+                    Ok(super::real::dispatch_chain::WholePso::Pending) => {
+                        count(DISPATCHES_SKIPPED);
+                        return;
+                    }
                     Err(e) => {
                         crate::xlog_warn!("D3D12.X: ExecuteIndirect whole compute PSO: {e}");
                         count(DISPATCHES_SKIPPED);

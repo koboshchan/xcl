@@ -2,7 +2,8 @@
 //! to the caller. Other pieces and the lazily built whole form belong to it.
 use super::*;
 use crate::gpu::{dxil::kernel::DispatchChain, recomp::pso};
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Condvar, LazyLock, OnceLock};
 
 static PROGRAMS: AtomicU64 = AtomicU64::new(0);
 static PIECES: AtomicU64 = AtomicU64::new(0);
@@ -48,23 +49,120 @@ impl PipelineBuilder {
     }
 }
 
+struct WholeSlot<T> {
+    ready: OnceLock<T>,
+    build_lock: Mutex<()>,
+    started: AtomicBool,
+    late: AtomicBool,
+    done: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl<T: Clone> WholeSlot<T> {
+    fn new() -> Self {
+        Self {
+            ready: OnceLock::new(),
+            build_lock: Mutex::new(()),
+            started: AtomicBool::new(false),
+            late: AtomicBool::new(false),
+            done: Mutex::new(false),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn build_sync(&self, build: impl FnOnce() -> Option<T>) -> Result<T, String> {
+        if let Some(p) = self.ready.get() {
+            return Ok(p.clone());
+        }
+        let _guard = self.build_lock.lock().unwrap();
+        if let Some(p) = self.ready.get() {
+            return Ok(p.clone());
+        }
+        let p = build().ok_or_else(|| "whole compute pipeline".to_string())?;
+        let _ = self.ready.set(p.clone());
+        *self.done.lock().unwrap() = true;
+        self.cv.notify_all();
+        Ok(p)
+    }
+}
+
+/// Result of resolving a split compute pipeline's unsplit fallback for `ExecuteIndirect`.
+pub(in crate::hle::d3d12x) enum WholePso<T = ID3D12PipelineState> {
+    /// Not a split compute pipeline; keep the already-bound PSO.
+    None,
+    /// Unsplit fallback PSO is ready to bind.
+    Ready(T),
+    /// Unsplit fallback PSO is compiling in the background; skip this dispatch until ready.
+    Pending,
+}
+
+fn resolve_whole_with<T: Clone + Send + Sync + 'static>(
+    slot: &Arc<WholeSlot<T>>,
+    image_only: bool,
+    budget: Option<std::time::Duration>,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>),
+    build: impl FnOnce() -> Option<T> + Send + 'static,
+) -> Result<WholePso<T>, String> {
+    if let Some(p) = slot.ready.get() {
+        return Ok(WholePso::Ready(p.clone()));
+    }
+    if !image_only && budget.is_none() {
+        return slot.build_sync(build).map(WholePso::Ready);
+    }
+    if *slot.done.lock().unwrap() {
+        return slot.ready.get().cloned().map(WholePso::Ready).ok_or_else(|| "whole compute pipeline".to_string());
+    }
+    if !slot.started.swap(true, Ordering::AcqRel) {
+        let s = slot.clone();
+        spawn(Box::new(move || {
+            let _ = s.build_sync(build);
+            let mut done = s.done.lock().unwrap();
+            *done = true;
+            s.cv.notify_all();
+        }));
+    }
+    if image_only || slot.late.load(Ordering::Acquire) {
+        return Ok(WholePso::Pending);
+    }
+    let budget = budget.unwrap();
+    let (done, _) = slot.cv.wait_timeout_while(slot.done.lock().unwrap(), budget, |d| !*d).unwrap();
+    if *done {
+        return slot.ready.get().cloned().map(WholePso::Ready).ok_or_else(|| "whole compute pipeline".to_string());
+    }
+    drop(done);
+    slot.late.store(true, Ordering::Release);
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 16 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: whole fallback of a split compute pipeline still building after {} ms: ExecuteIndirect goes on without it ({} so far)", budget.as_millis(), n + 1);
+    }
+    Ok(WholePso::Pending)
+}
+
 struct Chain {
     builder: Arc<PipelineBuilder>,
     tail: Vec<ID3D12PipelineState>,
     words: u32,
-    whole_code: Vec<u8>,
-    whole: OnceLock<ID3D12PipelineState>,
-    build_whole: Mutex<()>,
+    whole_code: Arc<[u8]>,
+    whole: Arc<WholeSlot<ID3D12PipelineState>>,
+    image_only: bool,
 }
 
 impl Chain {
     unsafe fn whole(&self) -> Result<ID3D12PipelineState, String> {
-        if let Some(p) = self.whole.get() { return Ok(p.clone()); }
-        let _guard = self.build_whole.lock().unwrap();
-        if let Some(p) = self.whole.get() { return Ok(p.clone()); }
-        let p = self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)).ok_or("whole compute pipeline")?;
-        let _ = self.whole.set(p.clone());
-        Ok(p)
+        self.whole.build_sync(|| self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)))
+    }
+
+    unsafe fn whole_for_indirect(&self) -> Result<WholePso, String> {
+        let builder = self.builder.clone();
+        let code = self.whole_code.clone();
+        resolve_whole_with(
+            &self.whole,
+            self.image_only,
+            super::super::pso_async::wait_budget(),
+            |work| super::super::pso_async::run_on_worker(work),
+            move || builder.pipeline(&code, &pc_iid(Kind::PipelineState)),
+        )
     }
 }
 
@@ -72,7 +170,7 @@ static CHAINS: LazyLock<Mutex<HashMap<usize, Arc<Chain>>>> = LazyLock::new(Defau
 
 pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC,
     iid: *const GUID, result: *mut *mut c_void, record: u64, whole: &[u8], samplers: &[pso::StaticSampler],
-    plan: Arc<DispatchChain>) -> Option<usize> {
+    plan: Arc<DispatchChain>, image_only: bool) -> Option<usize> {
     if result.is_null() || iid.is_null() || plan.pieces.len() < 2 { return None; }
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
     let signature = pso::dispatch_chain_root_signature(dev, samplers).ok()?;
@@ -91,7 +189,7 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let mut pieces = built.into_iter().collect::<Option<Vec<_>>>()?.into_iter();
     let first = pieces.next()?;
     let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
-        whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()) });
+        whole_code: Arc::from(whole), whole: Arc::new(WholeSlot::new()), image_only });
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
@@ -104,9 +202,12 @@ pub(super) fn forget(pso: usize) {
     drop(gone); // releasing a tail PSO also goes through forget_pso
 }
 
-pub(in crate::hle::d3d12x) unsafe fn whole(pso: usize) -> Result<Option<ID3D12PipelineState>, String> {
+pub(in crate::hle::d3d12x) unsafe fn whole(pso: usize) -> Result<WholePso, String> {
     let chain = CHAINS.lock().unwrap().get(&pso).cloned();
-    chain.map(|c| c.whole()).transpose()
+    match chain {
+        Some(c) => c.whole_for_indirect(),
+        None => Ok(WholePso::None),
+    }
 }
 
 struct Scratch {
@@ -227,9 +328,80 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
 
 #[cfg(test)]
 mod tests {
-    use super::{scratch_bytes, LEAST};
+    use super::{resolve_whole_with, scratch_bytes, WholePso, WholeSlot, LEAST};
+    use std::sync::{mpsc, Arc};
+    use std::time::{Duration, Instant};
 
     const MB: u64 = 1 << 20;
+
+    #[test]
+    fn whole_fallback_with_budget_defers_slow_build_and_returns_ready_once_built() {
+        let slot = Arc::new(WholeSlot::<u32>::new());
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let t0 = Instant::now();
+        let first = resolve_whole_with(
+            &slot,
+            false,
+            Some(Duration::from_millis(25)),
+            |work| { std::thread::spawn(work); },
+            move || {
+                let _ = go_rx.recv();
+                Some(42)
+            },
+        );
+        assert!(matches!(first, Ok(WholePso::Pending)), "slow build must defer past budget");
+        assert!(t0.elapsed() < Duration::from_millis(500));
+
+        // Subsequent calls while building return Pending immediately without waiting for budget again.
+        let t1 = Instant::now();
+        let second = resolve_whole_with(&slot, false, Some(Duration::from_secs(5)), |_| panic!("must spawn once"), || Some(99));
+        assert!(matches!(second, Ok(WholePso::Pending)));
+        assert!(t1.elapsed() < Duration::from_millis(50));
+
+        go_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match resolve_whole_with(&slot, false, Some(Duration::from_millis(25)), |_| panic!("must spawn once"), || Some(99)) {
+                Ok(WholePso::Ready(v)) => {
+                    assert_eq!(v, 42);
+                    break;
+                }
+                Ok(WholePso::Pending) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+                other => panic!("expected Ready(42), got {}", matches!(other, Ok(WholePso::Ready(_)))),
+            }
+        }
+    }
+
+    #[test]
+    fn whole_fallback_image_only_returns_pending_without_waiting() {
+        let slot = Arc::new(WholeSlot::<u32>::new());
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let t0 = Instant::now();
+        let first = resolve_whole_with(
+            &slot,
+            true,
+            None,
+            |work| { std::thread::spawn(work); },
+            move || {
+                let _ = go_rx.recv();
+                Some(7)
+            },
+        );
+        assert!(matches!(first, Ok(WholePso::Pending)));
+        assert!(t0.elapsed() < Duration::from_millis(50));
+        go_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match resolve_whole_with(&slot, true, None, |_| panic!("must spawn once"), || Some(99)) {
+                Ok(WholePso::Ready(v)) => {
+                    assert_eq!(v, 7);
+                    break;
+                }
+                Ok(WholePso::Pending) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+                _ => panic!("expected Ready(7)"),
+            }
+        }
+    }
 
     #[test]
     fn a_chains_scratch_is_bounded_by_what_all_recordings_hold() {
