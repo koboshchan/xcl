@@ -81,7 +81,8 @@ fn console_ms_in_as_slot_and_ms_with_as_are_refused_cleanly() {
     assert_eq!(xcl::gpu::xbox::parse(&ms).unwrap().stage, "MS");
     assert_eq!(xcl::gpu::xbox::parse(&as_blob).unwrap().stage, "AS");
 
-    // Case 1: console MS placed in the AS slot with no MS slot (#1968 context path)
+    // Case 1: console MS placed in the AS slot with no MS slot (#541 routes it to MS translation;
+    // the synthetic container has no NGG variant and fails translation cleanly)
     #[repr(C)]
     struct AsOnly {
         as_slot: Sub<D3D12_SHADER_BYTECODE>,
@@ -91,11 +92,11 @@ fn console_ms_in_as_slot_and_ms_with_as_are_refused_cleanly() {
         SizeInBytes: std::mem::size_of::<AsOnly>(),
         pPipelineStateSubobjectStream: &st as *const _ as *mut c_void,
     };
-    let err = unsafe { d2.CreatePipelineState::<ID3D12PipelineState>(&desc) }.expect_err("MS in AS slot must be refused");
+    let err = unsafe { d2.CreatePipelineState::<ID3D12PipelineState>(&desc) }.expect_err("synthetic MS in AS slot must fail translation");
     assert_eq!(err.code(), E_INVALIDARG);
     assert!(
-        real::stats().translation_errors.iter().any(|e| e.contains("in the AS slot")),
-        "expected AS-slot refusal in translation_errors: {:?}",
+        real::stats().translation_errors.iter().any(|e| e.contains("MS:")),
+        "expected MS translation error for MS-in-AS-slot synthetic container: {:?}",
         real::stats().translation_errors
     );
 
