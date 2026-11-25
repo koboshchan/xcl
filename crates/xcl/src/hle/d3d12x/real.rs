@@ -7923,6 +7923,12 @@ pub fn log_device_removed() {
     }
     crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());
     unsafe {
+        // (DRED 1.2: 3 hung, 6 fault, 7 page fault; 0 when the removal did not come from work
+        // the GPU was doing – then there is no page fault and there are no breadcrumbs either)
+        match dev.cast::<ID3D12DeviceRemovedExtendedData2>() {
+            Ok(d) => crate::xlog_error!("DRED device state: {}", d.GetDeviceState().0),
+            Err(e) => crate::xlog_error!("DRED device state: not available ({:#x})", e.code().0 as u32),
+        }
         let Ok(dred) = dev.cast::<ID3D12DeviceRemovedExtendedData>() else { return };
         if let Ok(pf) = dred.GetPageFaultAllocationOutput() {
             let names = |mut n: *const D3D12_DRED_ALLOCATION_NODE| {
@@ -7939,7 +7945,13 @@ pub fn log_device_removed() {
             let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
             crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
         }
-        if let Ok(bc) = dred.GetAutoBreadcrumbsOutput() {
+        let breadcrumbs = dred.GetAutoBreadcrumbsOutput();
+        match &breadcrumbs {
+            Err(e) => crate::xlog_error!("DRED: no breadcrumbs ({:#x})", e.code().0 as u32),
+            Ok(bc) if bc.pHeadAutoBreadcrumbNode.is_null() => crate::xlog_error!("DRED: no breadcrumbs (no list was in flight)"),
+            Ok(_) => {}
+        }
+        if let Ok(bc) = breadcrumbs {
             report_dred_lists(bc.pHeadAutoBreadcrumbNode, |node, done| {
                 let count = node.BreadcrumbCount as usize;
                 let ops: Vec<String> = (done.saturating_sub(3)..(done + 3).min(count)).map(|i| format!("{}{}", if i == done { ">" } else { "" }, (*node.pCommandHistory.add(i)).0)).collect();
@@ -7953,6 +7965,17 @@ pub fn log_device_removed() {
                     bound += &format!("; bound after it: {}", after.iter().take(4).cloned().collect::<Vec<_>>().join(", "));
                 }
                 crate::xlog_error!("DRED: list {:p} on queue {:p}: {done} of {count} operations done, around: {}{bound}", list, node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw()), ops.join(" "));
+                // a list the GPU was in: what it ran last and all it had left (at most 160
+                // operations), by name – the one that faulted is among those not done
+                if done != 0 {
+                    let to = (done + 160).min(count);
+                    crate::xlog_error!(
+                        "DRED: … that list, before: {}; not done: {}{}",
+                        super::dred::ops(key, &history, done.saturating_sub(16), done),
+                        super::dred::ops(key, &history, done, to),
+                        if to < count { format!(" … {} more", count - to) } else { String::new() }
+                    );
+                }
             });
         }
     }

@@ -1470,6 +1470,17 @@ fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
     }
 }
 
+/// What stand-in `pso` is (being) built from, for a diagnostic line (`dred::mark_pipeline`: a
+/// pipeline bound with no label of its own). None: not a stand-in.
+pub fn describe(pso: usize) -> Option<String> {
+    let p = entry(pso)?;
+    let state = if p.real.load(Ordering::Acquire) != 0 { "" } else { ", not built yet" };
+    Some(match (p.compute, p.record) {
+        (true, 0) => format!("a compute pipeline {pso:#x}{state}"),
+        (true, record) => format!("cs {record:016x}{state}"),
+        (false, _) => format!("a graphics pipeline {pso:#x} (shaders {:016x}){state}", p.key),
+    })
+}
 /// For binding: compute pipelines are waited for, graphics ones are not.
 pub fn resolve_for_bind(pso: usize) -> usize {
     match entry(pso) {
