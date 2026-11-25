@@ -1715,21 +1715,24 @@ pub(super) fn standin_released(pso: usize) {
 
 /// A stand-in pipeline released for good takes its background-built real pipeline with it.
 unsafe extern "system" fn pso_release(this: *mut c_void) -> u32 {
-    let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    // The last reference: forgotten while the object has its address. A pipeline another thread
-    // makes can get that address as soon as it is free, and must keep its own entries.
+    let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
+    // The last reference: forgotten while the object still has its address (a pipeline another
+    // thread makes may get it at once, and what is kept of that one must stay).
     let last = add(this) == 2;
-    if last {
+    let forget = || {
+        super::shader_code::freed(this as usize);
         forget_pso(this as usize);
         super::pso_async::release(super::pso_async::released(this as usize));
+    };
+    if last {
+        forget();
     }
     f(this);
     let n = f(this);
     // (two last-but-one releases at once: neither saw itself as the last)
     if n == 0 && !last {
-        forget_pso(this as usize);
-        super::pso_async::release(super::pso_async::released(this as usize));
+        forget();
     }
     n
 }
@@ -2997,6 +3000,7 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, in
     preserve_vtable(this, ext);
     if hr >= 0 {
         super::list_x::on_pc_reset(this);
+        super::shader_code::bound(this as usize);
         super::dred::reset(this);
         if !initial_state.is_null() {
             super::dred::mark_pipeline(this, initial_state as usize, resolved as usize);
@@ -3714,7 +3718,7 @@ fn dummy_mesh() -> Option<&'static (Vec<u8>, Vec<u8>)> {
     .as_ref()
 }
 
-fn compile(src: &str, target: &str) -> Vec<u8> {
+pub(super) fn compile(src: &str, target: &str) -> Vec<u8> {
     unsafe {
         let mut blob = None;
         let t = format!("{target}\0");
@@ -4715,6 +4719,11 @@ mod compute_blob_tests {
         assert!(super::compute_blob(key).is_none());
         assert_eq!(super::COMPUTE_BLOBS.lock().unwrap().as_ref().unwrap().1, before - 3);
     }
+}
+
+/// Bytes of the driver's compiled form of `pso` (0: unknown).
+pub(super) unsafe fn cached_blob_size(pso: *mut c_void) -> usize {
+    read_pso_cached_blob(pso).map_or(0, |b| b.len())
 }
 
 /// Read `GetCachedBlob` from either an adopted or raw PC `ID3D12PipelineState`.
@@ -6889,6 +6898,7 @@ unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_v
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetPipelineState")));
     let bound = super::pso_async::resolve(pso as usize);
     f(this, bound as *mut c_void);
+    super::shader_code::bound(this as usize);
     super::dred::mark_pipeline(this, pso as usize, bound);
     super::list_x::on_set_pipeline_state(this, pso as usize);
 }
@@ -6906,6 +6916,7 @@ unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ClearState")));
     let bound = super::pso_async::resolve_for_bind(pso as usize);
     f(this, bound as *mut c_void);
+    super::shader_code::bound(this as usize);
     if !pso.is_null() {
         super::dred::mark_pipeline(this, pso as usize, bound);
     }
@@ -6968,6 +6979,7 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
     let n = f(this);
     if n == 0 {
         dispatch_chain::allocator_reset(this as usize);
+        super::shader_code::allocator_reset(this as usize);
         super::alloc_pool::forget(this as usize);
         super::list_x::on_allocator_release(this as usize);
     }
@@ -6979,7 +6991,10 @@ pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
     type F = unsafe extern "system" fn(*mut c_void) -> HRESULT;
     let f: F = std::mem::transmute(orig_fn(raw, slot_of(raw, "Reset")));
     let hr = f(raw);
-    if hr >= 0 { dispatch_chain::allocator_reset(raw as usize); }
+    if hr >= 0 {
+        dispatch_chain::allocator_reset(raw as usize);
+        super::shader_code::allocator_reset(raw as usize);
+    }
     hr
 }
 
@@ -8914,7 +8929,6 @@ void main() {
         }
     }
 }
-
 
 #[cfg(test)]
 mod pso_release_tests {

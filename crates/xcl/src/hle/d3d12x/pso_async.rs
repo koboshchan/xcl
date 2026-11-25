@@ -14,6 +14,15 @@ use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 struct Pending {
     /// the build, until a worker – or a bind that cannot wait for the queue – takes it
     job: Mutex<Option<Job>>,
+    /// the same build, for when the pipeline was released (`shader_code`)
+    again: Mutex<Option<Job>>,
+    /// its code counts, and a compute one may be released when not used for a while
+    releasable: bool,
+    /// it was built in this run and released since: the next bind builds it itself
+    gone: std::sync::atomic::AtomicBool,
+    /// bytes of its compiled code (0: not used yet) and when it was last used
+    code: AtomicUsize,
+    last: std::sync::atomic::AtomicU64,
     /// the build went to the workers (a lazy one goes on its first `resolve`)
     sent: std::sync::atomic::AtomicBool,
     /// the real pipeline state (raw pointer), 0 while building or when building failed
@@ -79,7 +88,7 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) {
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
         }
     }
-    complete(p, job());
+    run(p, job);
     if preload {
         // (under the lock: `want` does not raise this thread after it)
         let mut d = p.demand.lock().unwrap();
@@ -110,6 +119,7 @@ impl Pending {
     }
 
     fn note_use(&self) {
+        self.last.store(super::shader_code::now_ms(), Ordering::Release);
         if self.key != 0 && !self.used.swap(true, Ordering::Relaxed) {
             used::note(self.key);
         }
@@ -118,6 +128,14 @@ impl Pending {
 
 /// stand-in handed to the title → its real pipeline
 static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
+
+fn run(p: &Pending, mut job: Job) {
+    let real = job();
+    if p.releasable && p.compute {
+        *p.again.lock().unwrap() = Some(job);
+    }
+    complete(p, real);
+}
 
 /// The build is done (`real`: its pipeline, 0 = failed).
 fn complete(p: &Pending, real: usize) {
@@ -267,7 +285,7 @@ pub fn enabled() -> bool {
 }
 
 /// Builds the real pipeline: its raw pointer, 0 = failed.
-pub type Job = Box<dyn FnOnce() -> usize + Send>;
+pub type Job = Box<dyn FnMut() -> usize + Send>;
 
 /// pipelines a submit will wait for: the workers take these before their queue (`need_by_submit`)
 static NEEDED: Mutex<std::collections::VecDeque<Arc<Pending>>> = Mutex::new(std::collections::VecDeque::new());
@@ -338,7 +356,7 @@ pub(super) fn build_pieces(jobs: Vec<Job>) -> Vec<usize> {
     let (send, recv) = mpsc::channel();
     let drain = move || loop {
         let job = jobs.lock().unwrap().pop();
-        let Some((i, job)) = job else { return };
+        let Some((i, mut job)) = job else { return };
         let _ = send.send((i, job()));
     };
     // the helpers build for this worker's pipeline: the title waiting for it waits for them too
@@ -366,7 +384,7 @@ pub fn release(p: usize) {
 
 /// `standin` went to the title; `job` builds the real pipeline on a worker.
 pub fn submit(standin: usize, compute: bool, job: Job) {
-    submit_as(standin, compute, job, true, 0);
+    submit_as(standin, compute, job, true, 0, super::shader_code::limit() != 0);
 }
 
 /// Lazy pipeline creation (`XCL_LAZY_PSO=0`: off): a title's pipelines with console shaders get
@@ -382,11 +400,16 @@ pub fn lazy() -> bool {
 /// `submit`, sent to the workers only on its first `resolve` (`lazy`) – or now, at a low
 /// priority, when an earlier run used a pipeline of these shaders (`key`, 0 = none; `used`).
 pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
-    submit_as(standin, compute, job, false, key);
+    submit_as(standin, compute, job, false, key, super::shader_code::limit() != 0);
 }
 
-fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
+fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, releasable: bool) {
     let p = Arc::new(Pending {
+        again: Mutex::new(None),
+        releasable,
+        gone: Default::default(),
+        code: AtomicUsize::new(0),
+        last: Default::default(),
         job: Mutex::new(Some(job)),
         sent: std::sync::atomic::AtomicBool::new(send),
         real: AtomicUsize::new(0),
@@ -810,6 +833,61 @@ mod used_tests {
         released(unknown);
     }
 
+    /// A compute pipeline not used for a while is released and built again by its next bind; one
+    /// in use, or a thread's, is not freed.
+    #[test]
+    fn an_unused_compute_pipeline_is_released_and_built_again() {
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Direct3D12::*;
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let mut sig = None;
+            D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut sig, None).unwrap();
+            let sig = sig.unwrap();
+            let rs: ID3D12RootSignature = dev.CreateRootSignature(0, std::slice::from_raw_parts(sig.GetBufferPointer() as *const u8, sig.GetBufferSize())).unwrap();
+            let code = super::super::real::compile("[numthreads(1, 1, 1)] void main() {}", "cs_5_0");
+            let builds = Arc::new(AtomicUsize::new(0));
+            let (n, dev, rs) = (builds.clone(), dev.into_raw() as usize, rs.into_raw() as usize);
+            let standin = 0x7E57_C0DEusize;
+            let job: Job = Box::new(move || {
+                n.fetch_add(1, Ordering::AcqRel);
+                let (dev, rs) = (dev as *mut std::ffi::c_void, rs as *mut std::ffi::c_void);
+                let dev = ID3D12Device::from_raw_borrowed(&dev).unwrap();
+                let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute(rs),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr() as _, BytecodeLength: code.len() },
+                    ..Default::default()
+                };
+                dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc).map_or(0, |p| p.into_raw() as usize)
+            });
+            submit_as(standin, true, job, false, 0, true);
+            shared(standin, 0x7E57_C0DF);
+            let built = resolve_wait_for(standin, None);
+            assert_ne!(built, 0x7E57_C0DF);
+            release_unused(0);
+            assert_eq!(resolve_wait_for(standin, None), built, "just used");
+            let p = entry(standin).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(super::super::shader_code::IDLE_MS + 50));
+            release_unused(0);
+            assert!(is_pending(standin) && p.real.load(Ordering::Acquire) == 0, "released");
+            // (the thread's reference: a list it was about to record keeps it)
+            assert!(super::super::shader_code::Ref::new(built).is_some());
+            assert_eq!(builds.load(Ordering::Acquire), 1);
+            assert_ne!(resolve_wait_for(standin, None), 0x7E57_C0DF);
+            assert_eq!(builds.load(Ordering::Acquire), 2);
+            // (with a time budget too: not behind what the workers have to build first)
+            std::thread::sleep(std::time::Duration::from_millis(super::super::shader_code::IDLE_MS + 50));
+            release_unused(0);
+            assert!(is_pending(standin));
+            assert_ne!(resolve_wait_for(standin, Some(std::time::Duration::from_nanos(1))), 0x7E57_C0DF);
+            assert_eq!(builds.load(Ordering::Acquire), 3);
+            release(released(standin));
+        }
+    }
+
     static WORKER_SATURATION_LOCK: Mutex<()> = Mutex::new(());
 
     /// A queued normal worker job whose stand-in was released before a worker starts it is
@@ -1038,6 +1116,86 @@ impl Pending {
     }
 }
 
+impl Pending {
+    /// Build it here if it was released: that takes the driver milliseconds (its cache has the
+    /// code), and a turn in the workers' queue – behind first builds of seconds – minutes.
+    fn build_again(&self) {
+        if self.gone.swap(false, Ordering::AcqRel) {
+            let job = self.job.lock().unwrap().take();
+            if let Some(job) = job {
+                run(self, job);
+            }
+        }
+    }
+
+    /// The pipeline to bind for `pso`: this thread's until it is bound (`shader_code`).
+    fn take(&self, pso: usize) -> usize {
+        let mut first = false;
+        let real = {
+            let _done = self.done.lock().unwrap();
+            let real = self.real.load(Ordering::Acquire);
+            if real == 0 {
+                return self.stand(pso);
+            }
+            if self.releasable && self.compute {
+                unsafe { super::shader_code::Ref::new(real) }.map(super::shader_code::hold);
+            }
+            if self.releasable && self.code.load(Ordering::Acquire) == 0 {
+                self.code.store(unsafe { super::shader_code::count(real) }.max(1), Ordering::Release);
+                first = true;
+            }
+            real
+        };
+        if first {
+            release_unused(super::shader_code::limit());
+        }
+        real
+    }
+}
+
+/// Release the compute pipelines used longest ago when there is more compiled code in use than
+/// `shader_code::limit`. Their next bind builds them again (from the driver's cache).
+fn release_unused(limit: usize) {
+    use super::shader_code::{choose, in_recordings, let_go_done, now_ms, used, IDLE_MS};
+    if used() <= limit {
+        return;
+    }
+    let_go_done();
+    let recorded = in_recordings();
+    let all: Vec<Arc<Pending>> = PENDING.lock().unwrap().as_ref().map_or(Vec::new(), |m| m.values().filter(|p| p.releasable && p.compute && p.driver.load(Ordering::Acquire) != 0 && p.code.load(Ordering::Acquire) != 0 && !recorded.contains(&p.real.load(Ordering::Acquire))).cloned().collect());
+    let sizes: Vec<(usize, u64)> = all.iter().map(|p| (p.code.load(Ordering::Acquire), p.last.load(Ordering::Acquire))).collect();
+    let mut n = 0;
+    for i in choose(&sizes, used(), limit, now_ms()) {
+        let p = &all[i];
+        let real = {
+            // (a build or a bind of it is going on: not unused)
+            let Ok(mut done) = p.done.try_lock() else { continue };
+            if !*done || p.last.load(Ordering::Acquire) + IDLE_MS > now_ms() || p.orphan.load(Ordering::Acquire) {
+                continue;
+            }
+            let real = p.real.swap(0, Ordering::AcqRel);
+            if real == 0 {
+                continue;
+            }
+            p.code.store(0, Ordering::Release);
+            *p.job.lock().unwrap() = p.again.lock().unwrap().take();
+            p.sent.store(false, Ordering::Release);
+            p.late.store(false, Ordering::Release);
+            p.gone.store(true, Ordering::Release);
+            p.demand.lock().unwrap().by_submit = false;
+            *done = false;
+            real
+        };
+        release(real);
+        n += 1;
+    }
+    if n != 0 {
+        static RELEASED: AtomicUsize = AtomicUsize::new(0);
+        let all = RELEASED.fetch_add(n, Ordering::Relaxed) + n;
+        crate::xlog_info!("D3D12.X: {n} compute pipelines not used lately released ({} MB of shader code left in use; {all} released so far)", used() >> 20);
+    }
+}
+
 /// Stand-in `standin` is no driver object (`standin::shell`): binds get `driver` in its place.
 /// Told before the title has the stand-in.
 pub fn shared(standin: usize, driver: usize) {
@@ -1060,7 +1218,7 @@ pub fn resolve(pso: usize) -> usize {
             }
             stand
         }
-        r => r,
+        _ => p.take(pso),
     }
 }
 
@@ -1084,17 +1242,15 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     }
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
-        complete(&p, job());
+        run(&p, job);
     }
     p.want();
     let mut done = p.done.lock().unwrap();
     while !*done {
         done = p.cv.wait(done).unwrap();
     }
-    match p.real.load(Ordering::Acquire) {
-        0 => p.stand(pso),
-        r => r,
-    }
+    drop(done);
+    p.take(pso)
 }
 
 /// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset or 0: until
@@ -1110,12 +1266,9 @@ fn wait_budget() -> Option<std::time::Duration> {
 /// pipeline not built by then is `late` – it and later binds of it get the stand-in (their
 /// dispatches are skipped) until a worker has built it.
 fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> usize {
-    let built = |p: &Pending| match p.real.load(Ordering::Acquire) {
-        0 => p.stand(pso),
-        r => r,
-    };
+    p.build_again();
     if *p.done.lock().unwrap() {
-        return built(p);
+        return p.take(pso);
     }
     if !p.sent.swap(true, Ordering::AcqRel) {
         enqueue(p.clone());
@@ -1125,10 +1278,11 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
     }
     p.want();
     let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), budget, |d| !*d).unwrap();
-    if *done {
-        return built(p);
-    }
+    let built = *done;
     drop(done);
+    if built {
+        return p.take(pso);
+    }
     p.late.store(true, Ordering::Release);
     static N: AtomicUsize = AtomicUsize::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
@@ -1163,6 +1317,7 @@ pub fn image_only(standin: usize) {
 /// else the stand-in, with the build sent to the workers. Nobody waits, so the build is not
 /// `wanted`: a big one takes its turn among the driver's compiles and waits for free commit.
 fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
+    p.build_again();
     match p.real.load(Ordering::Acquire) {
         0 => {
             if !p.sent.swap(true, Ordering::AcqRel) {
@@ -1177,7 +1332,7 @@ fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
             }
             p.stand(pso)
         }
-        r => r,
+        _ => p.take(pso),
     }
 }
 
@@ -1198,7 +1353,10 @@ pub fn released(pso: usize) -> usize {
     {
         let done = p.done.lock().unwrap();
         if *done {
-            return p.real.swap(0, Ordering::AcqRel);
+            let real = p.real.swap(0, Ordering::AcqRel);
+            drop(done);
+            super::shader_code::let_go(real);
+            return real;
         }
         // the worker stores its result into a Pending nobody will read: mark it orphaned
         p.orphan.store(true, Ordering::Release);

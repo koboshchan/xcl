@@ -218,6 +218,13 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
     }
 }
 
+/// Those of the PC allocators `of` that no list's recording is on and the GPU is done with.
+pub fn done(of: &[usize]) -> Vec<usize> {
+    let g = STATE.lock().unwrap();
+    let Some(s) = g.as_ref() else { return Vec::new() };
+    of.iter().copied().filter(|a| s.backings.get(a).is_some_and(|b| unsafe { b.free() })).collect()
+}
+
 /// Whether the GPU may still run a recording made on the title's allocator `alloc`.
 pub(super) unsafe fn allocator_in_flight(alloc: usize) -> bool {
     let g = STATE.lock().unwrap();
@@ -427,13 +434,16 @@ mod tests {
             !s.of_list.contains_key(&second) && s.backings[&alloc].users.is_empty()
                 && s.backings[&alloc].marks.len() == 1 && !unsafe { s.backings[&alloc].free() }
         };
+        let pending_done = done(&[alloc]);
         fence.value.set(7);
+        let completed_done = done(&[alloc]);
         let reusable = unsafe { STATE.lock().unwrap().as_ref().unwrap().backings[&alloc].free() };
         // Clean up the synthetic COM pointer before assertions, including on the old code.
         unsafe { forget(alloc) };
         assert!(first_removed, "another live recording must remain while the released list goes");
         assert!(pending_still_held, "final list Release must retain the submitted-work fence");
         assert!(reusable, "a released list cannot keep a completed backing busy");
+        assert_eq!((pending_done, completed_done), (vec![], vec![alloc]));
         assert_eq!(fence.releases.get(), 1);
     }
 
