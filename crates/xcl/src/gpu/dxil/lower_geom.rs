@@ -42,10 +42,10 @@ impl Lw {
         match name {
             "s_barrier" if self.split && gs_phase => Some(()),
             "s_sendmsg" => {
-                // MSG_GS (2): op 1 cut, 2 emit, 3 emit + cut (stream 0); the rest: nothing
+                // MSG_GS (2) and MSG_GS_DONE (3): op 1 cut, 2 emit, 3 emit + cut (stream 0); the rest: nothing
                 let simm = rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0);
                 let (msg, op, stream) = (simm & 0xF, (simm >> 4) & 3, (simm >> 8) & 3);
-                if msg == 2 && stream == 0 {
+                if (msg == 2 || msg == 3) && op != 0 && stream == 0 {
                     self.gs_emit_cut(op);
                 }
                 Some(())

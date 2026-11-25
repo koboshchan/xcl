@@ -235,3 +235,98 @@ fn geometry_es_inputs_validate_and_run_with_heap_windows() {
     assert_eq!(out[0x100 / 4 + 2], 0x3333_0003, "vertex 2 v9 fetched via heap window 0");
     assert_eq!(out[0x100 / 4 + 3], 0, "lane past nv gets 0");
 }
+
+/// ES jump + GS emitting 3 vertices per primitive: two `MSG_GS` emits (`0x22`) followed by
+/// `s_sendmsg final_simm` (e.g. `0x23` = `MSG_GS_DONE | EMIT` or `0x33` = `MSG_GS_DONE | EMIT_CUT`).
+fn msg_gs_done_program(final_simm: u64) -> (Vec<u8>, GsInterface) {
+    let e = |n: &str, enc: &str, f: &[(&str, u64)], lit: Option<u32>| encode(n, enc, f, lit).unwrap_or_else(|x| panic!("{n}: {x}"));
+    const V: u64 = 256;
+    let es = e("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)], None);
+    let mut gs: Vec<Vec<u8>> = Vec::new();
+    gs.push(e("S_BFE_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 3), ("SSRC1", 255)], Some(0x80008)));
+    gs.push(e("S_BFM_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 0), ("SSRC1", 128)], None));
+    gs.push(e("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", 128)], None));
+    gs.push(e("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", V + 20)], None));
+    gs.push(e("V_MAD_U32_U24", "ENC_VOP3", &[("VDST", 50), ("SRC0", V + 20), ("SRC1", 176), ("SRC2", 2)], None)); // lane * 48 + s2
+    gs.push(e("V_MOV_B32", "ENC_VOP1", &[("VDST", 52), ("SRC0", 242)], None)); // 1.0f
+    for k in 0..3u64 {
+        gs.push(e("V_MOV_B32", "ENC_VOP1", &[("VDST", 51), ("SRC0", 128 + k)], None));
+        gs.push(e("DS_WRITE2_B32", "ENC_DS", &[("ADDR", 50), ("DATA0", 20), ("DATA1", 51), ("OFFSET0", 0), ("OFFSET1", 1)], None));
+        gs.push(e("DS_WRITE2_B32", "ENC_DS", &[("ADDR", 50), ("DATA0", 52), ("DATA1", 52), ("OFFSET0", 2), ("OFFSET1", 3)], None));
+        gs.push(e("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 50), ("SRC0", 144), ("VSRC1", 50)], None)); // + 16
+        let simm = if k < 2 { 0x22 } else { final_simm };
+        gs.push(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", simm)], None));
+    }
+    gs.push(e("S_ENDPGM", "ENC_SOPP", &[], None));
+    let g = GsInterface {
+        es_inputs: vec![],
+        es_outputs: vec![sig("SV_Position", 1, 0, 3)],
+        outputs: vec![sig("SV_Position", 1, 0, 3)],
+        max_vertex_count: 3,
+        gs_start: Some(es.len() as u64),
+    };
+    let mut code = es;
+    code.extend(gs.concat());
+    (code, g)
+}
+
+/// `MSG_GS_DONE` (`msg == 3`) with `op == EMIT` (`0x23`) or `EMIT_CUT` (`0x33`) on stream 0 emits
+/// in DXIL (`waveActiveOp` sums `emitted`); `op == 0` (`0x03`) and `stream != 0` (`0x123`) fold to 0.
+#[test]
+fn msg_gs_done_emits_in_dxil() {
+    let e = |n: &str, enc: &str, f: &[(&str, u64)]| encode(n, enc, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let g = GsInterface {
+        es_inputs: vec![],
+        es_outputs: vec![sig("SV_Position", 1, 0, 3)],
+        outputs: vec![sig("SV_Position", 1, 0, 3)],
+        max_vertex_count: 1,
+        gs_start: Some(0),
+    };
+    for (simm, expect_emit) in [(0x23, true), (0x33, true), (0x03, false), (0x123, false)] {
+        let mut code = e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", simm)]);
+        code.extend(e("S_ENDPGM", "ENC_SOPP", &[]));
+        let k = translate_geometry(&code, opts(true, 1), &g).expect("translate geometry");
+        super::validate::validate(&k.dxil).expect("validate geometry");
+        let dis = super::validate::disassemble(&k.dxil).expect("disassemble geometry");
+        let active_ops = dis.matches("call i32 @dx.op.waveActiveOp.i32(").count();
+        assert_eq!(active_ops, if expect_emit { 2 } else { 1 }, "simm={simm:#x}:\n{dis}");
+    }
+}
+
+/// GPU execution check for `MSG_GS_DONE` (`0x23` emit, `0x33` emit+cut, `0x03` nop, `0x123` stream 1).
+#[test]
+fn gpu_geometry_msg_gs_done_records() {
+    if runner::adapter().is_err() || runner::wave64_programs_supported() != Ok(true) || dxc::location().is_err() || runner::mesh_shaders_supported() != Ok(true) {
+        runner::skip_test("no GPU / DXC / mesh shaders");
+        return;
+    }
+    let prims = 2usize;
+    let mut io = vec![0u32; 128];
+    io[IO_GS_PRIMS] = prims as u32;
+    let mem = vec![0u32; 64];
+    let ps_src = "struct V { float4 pos : SV_Position; };\nfloat4 main(V v) : SV_Target0 { return float4(1.0, 0.0, 0.0, 1.0); }\n";
+    let ps = dxc::compile(ps_src, "main", "ps_6_6", &[]).unwrap();
+
+    for (simm, verts_per_prim, tris_per_prim) in [(0x23, 3usize, 1usize), (0x33, 3, 1), (0x03, 2, 0), (0x123, 2, 0)] {
+        let (code, g) = msg_gs_done_program(simm);
+        let rec = g.record();
+        let msb = dxc::compile(&mesh_passthrough(&rec), "main", "ms_6_6", &[]).unwrap();
+        let direct = translate_geometry(&code, opts(true, 1), &g).unwrap().dxil;
+        let (_, got) = runner::mesh_draw(&direct, &msb, &ps, 1, rec.record_dwords(), &io, &mem, 32, [0.0; 4]).unwrap();
+
+        let (vd, maxv) = (rec.vert_dwords(), rec.max_vertices as usize);
+        assert_eq!(got[0], (prims * verts_per_prim) as u32, "simm={simm:#x}: vertex count");
+        assert_eq!(got[1], (prims * tris_per_prim) as u32, "simm={simm:#x}: triangle count");
+        for lane in 0..prims {
+            for k in 0..verts_per_prim {
+                let v = MESH_HEADER + (lane * verts_per_prim + k) * vd;
+                assert_eq!(&got[v..v + 4], &[lane as u32, k as u32, 0x3F80_0000, 0x3F80_0000], "simm={simm:#x}: lane {lane} vertex {k}");
+            }
+            if tris_per_prim == 1 {
+                let b = (lane * verts_per_prim) as u32;
+                let t = got[MESH_HEADER + maxv * vd + lane];
+                assert_eq!(t, b | ((b + 1) << 10) | ((b + 2) << 20), "simm={simm:#x}: lane {lane} triangle");
+            }
+        }
+    }
+}
