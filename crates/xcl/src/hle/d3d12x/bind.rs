@@ -626,6 +626,19 @@ unsafe fn scratch_args(this: *mut c_void, dev: &ID3D12Device, bytes: u64) -> Res
     Ok((b, 0))
 }
 
+/// The root UAVs of the pass that rewrites a two-pass ExecuteIndirect's arguments
+/// (`SCALE_ARGS_HLSL`), as (root slot, GPU address): every view its program declares gets one.
+///
+/// u4 holds the count and the program reads it only with a count buffer – but the root signature
+/// was just set, so a slot left out holds nothing, and a driver may load from it ahead of the
+/// test: a load at GPU address 0, which an NVIDIA GPU answers with a fault and a device removal
+/// (0x887A0006, the first operation not done in the list: this pass's Dispatch – a retail
+/// title's world, three times, each at the first such draw of a list). Without a count buffer
+/// u4 names the constants, which are always there.
+fn scale_views(consts: u64, src: u64, dst: u64, count: Option<u64>) -> [(u32, u64); 4] {
+    [(0, consts), (2, src), (3, dst), (4, count.unwrap_or(consts))]
+}
+
 /// The arguments of `max` commands at UMA address `src`, rewritten for the two passes
 /// (`SCALE_ARGS_HLSL`) into a scratch block: the block (INDIRECT_ARGUMENT until the caller puts
 /// it back to COMMON) and where the compute pass's commands are; the mesh pass's follow them.
@@ -658,11 +671,8 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
     emit_transition(list, &dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     list.SetComputeRootSignature(&rs);
     list.SetPipelineState(&pso);
-    list.SetComputeRootUnorderedAccessView(0, consts_va);
-    list.SetComputeRootUnorderedAccessView(2, src_va);
-    list.SetComputeRootUnorderedAccessView(3, dst.GetGPUVirtualAddress() + dst_off);
-    if let Some(va) = count_va {
-        list.SetComputeRootUnorderedAccessView(4, va);
+    for (slot, va) in scale_views(consts_va, src_va, dst.GetGPUVirtualAddress() + dst_off, count_va) {
+        list.SetComputeRootUnorderedAccessView(slot, va);
     }
     list.Dispatch(max.div_ceil(64), 1, 1);
     emit_transition(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
@@ -2515,6 +2525,22 @@ void main(uint t : SV_GroupIndex) {
         // the mesh pass's groups, `split` a record, all in X
         assert_eq!(record_groups(1 << 30, 64, 7), 65_535 / 7);
         assert_eq!(record_groups(1 << 20, 2 << 20, 1), 0);
+    }
+
+    /// Every root view the argument pass's program declares (u0, u2, u3, u4) gets an address,
+    /// also without a count buffer: u4 then names the constants. (A slot left out after the root
+    /// signature is set holds nothing, and a load from it is a load at GPU address 0.)
+    #[test]
+    fn the_argument_pass_names_a_buffer_in_every_view_it_declares() {
+        for register in ["u0", "u2", "u3", "u4"] {
+            assert!(SCALE_ARGS_HLSL.contains(&format!("register({register})")), "{register}");
+        }
+        assert!(!SCALE_ARGS_HLSL.contains("register(u1)") && !SCALE_ARGS_HLSL.contains("register(u5)"));
+        let with_count = scale_views(0x1000, 0x2000, 0x3000, Some(0x4000));
+        assert_eq!(with_count, [(0, 0x1000), (2, 0x2000), (3, 0x3000), (4, 0x4000)]);
+        let without = scale_views(0x1000, 0x2000, 0x3000, None);
+        assert_eq!(without, [(0, 0x1000), (2, 0x2000), (3, 0x3000), (4, 0x1000)]);
+        assert!(without.iter().all(|&(_, va)| va != 0));
     }
 
     /// `SCALE_ARGS_HLSL` on `commands` (dwords each, the DispatchMesh argument at dword 1):
