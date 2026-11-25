@@ -427,7 +427,7 @@ static PENDING_FREES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
 /// (bytes of video memory in pool heaps, of those mapped) – `XCL_ACTIVITY`
 pub fn pool_bytes() -> (usize, usize) {
-    let g = STATE.lock().unwrap();
+    let g = lock_state();
     let Some(s) = g.as_ref() else { return (0, 0) };
     let pools = s.pools.iter().filter(|p| p.is_some()).count() * POOL_TILES as usize * TILE;
     (pools, pools.saturating_sub(s.free.len() * TILE))
@@ -1294,7 +1294,7 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     if ranges.is_empty() {
         return;
     }
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| n > 0 && s.window_index(a).is_some()).collect();
     if filtered.is_empty() {
@@ -1315,6 +1315,7 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     let v = s.rb_value;
     if queue.Signal(&s.rb_fence, v).is_ok() {
         let _ = s.queue.Wait(&s.rb_fence, v);
+        super::list_x::note_internal_wait(s.queue.as_raw() as usize, "sparse readback behind a title queue", &s.rb_fence, v);
     }
     s.readback_ranges(&merged);
 }
@@ -1327,7 +1328,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     if len == 0 {
         return;
     }
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     if s.window_index(va).is_none() {
         return;
@@ -1371,7 +1372,7 @@ pub unsafe fn committed(a: usize, n: usize) {
     if n == 0 {
         return;
     }
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     let Some(s) = g.as_mut() else {
         let (start, end) = page_span(a, n);
         early_add(&mut EARLY.lock().unwrap(), start, end);
@@ -1387,7 +1388,7 @@ pub unsafe fn decommitted(a: usize, n: usize) {
     if n == 0 {
         return;
     }
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     let Some(s) = g.as_mut() else {
         let (start, end) = page_span(a, n);
         early_remove(&mut EARLY.lock().unwrap(), start, end);
@@ -1524,7 +1525,7 @@ impl State {
 /// The sparse windows' tiles with video memory as sorted (start, end) runs: where a CPU write
 /// has to reach the GPU.
 pub fn mapped_ranges() -> Vec<(usize, usize)> {
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     let Some(s) = g.as_mut() else { return Vec::new() };
     if s.runs.is_none() {
         let mut tiles: Vec<usize> = s.mapped.keys().copied().collect();
@@ -1556,7 +1557,7 @@ pub fn note_watch(t: std::time::Duration, pages: usize) {
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
     let t0 = std::time::Instant::now();
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     s.drain_deferred();
     // the title's work sees what was decommitted unmapped, as it was
@@ -1637,6 +1638,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let q = queue.as_raw() as usize;
     if s.value > 0 && s.waited.get(&q).copied().unwrap_or(0) < s.value {
         let _ = queue.Wait(&s.fence, s.value);
+        super::list_x::note_internal_wait(q, "sparse uploads and tile mappings", &s.fence, s.value);
         s.waited.insert(q, s.value);
     }
 }
@@ -1645,7 +1647,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
 /// description): a reserved resource over the window's tiles there, starting at the 64 KiB
 /// below `va` (returned: its distance from there).
 pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<(crate::util::HRESULT, usize)> {
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     let s = g.as_mut()?;
     s.drain_deferred();
     let start = va & !(TILE - 1);
@@ -1687,6 +1689,15 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     }
     s.signal();
     Some((hr, delta))
+}
+
+/// `STATE`, with any deferred tile unpins from `forget_buffer` drained first.
+fn lock_state() -> std::sync::MutexGuard<'static, Option<State>> {
+    let mut g = STATE.lock().unwrap();
+    if let Some(s) = g.as_mut() {
+        s.drain_unpins();
+    }
+    g
 }
 
 /// A placed buffer is gone: its tiles are not pinned by it any more.
@@ -1798,6 +1809,40 @@ mod tests {
             t.join().unwrap();
         }
     }
+
+    /// `f` on another thread while this one holds the sparse state (as `before_execute` does
+    /// around its D3D12 calls, which can wait for that thread): did `f` finish without waiting
+    /// for the state? The thread runs before the state is taken, so its start is not timed.
+    fn returns_while_the_state_is_held(f: impl FnOnce() + Send + 'static) -> bool {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            let _ = ready_tx.send(());
+            let _ = go_rx.recv();
+            f();
+            let _ = tx.send(());
+        });
+        ready_rx.recv().unwrap();
+        let held = STATE.lock().unwrap();
+        go_tx.send(()).unwrap();
+        let done = rx.recv_timeout(std::time::Duration::from_secs(5));
+        drop(held);
+        let joined = t.join();
+        assert!(joined.is_ok(), "the thread panicked: {joined:?}");
+        done.is_ok()
+    }
+
+    /// A placed buffer released while another thread holds the sparse state: the release does
+    /// not wait for the state, and the next `lock_state` lets the buffer go.
+    #[test]
+    fn a_buffer_released_while_the_state_is_held_does_not_wait_for_it() {
+        const RES: usize = 0x7ff0_dead_0000;
+        assert!(returns_while_the_state_is_held(|| forget_buffer(RES)), "forget_buffer waited for the sparse state's lock");
+        drop(lock_state());
+        assert!(!PLACED.lock().unwrap().buffers.as_ref().is_some_and(|m| m.contains_key(&RES)));
+    }
+
 
     /// Freeing the last tile in use of a pool and taking a tile again takes the retired pool
     /// back, not a new 64 MB heap each time (#913: 288 pools, 18 GB asked of a 12 GB card).

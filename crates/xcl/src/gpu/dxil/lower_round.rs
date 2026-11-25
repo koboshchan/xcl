@@ -21,12 +21,14 @@
 use super::lower::{LResult, Lw};
 use super::module::{BinOp, CastOp, Pred, Value};
 
-/// MODE[1:0] | MODE[5:4] << 4 (single-precision round and denormal modes), `f32_rm` programs.
+/// MODE[1:0] and MODE[5:4] (single-precision round and denormal modes).
 pub const VAR_F32_MODE: u32 = super::lower::VAR_BUDGET + 5;
 /// The MODE bits `VAR_F32_MODE` mirrors.
 pub const MODE_BITS: u32 = 0x33;
 /// Initial MODE (nearest even, f32 denormals kept: what the translator assumes elsewhere).
 pub const MODE_INIT: u32 = 0x30;
+/// Translator-only flag: an instruction on this path has explicitly written MODE[4].
+pub(super) const F32_DENORM_INPUT_WRITTEN: u32 = 1 << 31;
 
 const MASK52: u64 = (1 << 52) - 1;
 
@@ -43,13 +45,18 @@ impl Lw {
     /// MODE ← (MODE & !mask) | (v & mask), on the mirrored bits.
     pub fn mode_write(&mut self, v: Value, mask: u32) {
         let mask = mask & MODE_BITS;
-        if mask == 0 || !self.f32_rm {
+        if mask == 0 || !(self.f32_rm || self.track_frexp_denorm) {
             return;
         }
         let cur = self.rd(VAR_F32_MODE);
         let keep = self.andc(cur, !mask);
         let nv = self.andc(v, mask);
         let r = self.or(keep, nv);
+        let r = if self.track_frexp_denorm && mask & 0x10 != 0 {
+            self.orc(r, F32_DENORM_INPUT_WRITTEN)
+        } else {
+            r
+        };
         self.wr(VAR_F32_MODE, r);
     }
 
@@ -150,8 +157,9 @@ impl Lw {
 
     /// f32 bits of the exact value `s + e` (`s` its f64 rounding, `e` the remainder or +0)
     /// rounded by MODE (`rm` 1: +inf, 2: -inf, 3: zero; 0 is not used here), output denormals
-    /// flushed by MODE bit 5. `s` NaN / inf: `native`.
-    fn round_exact(&mut self, s: Value, e: Value, mode: Value, native: Value) -> Value {
+    /// flushed by MODE bit 5. `s` NaN / inf: truncated directly from `s` (preserving the
+    /// input denormal mode already applied to `s`).
+    fn round_exact(&mut self, s: Value, e: Value, mode: Value) -> Value {
         let sb = self.bits64(s);
         let sg = self.sh64(BinOp::LShr, sb, 63);
         let neg = self.trunc32(sg);
@@ -227,7 +235,10 @@ impl Lw {
         let r = self.or(sgn, mag);
         let r = self.flush_den(r, mode, 5);
         let special = self.cmpc(Pred::Eq, ex, 0x7FF);
-        self.sel(special, native, r)
+        let f32t = self.s.m.f32();
+        let sf = self.s.m.cast(CastOp::FPTrunc, s, f32t);
+        let sp = self.bits(sf);
+        self.sel(special, sp, r)
     }
 
     /// The final f32 (float) of a directed operation: `native` (round to nearest even) when
@@ -256,9 +267,9 @@ impl Lw {
 
     /// Sum `a + b` (f64, exact inputs) rounded by MODE; an exact zero from a sum is -0 toward
     /// -inf unless both addends are +0 (IEEE 754 6.3).
-    fn round_sum(&mut self, a: Value, b: Value, mode: Value, native: Value) -> Value {
+    fn round_sum(&mut self, a: Value, b: Value, mode: Value) -> Value {
         let (s, e) = self.two_sum(a, b);
-        let r = self.round_exact(s, e, mode, native);
+        let r = self.round_exact(s, e, mode);
         let mag = self.andc(r, 0x7FFF_FFFF);
         let zero = self.cmpc(Pred::Eq, mag, 0);
         let ab = self.bits64(a);
@@ -286,8 +297,7 @@ impl Lw {
         self.by_mode(native, mode, &mut |lw| {
             let x = lw.ext_exact(a, mode);
             let y = lw.ext_exact(b, mode);
-            let nb = lw.bits(native);
-            lw.round_sum(x, y, mode, nb)
+            lw.round_sum(x, y, mode)
         })
     }
 
@@ -299,8 +309,7 @@ impl Lw {
             let y = lw.ext_exact(b, mode);
             let p = lw.fmul(x, y);
             let z = lw.dc(0.0);
-            let nb = lw.bits(native);
-            lw.round_exact(p, z, mode, nb)
+            lw.round_exact(p, z, mode)
         })
     }
 
@@ -312,8 +321,7 @@ impl Lw {
             let y = lw.ext_exact(b, mode);
             let w = lw.ext_exact(c, mode);
             let p = lw.fmul(x, y);
-            let nb = lw.bits(native);
-            lw.round_sum(p, w, mode, nb)
+            lw.round_sum(p, w, mode)
         })
     }
 
@@ -343,8 +351,7 @@ impl Lw {
         self.by_mode(native, mode, &mut |lw| {
             let x = lw.int_exact(a, signed);
             let z = lw.dc(0.0);
-            let nb = lw.bits(native);
-            lw.round_exact(x, z, mode, nb)
+            lw.round_exact(x, z, mode)
         })
     }
 
@@ -353,8 +360,7 @@ impl Lw {
         let Some(mode) = self.f32_mode() else { return native };
         self.by_mode(native, mode, &mut |lw| {
             let z = lw.dc(0.0);
-            let nb = lw.bits(native);
-            lw.round_exact(a, z, mode, nb)
+            lw.round_exact(a, z, mode)
         })
     }
 
@@ -374,8 +380,7 @@ impl Lw {
             let p2 = lw.dbl(e);
             let p = lw.fmul(x, p2);
             let z = lw.dc(0.0);
-            let nb = lw.bits(native);
-            lw.round_exact(p, z, mode, nb)
+            lw.round_exact(p, z, mode)
         })
     }
 
