@@ -2679,7 +2679,12 @@ mod tests {
                 // --- Phase 2: Global UAV barrier (#146 GLOBAL) + before_bind_dsv ---
                 alloc.Reset().unwrap();
                 let reset_orig: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(real::orig_fn(list.as_raw(), 10));
-                assert_eq!(reset_orig(list.as_raw(), alloc.as_raw(), std::ptr::null_mut()), 0);
+                {
+                    // the runtime's Reset puts its own vtable back (as `list_x::reset_pc` knows)
+                    let ext = *(list.as_raw() as *const usize);
+                    assert_eq!(reset_orig(list.as_raw(), alloc.as_raw(), std::ptr::null_mut()), 0);
+                    real::preserve_vtable(list.as_raw(), ext);
+                }
 
                 set_heaps_orig(list.as_raw(), 1, &uav_heap_raw);
                 set_cs_rs(list.as_raw(), cs_rs.as_raw());
@@ -2733,7 +2738,12 @@ mod tests {
 
                 forget(depth_res.as_raw() as usize);
                 alloc.Reset().unwrap();
-                assert_eq!(reset_orig(list.as_raw(), alloc.as_raw(), std::ptr::null_mut()), 0);
+                {
+                    // the runtime's Reset puts its own vtable back (as `list_x::reset_pc` knows)
+                    let ext = *(list.as_raw() as *const usize);
+                    assert_eq!(reset_orig(list.as_raw(), alloc.as_raw(), std::ptr::null_mut()), 0);
+                    real::preserve_vtable(list.as_raw(), ext);
+                }
             }
             if let Some(m) = PIPELINES.lock().unwrap().as_mut() {
                 m.remove(&(dev.as_raw() as usize));
