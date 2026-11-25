@@ -84,6 +84,11 @@ pub(crate) fn mark(page: usize) {
     LAZY.write().unwrap_or_else(|e| e.into_inner()).insert(page);
 }
 
+/// Whether `page` (64 KiB aligned) is mapped but not committed yet.
+pub fn is_lazy(page: usize) -> bool {
+    LAZY.read().unwrap_or_else(|e| e.into_inner()).contains(&page)
+}
+
 /// `page` is unmapped: true if it was never used (nothing to keep of it).
 pub(crate) fn unmark(page: usize) -> bool {
     LAZY.write().unwrap_or_else(|e| e.into_inner()).remove(&page)

@@ -11,7 +11,7 @@
 //! replaced by the window's. Only what is read is mirrored: a write through it is lost, so UAVs
 //! keep their address.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::*;
 
@@ -20,6 +20,13 @@ use super::*;
 const EXTENT: usize = 1 << 20;
 /// Views longer than this keep their address.
 const MOST: usize = 64 << 20;
+/// Minimum submit age before budget-pressure LRU eviction can reclaim a still-backed tile,
+/// ensuring tiles referenced in the current frame or in-flight submissions are never evicted.
+const EVICT_GRACE_SUBMITS: u64 = 16;
+/// Rotating title tiles inspected per submit for unmapped/decommitted reclamation.
+const SWEEP_PER_SUBMIT: usize = 64;
+/// Extra cold tiles reclaimed alongside a budget eviction to amortize tile-mapping updates.
+const EVICT_BATCH_EXTRA: usize = 32;
 
 pub fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -44,6 +51,14 @@ pub(super) struct Mirrors {
     by_read: FxHashMap<usize, Vec<usize>>,
     /// window tiles none of whose bytes have gone up yet (or whose pages changed place)
     fresh: Vec<usize>,
+    /// window tile → submit epoch when last referenced (`base_for`, `show`, or dirty upload)
+    last_used: FxHashMap<usize, u64>,
+    /// title tiles whose backing read page has been observed committed at least once
+    backed: HashSet<usize>,
+    /// title tiles detected as dead/unmapped during `refresh_sources()` awaiting decommit in `sync()`
+    pending_dead: Vec<usize>,
+    /// monotonically incremented once per `sync()` submission
+    epoch: u64,
     /// the next title tile the slow check looks at
     turn: usize,
     /// GPU-view mappings seen (`kernelx::gpu_view_map_gen`)
@@ -59,6 +74,13 @@ impl Mirrors {
         self.read.insert(title, read);
         self.by_read.entry(read).or_default().push(win);
         self.fresh.push(win);
+        self.last_used.insert(win, self.epoch);
+    }
+
+    fn touch(&mut self, win: usize) {
+        if self.title_of.contains_key(&win) {
+            self.last_used.insert(win, self.epoch);
+        }
     }
 
     fn set_read(&mut self, title: usize, read: usize) {
@@ -67,11 +89,86 @@ impl Mirrors {
             return;
         }
         let wins: Vec<usize> = self.title_of.iter().filter(|&(_, &t)| t == title).map(|(&w, _)| w).collect();
-        if let Some(o) = old.and_then(|o| self.by_read.get_mut(&o)) {
-            o.retain(|w| !wins.contains(w));
+        if let Some(o) = old {
+            if let Some(v) = self.by_read.get_mut(&o) {
+                v.retain(|w| !wins.contains(w));
+                if v.is_empty() {
+                    self.by_read.remove(&o);
+                }
+            }
         }
         self.by_read.entry(read).or_default().extend(&wins);
         self.fresh.extend(wins);
+    }
+
+    /// Remove `wins` from all mirror tables and prune orphaned `by_read`, `read`, `backed`, and
+    /// `fresh` entries. Returns the number of mapped window tiles removed.
+    fn evict_windows(&mut self, wins: &[usize]) -> usize {
+        if wins.is_empty() {
+            return 0;
+        }
+        let mut evicted = 0usize;
+        let mut affected_titles: HashSet<usize> = HashSet::new();
+        let mut touched_reads: HashSet<usize> = HashSet::new();
+        for &w in wins {
+            let Some(title) = self.title_of.remove(&w) else { continue };
+            self.last_used.remove(&w);
+            affected_titles.insert(title);
+            if let Some(&r) = self.read.get(&title) {
+                touched_reads.insert(r);
+            }
+            evicted += 1;
+        }
+        if evicted == 0 {
+            return 0;
+        }
+        for r in touched_reads {
+            if let Some(v) = self.by_read.get_mut(&r) {
+                v.retain(|w| self.title_of.contains_key(w));
+                if v.is_empty() {
+                    self.by_read.remove(&r);
+                }
+            }
+        }
+        self.fresh.retain(|w| self.title_of.contains_key(w));
+        for &t in self.title_of.values() {
+            affected_titles.remove(&t);
+        }
+        for title in affected_titles {
+            self.read.remove(&title);
+            self.backed.remove(&title);
+        }
+        evicted
+    }
+
+    /// Evict every window tile showing `title` if none were touched in the current submit epoch.
+    fn evict_title_if_idle(&mut self, title: usize) -> Vec<usize> {
+        let wins: Vec<usize> = self.title_of.iter().filter(|&(_, &t)| t == title).map(|(&w, _)| w).collect();
+        if wins.is_empty() || wins.iter().any(|w| self.last_used.get(w).copied().unwrap_or(0) >= self.epoch) {
+            return Vec::new();
+        }
+        self.evict_windows(&wins);
+        wins
+    }
+
+    /// Select up to `want` least-recently-used window tiles at least `min_age` submits old and
+    /// outside `protect`, ordered oldest-first.
+    fn lru_eviction_candidates(&self, want: usize, min_age: u64, protect: &HashSet<usize>) -> Vec<usize> {
+        if want == 0 {
+            return Vec::new();
+        }
+        let mut cold: Vec<(u64, usize)> = self
+            .title_of
+            .keys()
+            .filter(|w| !protect.contains(w))
+            .filter_map(|&w| {
+                let last = self.last_used.get(&w).copied().unwrap_or(0);
+                (self.epoch.saturating_sub(last) >= min_age).then_some((last, w))
+            })
+            .collect();
+        cold.sort_unstable();
+        cold.truncate(want);
+        cold.into_iter().map(|(_, w)| w).collect()
     }
 
     /// The window tiles and pages a set of written pages (`dirty`, title or CPU addresses) is
@@ -92,6 +189,49 @@ impl Mirrors {
     }
 }
 
+/// Decommit evicted mirror window tiles in coalesced contiguous runs so `sparse::State` parks,
+/// unmaps, and returns their 64 KiB VRAM tiles (and empty 64 MiB pools) safely.
+unsafe fn decommit_window_tiles(s: &mut State, wins: &mut [usize]) {
+    if wins.is_empty() {
+        return;
+    }
+    wins.sort_unstable();
+    let mut i = 0;
+    while i < wins.len() {
+        let start = wins[i];
+        let mut end = start + TILE;
+        i += 1;
+        while i < wins.len() && (wins[i] == end || wins[i] == end - TILE) {
+            if wins[i] == end {
+                end += TILE;
+            }
+            i += 1;
+        }
+        s.decommit_range(start, end - start);
+    }
+}
+
+/// Whether `title` (a 64 KiB tile in a GPU view) has lost its backing: either the GPU-view
+/// reservation was released, the page was explicitly unmapped via `CopyPageMappingsBatchX`, or
+/// a previously committed backing tile has been completely decommitted. Returns `(dead, read)`.
+unsafe fn check_title_tile(title: usize, was_backed: bool) -> (bool, usize) {
+    if crate::hle::kernelx::mirrors::source(title).is_none() {
+        return (true, 0);
+    }
+    let read = tile_source(title);
+    if read == 0 {
+        return (true, 0);
+    }
+    if was_backed
+        && query_tile_holes(read) == 0xFFFF
+        && !crate::hle::kernelx::lazy::is_lazy(read)
+        && !crate::hle::kernelx::physical_page_at(read)
+    {
+        return (true, read);
+    }
+    (false, read)
+}
+
 /// Copies `n` bytes from the title's memory at `at`; false when the page went away (nothing read).
 unsafe fn read_title(at: usize, out: *mut u8, n: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
@@ -104,6 +244,10 @@ impl State {
     /// the pages the title wrote (`dirty`). Before the title's lists; `m` is held by the caller.
     pub(super) unsafe fn mirror_up(&mut self, m: &mut Mirrors, dirty: &[usize]) -> usize {
         let mut pages: Vec<(usize, usize)> = m.shown_at(dirty);
+        let dirty_count = pages.len();
+        for &(win, _) in &pages[..dirty_count] {
+            m.touch(win & !(TILE - 1));
+        }
         for win in std::mem::take(&mut m.fresh) {
             let Some(&title) = m.title_of.get(&win) else { continue };
             let read = m.read[&title];
@@ -122,6 +266,9 @@ impl State {
             let Some(entry) = self.mapped.get_mut(&tile) else { continue };
             if !read_title(read, bytes.as_mut_ptr(), PAGE) {
                 continue;
+            }
+            if let Some(&title) = m.title_of.get(&tile) {
+                m.backed.insert(title);
             }
             let i = (win - tile) / PAGE;
             entry.holes &= !(1u16 << i);
@@ -211,8 +358,29 @@ pub fn base_for(va: usize, len: usize) -> Option<usize> {
     let mut mg = MIRRORS.lock().unwrap();
     let m = mg.get_or_insert_with(Mirrors::default);
     let new: Vec<usize> = (t0..t1).step_by(TILE).filter(|t| !m.title_of.contains_key(&(win + (t - first)))).collect();
+    for t in (t0..t1).step_by(TILE) {
+        m.touch(win + (t - first));
+    }
     if !new.is_empty() {
-        if m.tiles() + new.len() > budget() / TILE {
+        let limit = budget() / TILE;
+        if m.tiles() + new.len() > limit {
+            let need = (m.tiles() + new.len()).saturating_sub(limit);
+            let protect: HashSet<usize> = (t0..t1).step_by(TILE).map(|t| win + (t - first)).collect();
+            let want = need.saturating_add(EVICT_BATCH_EXTRA);
+            let mut victims = m.lru_eviction_candidates(want, EVICT_GRACE_SUBMITS, &protect);
+            if victims.len() >= need {
+                let n = m.evict_windows(&victims);
+                // SAFETY: evicted mirror tiles live in sparse window VA with no CPU backing.
+                unsafe { decommit_window_tiles(s, &mut victims) };
+                static EVICTED: AtomicU64 = AtomicU64::new(0);
+                let prev = EVICTED.fetch_add(n as u64, Ordering::Relaxed);
+                let total = prev + n as u64;
+                if prev == 0 || (total >> 10) > (prev >> 10) {
+                    crate::xlog_info!("D3D12.X: GPU view mirrors evicted {n} cold tiles ({} MB total reclaimed, {} tiles live)", (total as usize * TILE) >> 20, m.tiles());
+                }
+            }
+        }
+        if m.tiles() + new.len() > limit {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| crate::xlog_warn!("D3D12.X: the buffers of the GPU view take more than XCL_GPU_VIEW_MB: the rest keeps its address"));
             return None;
@@ -230,8 +398,11 @@ pub fn base_for(va: usize, len: usize) -> Option<usize> {
             for &t in &new[i..j] {
                 let w = win + (t - first);
                 if s.mapped.contains_key(&w) {
-                    let read = resolved.get(&t).map_or(0, |&(r, _)| r);
+                    let (read, holes) = resolved.get(&t).copied().unwrap_or((0, u16::MAX));
                     m.show(w, t, read);
+                    if read != 0 && holes != 0xFFFF {
+                        m.backed.insert(t);
+                    }
                 }
             }
             i = j;
@@ -253,30 +424,46 @@ pub fn sources() -> Vec<(usize, usize)> {
     MIRRORS.lock().unwrap().as_ref().map_or(Vec::new(), |m| m.by_read.keys().copied().filter(|&r| r != 0).map(|r| (r, r + TILE)).collect())
 }
 
-/// Refresh tile backing addresses outside `sparse::STATE` (called before `lock_state()` in `before_execute`).
+/// Refresh tile backing addresses and detect unmapped/decommitted tiles outside `sparse::STATE`
+/// (called before `lock_state()` in `before_execute` so `kernelx::AWAY` is never taken under `STATE`).
 pub(super) fn refresh_sources() {
-    let look: Vec<usize> = {
+    let look: Vec<(usize, bool)> = {
         let mut g = MIRRORS.lock().unwrap();
         let Some(m) = g.as_mut().filter(|m| m.tiles() != 0) else { return };
         let gen = crate::hle::kernelx::gpu_view_map_gen().wrapping_add(crate::hle::kernelx::mirrors::changed_gen());
         let titles: Vec<usize> = m.read.keys().copied().collect();
-        let look = if std::mem::replace(&mut m.gen, gen) != gen {
+        let selected: Vec<usize> = if std::mem::replace(&mut m.gen, gen) != gen {
             titles
         } else {
             let n = titles.len().max(1);
-            (0..8.min(titles.len())).map(|i| titles[(m.turn + i) % n]).collect()
+            (0..SWEEP_PER_SUBMIT.min(titles.len())).map(|i| titles[(m.turn + i) % n]).collect()
         };
-        m.turn = m.turn.wrapping_add(8);
-        look
+        m.turn = m.turn.wrapping_add(SWEEP_PER_SUBMIT);
+        selected.into_iter().map(|t| (t, m.backed.contains(&t))).collect()
     };
     if look.is_empty() {
         return;
     }
-    let updates: Vec<(usize, usize)> = look.into_iter().map(|t| (t, tile_source(t))).collect();
+    let updates: Vec<(usize, bool, usize, bool)> = look
+        .into_iter()
+        .map(|(t, was_backed)| {
+            let (dead, r) = unsafe { check_title_tile(t, was_backed) };
+            let now_backed = !dead && !was_backed && r != 0 && unsafe { query_tile_holes(r) } != 0xFFFF;
+            (t, dead, r, now_backed)
+        })
+        .collect();
     let mut g = MIRRORS.lock().unwrap();
     if let Some(m) = g.as_mut() {
-        for (t, r) in updates {
-            if m.read.contains_key(&t) {
+        for (t, dead, r, now_backed) in updates {
+            if !m.read.contains_key(&t) {
+                continue;
+            }
+            if dead {
+                m.pending_dead.push(t);
+            } else {
+                if now_backed {
+                    m.backed.insert(t);
+                }
                 m.set_read(t, r);
             }
         }
@@ -287,6 +474,22 @@ pub(super) fn refresh_sources() {
 pub(super) unsafe fn sync(s: &mut State, dirty: &[usize]) {
     let mut g = MIRRORS.lock().unwrap();
     let Some(m) = g.as_mut().filter(|m| m.tiles() != 0) else { return };
+    m.epoch = m.epoch.wrapping_add(1);
+    let pending_dead = std::mem::take(&mut m.pending_dead);
+    let mut dead_wins: Vec<usize> = Vec::new();
+    for t in pending_dead {
+        dead_wins.extend(m.evict_title_if_idle(t));
+    }
+    if !dead_wins.is_empty() {
+        let evicted = dead_wins.len();
+        decommit_window_tiles(s, &mut dead_wins);
+        static UNMAPPED_EVICTED: AtomicU64 = AtomicU64::new(0);
+        let prev = UNMAPPED_EVICTED.fetch_add(evicted as u64, Ordering::Relaxed);
+        let total = prev + evicted as u64;
+        if prev == 0 || (total >> 10) > (prev >> 10) {
+            crate::xlog_info!("D3D12.X: GPU view mirrors reclaimed {evicted} unmapped tiles ({} MB total, {} tiles live)", (total as usize * TILE) >> 20, m.tiles());
+        }
+    }
     let n = s.mirror_up(m, dirty);
     static SENT: AtomicU64 = AtomicU64::new(0);
     static CALLS: AtomicU64 = AtomicU64::new(0);
@@ -346,6 +549,50 @@ mod tests {
         unsafe { assert!(apply_batches(1, b_unmap.as_ptr() as usize, pool, 8).is_some()) };
         assert_eq!(tile_source(tile), 0);
         released(cpu);
+        released(gpu);
+    }
+
+    #[test]
+    fn evict_windows_cleans_all_indices_and_orphaned_sources() {
+        let mut m = Mirrors::default();
+        m.show(0x10_0000, 0xAA_0000, 0xCC_0000);
+        m.show(0x20_0000, 0xAA_0000, 0xCC_0000);
+        m.show(0x30_0000, 0xBB_0000, 0xDD_0000);
+        m.backed.insert(0xAA_0000);
+        m.backed.insert(0xBB_0000);
+        // Evicting one of two window aliases keeps the shared title/read entry alive.
+        assert_eq!(m.evict_windows(&[0x10_0000]), 1);
+        assert_eq!(m.tiles(), 2);
+        assert!(m.read.contains_key(&0xAA_0000));
+        assert_eq!(m.shown_at(&[0xCC_1000]), vec![(0x20_1000, 0xCC_1000)]);
+        assert!(!m.fresh.contains(&0x10_0000));
+        // Evicting the last alias removes title, backed, and empty by_read source entries.
+        assert_eq!(m.evict_windows(&[0x20_0000]), 1);
+        assert_eq!(m.tiles(), 1);
+        assert!(!m.read.contains_key(&0xAA_0000));
+        assert!(!m.backed.contains(&0xAA_0000));
+        assert!(!m.by_read.contains_key(&0xCC_0000));
+        assert_eq!(m.shown_at(&[0xDD_2000]), vec![(0x30_2000, 0xDD_2000)]);
+    }
+
+    #[test]
+    fn lru_eviction_respects_grace_window_and_protected_tiles() {
+        let mut m = Mirrors::default();
+        m.epoch = 1;
+        m.show(0x10_0000, 0xA0_0000, 0xA0_0000);
+        m.epoch = 5;
+        m.show(0x20_0000, 0xB0_0000, 0xB0_0000);
+        m.epoch = 20;
+        m.show(0x30_0000, 0xC0_0000, 0xC0_0000);
+        m.epoch = 25;
+        // At epoch 25 with grace 16: 0x10 (age 24) and 0x20 (age 20) are cold; 0x30 (age 5) is hot.
+        let protect: HashSet<usize> = [0x10_0000].into_iter().collect();
+        assert_eq!(m.lru_eviction_candidates(4, EVICT_GRACE_SUBMITS, &protect), vec![0x20_0000]);
+        assert_eq!(m.lru_eviction_candidates(4, EVICT_GRACE_SUBMITS, &HashSet::new()), vec![0x10_0000, 0x20_0000]);
+        // Touching 0x10 makes it hot in the current epoch, so evict_title_if_idle skips it too.
+        m.touch(0x10_0000);
+        assert!(m.evict_title_if_idle(0xA0_0000).is_empty());
+        assert_eq!(m.evict_title_if_idle(0xB0_0000), vec![0x20_0000]);
     }
 
     /// The bytes of the title's pages reach the window tiles mapped for them, and again when the
