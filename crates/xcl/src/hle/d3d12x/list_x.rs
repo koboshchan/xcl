@@ -2986,6 +2986,11 @@ pub(super) fn on_pc_reset(list: *mut c_void) {
     }
 }
 
+/// Whether the title's predication is set on `list` (XCL cannot set its own there)
+pub(super) fn predication_active(list: *mut c_void) -> bool {
+    LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).is_some_and(|s| s.predication.is_some())
+}
+
 /// Copy 8 predicate bytes from `(uma_buf, off)` into `pb` with exact barrier transitions and
 /// bind `SetPredication(pb, 0, op)` on `this`.
 unsafe fn apply_predication_copy(this: *mut c_void, uma_buf: usize, off: u64, pb: usize, op: D3D12_PREDICATION_OP) {
