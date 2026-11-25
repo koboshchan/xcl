@@ -155,8 +155,48 @@ pub fn graphics_reservations() -> Vec<(usize, usize)> {
 
 /// Whether `p` lies in one of the title's graphics reservations.
 pub fn in_graphics_reservation(p: usize) -> bool {
-    GRAPHICS_RESERVATIONS.lock().unwrap().range(..=p).next_back().is_some_and(|(&b, &s)| p < b + s)
+    graphics_reservation_bounds(p).is_some()
 }
+
+/// The `[start, end)` bounds of the graphics reservation containing `p`, if any.
+pub fn graphics_reservation_bounds(p: usize) -> Option<(usize, usize)> {
+    GRAPHICS_RESERVATIONS
+        .lock()
+        .unwrap()
+        .range(..=p)
+        .next_back()
+        .and_then(|(&b, &s)| {
+            let end = b.saturating_add(s);
+            (p < end).then_some((b, end))
+        })
+}
+
+/// Whether `[start, start + len)` overlaps any graphics reservation.
+pub fn overlaps_graphics_reservation(start: usize, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let end = start.saturating_add(len);
+    let g = GRAPHICS_RESERVATIONS.lock().unwrap();
+    if let Some((&b, &s)) = g.range(..=start).next_back() {
+        if start < b.saturating_add(s) {
+            return true;
+        }
+    }
+    g.range(start..end).next().is_some()
+}
+
+/// Notify `d3d12x::vram` when a range in a graphics reservation (or a CPU view with GPU views)
+/// gains or loses title memory so placed textures there follow it before the next submit.
+fn notify_vram_backing(a: usize, n: usize) {
+    if n > 0 && (overlaps_graphics_reservation(a, n) || !mirrors::gpu_views_of(a).is_empty()) {
+        crate::hle::d3d12x::vram::title_memory_changed(a, n);
+    }
+}
+
+/// Coherent UMA headroom kept for XCL itself (readback heaps; per-draw arguments have their own
+/// pool) so title graphics heaps or non-sparse physical-page fallbacks never starve XCL.
+const COHERENT_KEEP: usize = 96 << 20;
 
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
@@ -524,8 +564,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             let align = if t & 0x2000_0000 != 0 && t & 0x0040_0000 == 0 { 2 << 20 } else { crate::gpu::uma::GRAIN };
             // what XCL keeps of the window for itself (readback heaps; its per-draw arguments have
             // a pool of their own)
-            const KEEP: usize = 96 << 20;
-            let fits = u.size().saturating_sub(u.used()) >= size + KEEP;
+            let fits = u.size().saturating_sub(u.used()) >= size + COHERENT_KEEP;
             if let Some(q) = fits.then(|| u.alloc(size, align)).flatten() {
                 trace_mem("VirtualAlloc (graphics, coherent window)", 0, size, t as u64, p, q as usize);
                 return q as *mut c_void;
@@ -548,6 +587,9 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     }
     let q = mem::VirtualAlloc(addr, size, sanitize_alloc_type(t), sanitize_protect(p));
     trace_mem("VirtualAlloc", addr as usize, size, t as u64, p, q as usize);
+    if !q.is_null() && t & mem::MEM_COMMIT != 0 {
+        notify_vram_backing(q as usize, size);
+    }
     q
 }
 
@@ -657,7 +699,16 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
         }
         return 1;
     }
+    let gone = if t & 0x8000 != 0 {
+        GRAPHICS_RESERVATIONS.lock().unwrap().get(&(addr as usize)).copied().unwrap_or(0)
+    } else {
+        size
+    };
+    let notify = gone > 0 && (overlaps_graphics_reservation(addr as usize, gone) || !mirrors::gpu_views_of(addr as usize).is_empty());
     let ok = mem::VirtualFree(addr, size, t);
+    if ok != 0 && notify {
+        crate::hle::d3d12x::vram::title_memory_changed(addr as usize, gone);
+    }
     if ok != 0 && t & 0x8000 != 0 {
         let released = GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize));
         if let Some(len) = released {
@@ -1477,7 +1528,8 @@ unsafe fn alloc_physical_home(u: &crate::gpu::uma::Uma, bytes: usize) -> Option<
         return Some(p);
     }
     if !u.has_sparse() {
-        if let Some(p) = u.alloc(bytes, PHYS_PAGE) {
+        let fits = u.size().saturating_sub(u.used()) >= bytes.saturating_add(COHERENT_KEEP);
+        if let Some(p) = fits.then(|| u.alloc(bytes, PHYS_PAGE)).flatten() {
             return Some(p as usize);
         }
     }
@@ -1576,10 +1628,16 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
 }
 
 pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _t: u32, _p: u32, arr: *mut usize) -> *mut c_void {
-    let mut g = AWAY.lock().unwrap();
-    let away = g.get_or_insert_with(Away::default);
-    let r = map_pages(away, va, n, arr);
-    give_back_homes(away);
+    let r = {
+        let mut g = AWAY.lock().unwrap();
+        let away = g.get_or_insert_with(Away::default);
+        let r = map_pages(away, va, n, arr);
+        give_back_homes(away);
+        r
+    };
+    if !r.is_null() {
+        notify_vram_backing(r as usize, n.saturating_mul(PHYS_PAGE));
+    }
     r
 }
 
@@ -1721,15 +1779,28 @@ pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
     }
-    let mut g = AWAY.lock().unwrap();
-    let away = g.get_or_insert_with(Away::default);
-    // no page array: page 0 (unmap) for every address
-    let ok = (0..n).all(|i| {
-        let mut none = 0usize;
-        let page = if pages.is_null() { &mut none as *mut usize } else { pages.add(i) as *mut usize };
-        !map_pages(away, *addresses.add(i), 1, page).is_null()
-    });
-    give_back_homes(away);
+    let mut mapped: Vec<usize> = Vec::new();
+    let ok = {
+        let mut g = AWAY.lock().unwrap();
+        let away = g.get_or_insert_with(Away::default);
+        // no page array: page 0 (unmap) for every address
+        let ok = (0..n).all(|i| {
+            let mut none = 0usize;
+            let page = if pages.is_null() { &mut none as *mut usize } else { pages.add(i) as *mut usize };
+            let r = map_pages(away, *addresses.add(i), 1, page);
+            if !r.is_null() {
+                mapped.push(r as usize);
+                true
+            } else {
+                false
+            }
+        });
+        give_back_homes(away);
+        ok
+    };
+    for a in mapped {
+        notify_vram_backing(a, PHYS_PAGE);
+    }
     ok as BOOL
 }
 

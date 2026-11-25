@@ -89,6 +89,11 @@ pub(crate) fn unmark(page: usize) -> bool {
     LAZY.write().unwrap_or_else(|e| e.into_inner()).remove(&page)
 }
 
+/// Whether the 64 KiB page containing `addr` is marked lazy (mapped, committed on first touch).
+pub(crate) fn is_lazy(addr: usize) -> bool {
+    LAZY.read().unwrap_or_else(|e| e.into_inner()).contains(&(addr & !(PAGE - 1)))
+}
+
 /// The lazy pages of `[p, p + len)` committed – memory a kernel call or XCL writes.
 pub fn ensure(p: usize, len: usize) {
     if len == 0 {
