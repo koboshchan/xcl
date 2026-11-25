@@ -1738,7 +1738,10 @@ fn dispatch_with(
         list.SetComputeRootSignature(rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
-        list.SetComputeRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
+        // every window (u2..u5) is `mem`, as in the heap above
+        for k in 2..6 {
+            list.SetComputeRootUnorderedAccessView(k, mem_buf.GetGPUVirtualAddress());
+        }
         let scratch = chain.map(|(_, words, most)| {
             let first = super::pso::dispatch_slabs(groups, most)[0].1;
             let bytes = first.iter().fold(4 * u64::from(words), |n, &g| n * u64::from(g));

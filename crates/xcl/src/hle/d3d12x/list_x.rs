@@ -483,6 +483,17 @@ fn with_bindings(list: *mut c_void, f: impl FnOnce(&mut Bindings)) {
     f(&mut g.get_or_insert_with(HashMap::new).entry(list as usize).or_default().bindings);
 }
 
+/// (tests) The view heaps XCL counts as bound on `list`; forgetting the list with `forget`.
+#[cfg(test)]
+pub(super) fn bound_heaps(list: *mut c_void, forget: bool) -> Vec<usize> {
+    let mut heaps = Vec::new();
+    with_bindings(list, |b| heaps = b.heaps.clone());
+    if forget {
+        LISTS.lock().unwrap().as_mut().map(|m| m.remove(&(list as usize)));
+    }
+    heaps
+}
+
 const PC_IA_SET_PRIMITIVE_TOPOLOGY: usize = 20;
 const PC_RS_SET_VIEWPORTS: usize = 21;
 const PC_RS_SET_SCISSOR_RECTS: usize = 22;

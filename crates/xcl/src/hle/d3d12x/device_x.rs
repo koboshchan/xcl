@@ -1237,6 +1237,19 @@ pub(super) unsafe extern "system" fn get_copyable_footprints_x(
 /// device #41 CreateCommandSignature(desc, root signature, riid, signature): the console's
 /// DispatchX argument (105) is a PC Dispatch; the root signature only goes with arguments
 /// that need one (constants, CBV / SRV / UAV)
+fn indirect_arg_bytes(arg: &[u32; 4]) -> u32 {
+    match arg[0] {
+        0 => 16,
+        1 => 20,
+        2 | 10 => 12,
+        3 | 4 => 16,
+        5 => arg[3].saturating_mul(4),
+        6..=8 => 8,
+        9 => 108,
+        _ => 0,
+    }
+}
+
 pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_void, desc: *const u8, root: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     if desc.is_null() || ppv.is_null() {
         return E_INVALIDARG;
@@ -1254,8 +1267,22 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
     let needs_root = list.iter().any(|a| (5..=8).contains(&a[0]));
     pc[8..16].copy_from_slice(&(if list.is_empty() { 0 } else { list.as_ptr() as u64 }).to_le_bytes());
     let hr = real::dev_create_command_signature(this, pc.as_ptr() as usize, if needs_root { root } else { 0 }, riid, ppv);
-    if hr >= 0 && !ppv.is_null() && needs_root {
-        super::bind::note_root_changing_signature(*ppv as usize);
+    if hr >= 0 && !ppv.is_null() {
+        if needs_root {
+            super::bind::note_root_changing_signature(*ppv as usize);
+        } else if let Some(idx) = list.iter().position(|a| a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH.0 as u32) {
+            let offset: u32 = list[..idx].iter().map(indirect_arg_bytes).sum();
+            let byte_stride = u32::from_le_bytes(pc[0..4].try_into().unwrap());
+            let mut dispatch_list = list.clone();
+            dispatch_list[idx][0] = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32;
+            let mut dpc = pc;
+            dpc[8..16].copy_from_slice(&(dispatch_list.as_ptr() as u64).to_le_bytes());
+            let mut companion: *mut c_void = std::ptr::null_mut();
+            let hr2 = real::dev_create_command_signature(this, dpc.as_ptr() as usize, 0, riid, &mut companion);
+            if hr2 >= 0 && !companion.is_null() {
+                super::bind::note_dispatch_mesh_signature(*ppv as usize, companion as usize, byte_stride, offset);
+            }
+        }
     }
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         super::bind::note_signature_dispatches(*ppv as usize, list.iter().any(|a| a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32));
