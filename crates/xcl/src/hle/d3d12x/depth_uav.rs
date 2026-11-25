@@ -58,7 +58,10 @@ pub(super) enum DepthSyncKind {
     /// Two-plane `R32G8X24_TYPELESS` plane 0 (`R32_TYPELESS`): buffer-through `CopyTextureRegion`.
     BufferThrough,
     /// Two-plane `R24G8_TYPELESS` plane 0: fullscreen depth-write pass (twin -> depth) and CS copy (depth -> twin).
-    FullscreenPass { twin_srv_fmt: i32, twin_uav_fmt: i32 },
+    /// When `steps` is true (console `D16_UNORM_S8_UINT` family `118..=120`), the `R16_TYPELESS` twin stores
+    /// 16-bit integer steps of `1/65535` read as `R16_UINT` and multiplied by `asfloat(0x37800080)` so the
+    /// 24-bit depth matches tiled-lighting `DepthFunc = EQUAL` vertex shaders bit-for-bit.
+    FullscreenPass { steps: bool, twin_srv_fmt: i32, twin_uav_fmt: i32 },
 }
 
 /// Twin allocation & sync plan derived from a console resource format.
@@ -99,7 +102,8 @@ pub(super) fn plan_for_console_format(console_fmt: u32) -> Option<TwinPlan> {
             depth_twin_fmt: DXGI_FORMAT_R16_TYPELESS.0,
             stencil_twin_fmt: Some(DXGI_FORMAT_R8_TYPELESS.0),
             depth_sync: DepthSyncKind::FullscreenPass {
-                twin_srv_fmt: DXGI_FORMAT_R16_UNORM.0,
+                steps: true,
+                twin_srv_fmt: DXGI_FORMAT_R16_UINT.0,
                 twin_uav_fmt: DXGI_FORMAT_R16_UNORM.0,
             },
             two_plane: true,
@@ -109,6 +113,7 @@ pub(super) fn plan_for_console_format(console_fmt: u32) -> Option<TwinPlan> {
             depth_twin_fmt: DXGI_FORMAT_R32_TYPELESS.0,
             stencil_twin_fmt: Some(DXGI_FORMAT_R8_TYPELESS.0),
             depth_sync: DepthSyncKind::FullscreenPass {
+                steps: false,
                 twin_srv_fmt: DXGI_FORMAT_R32_FLOAT.0,
                 twin_uav_fmt: DXGI_FORMAT_R32_FLOAT.0,
             },
@@ -1417,6 +1422,7 @@ unsafe fn copy_plane_through_buffer(
 struct SyncPipelines {
     gfx_rs: ID3D12RootSignature,
     gfx_pso: ID3D12PipelineState,
+    gfx_pso_steps: ID3D12PipelineState,
     cs_rs: ID3D12RootSignature,
     cs_pso: ID3D12PipelineState,
 }
@@ -1462,6 +1468,14 @@ unsafe fn build_sync_pipelines(dev: &ID3D12Device) -> Option<SyncPipelines> {
         cbuffer C : register(b0) { uint slice; uint mip; };\n\
         float main(float4 pos : SV_Position) : SV_Depth {\n\
             return src.Load(int4(int2(pos.xy), int(slice), int(mip)));\n\
+        }\n",
+        "ps_5_0",
+    )?;
+    let ps_steps = compile_sm5(
+        "Texture2DArray<uint> src : register(t0);\n\
+        cbuffer C : register(b0) { uint slice; uint mip; };\n\
+        float main(float4 pos : SV_Position) : SV_Depth {\n\
+            return float(src.Load(int4(int2(pos.xy), int(slice), int(mip)))) * asfloat(0x37800080);\n\
         }\n",
         "ps_5_0",
     )?;
@@ -1593,11 +1607,20 @@ unsafe fn build_sync_pipelines(dev: &ID3D12Device) -> Option<SyncPipelines> {
     let create_gfx: CreateGfxPsoFn = std::mem::transmute(real::orig_fn(dev_raw, 10));
     let mut gfx_pso_raw = std::ptr::null_mut();
     let hr_gfx = create_gfx(dev_raw, &gfx_desc, &ID3D12PipelineState::IID as *const _ as *const _, &mut gfx_pso_raw);
-    ManuallyDrop::drop(&mut gfx_desc.pRootSignature);
     if hr_gfx < 0 || gfx_pso_raw.is_null() {
+        ManuallyDrop::drop(&mut gfx_desc.pRootSignature);
         return None;
     }
     let gfx_pso = ID3D12PipelineState::from_raw(gfx_pso_raw);
+
+    gfx_desc.PS = D3D12_SHADER_BYTECODE { pShaderBytecode: ps_steps.as_ptr() as *const c_void, BytecodeLength: ps_steps.len() };
+    let mut gfx_pso_steps_raw = std::ptr::null_mut();
+    let hr_gfx_steps = create_gfx(dev_raw, &gfx_desc, &ID3D12PipelineState::IID as *const _ as *const _, &mut gfx_pso_steps_raw);
+    ManuallyDrop::drop(&mut gfx_desc.pRootSignature);
+    if hr_gfx_steps < 0 || gfx_pso_steps_raw.is_null() {
+        return None;
+    }
+    let gfx_pso_steps = ID3D12PipelineState::from_raw(gfx_pso_steps_raw);
 
     let mut cs_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
         pRootSignature: ManuallyDrop::new(Some(cs_rs.clone())),
@@ -1614,7 +1637,7 @@ unsafe fn build_sync_pipelines(dev: &ID3D12Device) -> Option<SyncPipelines> {
     }
     let cs_pso = ID3D12PipelineState::from_raw(cs_pso_raw);
 
-    Some(SyncPipelines { gfx_rs, gfx_pso, cs_rs, cs_pso })
+    Some(SyncPipelines { gfx_rs, gfx_pso, gfx_pso_steps, cs_rs, cs_pso })
 }
 
 /// Ensure per-resource internal unadopted PC DSV + SRV/UAV descriptor heaps exist for `R24G8_TYPELESS` sync.
@@ -1719,13 +1742,15 @@ unsafe fn ensure_pass_heaps(
     Some((e.pass_dsv_heap.clone()?, e.pass_srv_uav_heap.clone()?))
 }
 
-unsafe fn get_pipelines(dev: &ID3D12Device) -> Option<(ID3D12RootSignature, ID3D12PipelineState, ID3D12RootSignature, ID3D12PipelineState)> {
+unsafe fn get_pipelines(
+    dev: &ID3D12Device,
+) -> Option<(ID3D12RootSignature, ID3D12PipelineState, ID3D12PipelineState, ID3D12RootSignature, ID3D12PipelineState)> {
     let key = dev.as_raw() as usize;
     let mut g = PIPELINES.lock().unwrap();
     let map = g.get_or_insert_with(HashMap::new);
     let entry = map.entry(key).or_insert_with(|| build_sync_pipelines(dev));
     let p = entry.as_ref()?;
-    Some((p.gfx_rs.clone(), p.gfx_pso.clone(), p.cs_rs.clone(), p.cs_pso.clone()))
+    Some((p.gfx_rs.clone(), p.gfx_pso.clone(), p.gfx_pso_steps.clone(), p.cs_rs.clone(), p.cs_pso.clone()))
 }
 
 /// Execute queued depth+UAV synchronization ops on a `DIRECT` command list.
@@ -1803,12 +1828,12 @@ pub(super) unsafe fn execute_syncs(list: *mut c_void, ops: &[SyncOp]) {
                                 list_x::transition(list, twin_raw, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                                 transition_plane_from(list, res, true, per_plane, 0, STATE_COPY_DEST, depth);
                             }
-                            DepthSyncKind::FullscreenPass { twin_srv_fmt, twin_uav_fmt } => {
+                            DepthSyncKind::FullscreenPass { steps, twin_srv_fmt, twin_uav_fmt } => {
                                 let heaps = {
                                     let mut g = ENTRIES.lock().unwrap();
                                     g.as_mut().and_then(|m| m.get_mut(&res)).and_then(|e| ensure_pass_heaps(&dev, depth_res, &twin, e, twin_srv_fmt, twin_uav_fmt))
                                 };
-                                if let (Some((gfx_rs, gfx_pso, _, _)), Some((dsv_heap, srv_heap))) = (get_pipelines(&dev), heaps) {
+                                if let (Some((gfx_rs, gfx_pso, gfx_pso_steps, _, _)), Some((dsv_heap, srv_heap))) = (get_pipelines(&dev), heaps) {
                                     let twin_raw = twin.as_raw() as usize;
                                     list_x::transition(list, twin_raw, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATES(STATE_SRV_ALL as i32));
                                     transition_plane_subs(list, res, true, per_plane, 0, depth, Some(STATE_DEPTH_WRITE));
@@ -1826,7 +1851,7 @@ pub(super) unsafe fn execute_syncs(list: *mut c_void, ops: &[SyncOp]) {
 
                                     set_heaps(list, 1, &srv_raw);
                                     set_gfx_rs(list, gfx_rs.as_raw());
-                                    set_pso(list, gfx_pso.as_raw());
+                                    set_pso(list, if steps { gfx_pso_steps.as_raw() } else { gfx_pso.as_raw() });
                                     set_topo(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST.0 as u32);
                                     set_gfx_table(list, 1, srv_heap.GetGPUDescriptorHandleForHeapStart().ptr);
                                     let dsv_base = dsv_heap.GetCPUDescriptorHandleForHeapStart().ptr;
@@ -1917,12 +1942,12 @@ pub(super) unsafe fn execute_syncs(list: *mut c_void, ops: &[SyncOp]) {
                                 list_x::transition(list, twin_raw, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                                 transition_plane_from(list, res, true, per_plane, 0, STATE_COPY_SOURCE, depth);
                             }
-                            DepthSyncKind::FullscreenPass { twin_srv_fmt, twin_uav_fmt } => {
+                            DepthSyncKind::FullscreenPass { twin_srv_fmt, twin_uav_fmt, .. } => {
                                 let heaps = {
                                     let mut g = ENTRIES.lock().unwrap();
                                     g.as_mut().and_then(|m| m.get_mut(&res)).and_then(|e| ensure_pass_heaps(&dev, depth_res, &twin, e, twin_srv_fmt, twin_uav_fmt))
                                 };
-                                if let (Some((_, _, cs_rs, cs_pso)), Some((_, srv_heap))) = (get_pipelines(&dev), heaps) {
+                                if let (Some((_, _, _, cs_rs, cs_pso)), Some((_, srv_heap))) = (get_pipelines(&dev), heaps) {
                                     transition_plane_subs(list, res, true, per_plane, 0, depth, Some(STATE_SRV_ALL));
                                     let srv_raw = srv_heap.as_raw() as usize;
                                     let set_heaps: unsafe extern "system" fn(*mut c_void, u32, *const usize) = std::mem::transmute(real::orig_fn(list, 28));
@@ -2017,12 +2042,12 @@ mod tests {
         assert_eq!(d16s8.depth_twin_fmt, 53);
         assert_eq!(d16s8.stencil_twin_fmt, Some(60));
         assert!(d16s8.two_plane);
-        assert_eq!(d16s8.depth_sync, DepthSyncKind::FullscreenPass { twin_srv_fmt: 56, twin_uav_fmt: 56 });
+        assert_eq!(d16s8.depth_sync, DepthSyncKind::FullscreenPass { steps: true, twin_srv_fmt: 57, twin_uav_fmt: 56 });
 
         let d24s8 = plan_for_console_format(45).expect("D24_UNORM_S8_UINT");
         assert_eq!(d24s8.depth_twin_fmt, 39);
         assert_eq!(d24s8.stencil_twin_fmt, Some(60));
-        assert_eq!(d24s8.depth_sync, DepthSyncKind::FullscreenPass { twin_srv_fmt: 41, twin_uav_fmt: 41 });
+        assert_eq!(d24s8.depth_sync, DepthSyncKind::FullscreenPass { steps: false, twin_srv_fmt: 41, twin_uav_fmt: 41 });
 
         assert!(plan_for_console_format(28).is_none(), "color format has no depth twin plan");
     }
