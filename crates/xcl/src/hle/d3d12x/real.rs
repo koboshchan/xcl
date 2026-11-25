@@ -1715,9 +1715,19 @@ pub(super) fn standin_released(pso: usize) {
 
 /// A stand-in pipeline released for good takes its background-built real pipeline with it.
 unsafe extern "system" fn pso_release(this: *mut c_void) -> u32 {
+    let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+    // The last reference: forgotten while the object has its address. A pipeline another thread
+    // makes can get that address as soon as it is free, and must keep its own entries.
+    let last = add(this) == 2;
+    if last {
+        forget_pso(this as usize);
+        super::pso_async::release(super::pso_async::released(this as usize));
+    }
+    f(this);
     let n = f(this);
-    if n == 0 {
+    // (two last-but-one releases at once: neither saw itself as the last)
+    if n == 0 && !last {
         forget_pso(this as usize);
         super::pso_async::release(super::pso_async::released(this as usize));
     }
@@ -8905,3 +8915,50 @@ void main() {
     }
 }
 
+
+#[cfg(test)]
+mod pso_release_tests {
+    use super::*;
+
+    /// An adopted pipeline as `orig_fn` sees it: its vtable, the original one before that.
+    #[repr(C)]
+    struct Pipeline {
+        vtable: *const usize,
+        refs: u32,
+        /// the pipeline was still known when its last reference went
+        known_when_freed: Option<bool>,
+    }
+
+    unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+        let p = &mut *(this as *mut Pipeline);
+        p.refs += 1;
+        p.refs
+    }
+
+    unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+        let p = &mut *(this as *mut Pipeline);
+        p.refs -= 1;
+        if p.refs == 0 {
+            p.known_when_freed = Some(is_translated_compute(this as usize));
+        }
+        p.refs
+    }
+
+    /// What XCL keeps of a pipeline goes before the driver frees it, not after: its address can be
+    /// another pipeline's by then. It stays while there are other references.
+    #[test]
+    fn a_pipeline_is_forgotten_before_its_address_is_free() {
+        let orig: [usize; 3] = [0, add_ref as usize, release as usize];
+        let ext: [usize; 4] = [orig.as_ptr() as usize, 0, 0, 0];
+        let mut p = Box::new(Pipeline { vtable: &ext[1], refs: 2, known_when_freed: None });
+        let this = p.as_mut() as *mut Pipeline as *mut c_void;
+        register_translated_compute_for_test(this as usize);
+        unsafe {
+            assert_eq!(pso_release(this), 1);
+            assert!(is_translated_compute(this as usize), "another reference is left");
+            assert_eq!(pso_release(this), 0);
+        }
+        assert_eq!(p.known_when_freed, Some(false));
+        assert!(!is_translated_compute(this as usize));
+    }
+}
