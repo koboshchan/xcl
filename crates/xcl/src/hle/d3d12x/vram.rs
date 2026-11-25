@@ -133,7 +133,9 @@ pub(super) fn is_placed_texture(resource: usize) -> bool {
 pub(super) fn forget(resource: usize) {
     let placed = PLACED_TEXTURES.lock().unwrap().as_mut().is_some_and(|textures| textures.remove(&resource));
     if placed {
-        forget_pages(resource);
+        if !super::vram_small::forget(resource) {
+            forget_pages(resource);
+        }
         if let Some(id) = ARENA_OF.lock().unwrap().as_mut().and_then(|m| m.remove(&resource)) {
             ARENAS.lock().unwrap().release(id, std::time::Instant::now());
         }
@@ -2064,11 +2066,54 @@ pub(super) fn mapped_tiles_for(device: usize, resource: usize) -> Option<(Vec<(u
     (used.len() + extra.len() == target.total as usize).then_some((used, extra))
 }
 
+/// Whether `va` already has a live (or still within `IDLE`) 64 KiB page on `device` (e.g., an
+/// existing GPU-owned render target that a sampled view at the same 64 KiB-aligned address should
+/// alias).
+fn has_live_page(device: usize, va: usize) -> bool {
+    let g = PAGES.lock().unwrap();
+    let now = std::time::Instant::now();
+    g.get(&device)
+        .and_then(|p| p.as_ref())
+        .is_some_and(|p| p.pages.get(&va).is_some_and(|pg| pg.idle_since.is_none_or(|s| now.duration_since(s) < IDLE)))
+}
+
 #[cfg(test)]
 pub(super) fn page_bytes_for(device: usize) -> (usize, usize) {
-    let g = PAGES.lock().unwrap();
-    let Some(Some(p)) = g.get(&device) else { return (0, 0) };
-    ((p.pages.len() + p.extra_pages.len()) * PAGE, p.pools.len() * POOL_PAGES as usize * PAGE)
+    let (su, sp) = super::vram_small::bytes_for(device);
+    let mut g = PAGES.lock().unwrap();
+    let Some(Some(p)) = g.get_mut(&device) else { return (su, sp) };
+    p.sweep(std::time::Instant::now());
+    ((p.pages.len() + p.extra_pages.len()) * PAGE + su, p.pools.len() * POOL_PAGES as usize * PAGE + sp)
+}
+
+#[cfg(test)]
+pub(super) fn extra_page_bytes_for(device: usize) -> usize {
+    let mut g = PAGES.lock().unwrap();
+    let Some(Some(p)) = g.get_mut(&device) else { return 0 };
+    p.sweep(std::time::Instant::now());
+    p.extra_pages.len() * PAGE
+}
+
+/// Immediately evict all unreferenced idle pages and small-pool slots on `device` so GPU tests
+/// sharing the process's singleton `ID3D12Device` do not observe stale `IDLE` expiries mid-test.
+#[cfg(test)]
+pub(super) fn flush_idle_for(device: usize) {
+    super::vram_small::flush_idle_for(device);
+    let mut g = PAGES.lock().unwrap();
+    if let Some(Some(p)) = g.get_mut(&device) {
+        let now = std::time::Instant::now();
+        while let Some((key, since)) = p.idle.pop_front() {
+            let still_idle = |pg: &Page| pg.idle_since == Some(since);
+            let page = match key {
+                PageKey::Own(a) if p.pages.get(&a).is_some_and(still_idle) => p.pages.remove(&a),
+                PageKey::Extra(va, i) if p.extra_pages.get(&(va, i)).is_some_and(still_idle) => p.extra_pages.remove(&(va, i)),
+                _ => None,
+            };
+            if let Some(pg) = page {
+                p.pool.push_cooling(pg.tile, now);
+            }
+        }
+    }
 }
 
 /// Pool/tile identities used by one mapped resource: title pages, then extra pages.
@@ -2086,8 +2131,9 @@ pub(super) fn tile_mappings_for(device: usize, resource: usize) -> Option<(Vec<(
 
 /// (bytes of pages in use by tiled textures, bytes of pool heaps) – `XCL_ACTIVITY`
 pub fn page_bytes() -> (usize, usize) {
+    let (su, sp) = super::vram_small::bytes();
     let g = PAGES.lock().unwrap();
-    g.values().flatten().fold((0, 0), |(used, pools), p| {
+    g.values().flatten().fold((su, sp), |(used, pools), p| {
         (used + (p.pages.len() + p.extra_pages.len()) * PAGE, pools + p.pools.len() * POOL_PAGES as usize * PAGE)
     })
 }
@@ -2096,11 +2142,6 @@ pub fn page_bytes() -> (usize, usize) {
 fn tier2(dev: &ID3D12Device) -> bool {
     let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
     unsafe { dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut o as *mut _ as *mut c_void, std::mem::size_of_val(&o) as u32).is_ok() && o.ResourceHeapTier.0 >= 2 }
-}
-
-/// Whether `dev` already has a live GPU-owned page mapped at canonical 64 KiB address `va`.
-fn has_live_page(dev_key: usize, va: usize) -> bool {
-    PAGES.lock().unwrap().get(&dev_key).and_then(|o| o.as_ref()).is_some_and(|p| p.pages.contains_key(&va))
 }
 
 /// Sampled 2D single-slice textures may map mip levels lazily under `XCL_TEXTURE_LEVEL_PAGES=1`,
@@ -2116,8 +2157,9 @@ fn should_use_lazy_levels(level_pages_on: bool, aliases_live: bool, desc: &D3D12
 }
 
 /// A sampled texture of the title at `va` (`desc`: the PC description, `console_bytes` its size on
-/// the console) backed by shared 64 KiB video-memory pages; None when reserved placement is not
-/// available (the caller falls back to a committed resource).
+/// the console) backed by shared 4 KiB small-resource heaps (when < 64 KiB and not aliasing an
+/// existing 64 KiB GPU page) or shared 64 KiB video-memory pages; None when neither applies (the
+/// caller falls back to a committed resource).
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn place_pages(
     this: *mut c_void,
@@ -2135,6 +2177,12 @@ pub unsafe fn place_pages(
     }
     if console_has_packed_3d_mips(desc) {
         return None;
+    }
+    if !(va % PAGE == 0 && has_live_page(dev.as_raw() as usize, canonical_va(va))) {
+        if let Some(hr) = super::vram_small::place(dev, this, va, desc, state, clear, console_bytes, riid, ppv) {
+            PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+            return Some(hr);
+        }
     }
     // (one slice: the tiles of an array's packed levels are not asked about here)
     let aliases_live = va % PAGE == 0 && has_live_page(dev.as_raw() as usize, canonical_va(va));
