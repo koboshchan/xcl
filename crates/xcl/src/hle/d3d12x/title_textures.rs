@@ -464,7 +464,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
 /// Where a texture at `va` is read from: the CPU view behind a GPU view (`kernelx::mirrors`)
 /// when nothing is mapped at `va` itself, else `va`. A physical page mapped at `va` counts
 /// before its first use too, while it is still reserved memory (`kernelx::physical_page_at`).
-fn mirror_source(va: usize) -> usize {
+pub(super) fn mirror_source(va: usize) -> usize {
     let Some(src) = crate::hle::kernelx::mirrors::source(va) else { return va };
     if crate::hle::kernelx::physical_page_at(va) {
         return va;
@@ -787,6 +787,7 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     regions.extend(crate::hle::kernelx::graphics_reservations());
     let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().by_res.values().flat_map(|e| e.src.ranges(e.tex.size() as usize).map(|(s, e)| (s & !0xFFF, (e + 0xFFF) & !0xFFF)).collect::<Vec<_>>()).collect();
     wanted.extend(super::sparse::mapped_ranges());
+    wanted.extend(super::sparse::gpu_view::sources());
     let computed = Arc::new(watch_ranges(&regions, wanted));
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
     computed
