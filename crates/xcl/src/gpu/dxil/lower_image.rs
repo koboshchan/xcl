@@ -146,7 +146,26 @@ impl Lw {
                     let b = lw.fmin(hi[0], hi[1]);
                     let b = lw.fmin(b, hi[2]);
                     let cv = lw.cmpc(Pred::Ne, child[k], u32::MAX);
-                    let mut all = cv;
+                    // Reject all-zero unmapped-page / Box32 page-straddle entries where
+                    // `child == 0` AND all box bounds are 0 (prevents infinite BVH traversal
+                    // loops on unmapped sparse tiles while preserving synthetic tests that use
+                    // child index 0 with real non-zero box bounds).
+                    let nonzero = if box32 {
+                        let b = 4 + 6 * k;
+                        let mut m = child[k];
+                        for j in 0..6 {
+                            m = lw.or(m, words[b + j]);
+                        }
+                        lw.nz(m)
+                    } else {
+                        let b = 4 + 3 * k;
+                        let mut m = child[k];
+                        for j in 0..3 {
+                            m = lw.or(m, words[b + j]);
+                        }
+                        lw.nz(m)
+                    };
+                    let mut all = lw.land(cv, nonzero);
                     for c in 0..3 {
                         let le = lw.fcmp(Pred::FOLe, mn[c], mx[c]);
                         all = lw.land(all, le);
@@ -918,7 +937,11 @@ impl Lw {
             let base_lo = self.shlc(d0, 8);
             let off_lo = self.shlc(nlo, 3);
             let a = self.add(base_lo, off_lo);
-            // the window: bits 32.. of the 64-bit address
+            // the window: bits 32.. of the 64-bit address; also verify the node is non-null
+            // (`full >= 0x10000`, `hi != 0`) and that both the start and end of a 128 B Box32
+            // node (`full + 111`) fall within valid UMA windows so out-of-window / null BVH
+            // roots never read `[0; 28]` or straddle into an unmapped window.
+            let mut bvh_valid = self.b(true);
             if self.mems.len() > 1 {
                 let d1lo = self.andc(d1, 0xFF);
                 let b64 = self.pack64(d0, d1lo);
@@ -939,6 +962,19 @@ impl Lw {
                 let full = self.add(b64, off);
                 let (_, hi) = self.unpack64(full);
                 self.window_hi(hi, false);
+                let hi_nz = self.nz(hi);
+                let w = self.rd(super::lower::VAR_WIN);
+                let w_ok = self.cmpc(Pred::ULt, w, self.mems.len() as u32);
+                // Check end of 112-byte Box32 node (`full + 111`) stays in-window as well.
+                let k111 = self.c64(111);
+                let full_end = self.add(full, k111);
+                let (_, hi_end) = self.unpack64(full_end);
+                let same_hi = self.cmp(Pred::Eq, hi_end, hi);
+                let k64k = self.c64(0x1_0000);
+                let non_null = self.cmp(Pred::UGe, full, k64k);
+                let ok1 = self.land(hi_nz, w_ok);
+                let ok2 = self.land(same_hi, non_null);
+                bvh_valid = self.land(ok1, ok2);
             }
             let ty = self.andc(node, 7);
             let sort = {
@@ -946,8 +982,15 @@ impl Lw {
                 self.nz(s)
             };
             let act = self.act();
+            let guard = self.land(act, bvh_valid);
             let out = [self.tmp_var(), self.tmp_var(), self.tmp_var(), self.tmp_var()];
-            self.guarded(act, &mut |lw| {
+            // Default to all-miss (`u32::MAX`) for active lanes whose BVH node address was
+            // null/out-of-window so traversal exits immediately instead of looping on zeroes.
+            let ones = self.c(u32::MAX);
+            for (c, _) in out.iter().enumerate() {
+                self.write32(&super::lower::Dst::V(vdata + c as u64), ones);
+            }
+            self.guarded(guard, &mut |lw| {
                 lw.bvh_intersect(ty, a, extent, origin, dir, inv, sort, out)?;
                 for (c, &t) in out.iter().enumerate() {
                     let v = lw.rd(t);
