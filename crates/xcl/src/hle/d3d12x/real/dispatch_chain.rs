@@ -232,6 +232,16 @@ pub(super) fn forget(pso: usize) {
     drop(gone); // releasing a tail PSO also goes through forget_pso
 }
 
+/// Compiled driver code bytes held by the tail pieces (and any built whole form) of a split
+/// compute chain keyed by its first piece `pso`.
+pub(in crate::hle::d3d12x) unsafe fn tail_code_bytes(pso: usize) -> usize {
+    let chain = CHAINS.lock().unwrap().get(&pso).cloned();
+    let Some(chain) = chain else { return 0 };
+    let tail: usize = chain.tail.iter().map(|p| cached_blob_size(p.as_raw())).sum();
+    let whole = chain.whole.get().map_or(0, |p| cached_blob_size(p.as_raw()));
+    tail + whole
+}
+
 pub(in crate::hle::d3d12x) unsafe fn whole(pso: usize) -> Result<WholePso, String> {
     let chain = CHAINS.lock().unwrap().get(&pso).cloned();
     if chain.is_some() { WHOLE_INDIRECT.fetch_add(1, Ordering::Relaxed); }
@@ -359,6 +369,15 @@ unsafe fn scratch_for(dev: &ID3D12Device, list: usize, allocator: usize, needed:
 pub(in crate::hle::d3d12x) fn allocator_reset(allocator: usize) {
     let recordings = RECORDINGS.lock().unwrap().remove(&allocator);
     drop(recordings);
+}
+
+/// First-piece pipelines still held by active split-dispatch recordings.
+pub(in crate::hle::d3d12x) fn recorded_pipelines(out: &mut std::collections::HashSet<usize>) {
+    for list in RECORDINGS.lock().unwrap().values() {
+        for r in list {
+            out.insert(r.first.as_raw() as usize);
+        }
+    }
 }
 
 unsafe fn scratch_buffer(dev: &ID3D12Device, bytes: u64) -> Option<ID3D12Resource> {

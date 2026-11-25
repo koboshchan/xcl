@@ -131,7 +131,7 @@ static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
 
 fn run(p: &Pending, mut job: Job) {
     let real = job();
-    if p.releasable && p.compute {
+    if p.releasable {
         *p.again.lock().unwrap() = Some(job);
     }
     complete(p, real);
@@ -893,6 +893,50 @@ mod used_tests {
         }
     }
 
+    #[test]
+    fn an_unused_graphics_pipeline_is_released_when_over_limit() {
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Direct3D12::*;
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let mut sig = None;
+            D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut sig, None).unwrap();
+            let sig = sig.unwrap();
+            let rs: ID3D12RootSignature = dev.CreateRootSignature(0, std::slice::from_raw_parts(sig.GetBufferPointer() as *const u8, sig.GetBufferSize())).unwrap();
+            let code = super::super::real::compile("[numthreads(1, 1, 1)] void main() {}", "cs_5_0");
+            let builds = Arc::new(AtomicUsize::new(0));
+            let (n, dev, rs) = (builds.clone(), dev.into_raw() as usize, rs.into_raw() as usize);
+            let standin = 0x7E57_C0E0usize;
+            let job: Job = Box::new(move || {
+                n.fetch_add(1, Ordering::AcqRel);
+                let (dev, rs) = (dev as *mut std::ffi::c_void, rs as *mut std::ffi::c_void);
+                let dev = ID3D12Device::from_raw_borrowed(&dev).unwrap();
+                let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute(rs),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr() as _, BytecodeLength: code.len() },
+                    ..Default::default()
+                };
+                dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc).map_or(0, |p| p.into_raw() as usize)
+            });
+            submit_as(standin, false, job, false, 0, true);
+            shared(standin, 0x7E57_C0E1);
+            let built = resolve_wait_for(standin, None);
+            assert_ne!(built, 0x7E57_C0E1);
+            release_unused_with(0, super::super::shader_code::IDLE_MS);
+            assert_eq!(resolve_wait_for(standin, None), built, "recently used graphics pipeline must stay");
+            let p = entry(standin).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(super::super::shader_code::IDLE_MS + 50));
+            release_unused_with(0, super::super::shader_code::IDLE_MS);
+            assert!(is_pending(standin) && p.real.load(Ordering::Acquire) == 0, "idle graphics pipeline must be released when over limit");
+            assert_ne!(resolve_wait_for(standin, None), 0x7E57_C0E1);
+            assert_eq!(builds.load(Ordering::Acquire), 2);
+            release(released(standin));
+        }
+    }
+
     static WORKER_SATURATION_LOCK: Mutex<()> = Mutex::new(());
 
     /// A queued normal worker job whose stand-in was released before a worker starts it is
@@ -1142,7 +1186,7 @@ impl Pending {
             if real == 0 {
                 return self.stand(pso);
             }
-            if self.releasable && self.compute {
+            if self.releasable {
                 unsafe { super::shader_code::Ref::new(real) }.map(super::shader_code::hold);
             }
             if self.releasable && self.code.load(Ordering::Acquire) == 0 {
@@ -1152,52 +1196,93 @@ impl Pending {
             real
         };
         if first {
-            release_unused(super::shader_code::limit());
+            let limit = super::shader_code::limit();
+            if limit != 0 {
+                release_unused(limit);
+            }
+        } else if self.releasable {
+            let limit = super::shader_code::limit();
+            if limit != 0 && super::shader_code::used() > limit {
+                static LAST_SWEEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let now = super::shader_code::now_ms();
+                let prev = LAST_SWEEP.load(Ordering::Relaxed);
+                if now >= prev + 250 && LAST_SWEEP.compare_exchange(prev, now, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                    release_unused(limit);
+                }
+            }
         }
         real
     }
 }
 
-/// Release the compute pipelines used longest ago when there is more compiled code in use than
-/// `shader_code::limit`. Their next bind builds them again (from the driver's cache).
+/// Release the pipelines used longest ago when there is more compiled code in use than
+/// `shader_code::limit`: idle compute pipelines first (`IDLE_MS`), then idle graphics pipelines
+/// (`GFX_IDLE_MS`) only if compute eviction alone could not bring usage under `limit`. Their next
+/// bind builds them again (from the driver's cache).
 fn release_unused(limit: usize) {
+    release_unused_with(limit, 10_000);
+}
+
+fn release_unused_with(limit: usize, gfx_idle_ms: u64) {
     use super::shader_code::{choose, in_recordings, let_go_done, now_ms, used, IDLE_MS};
     if used() <= limit {
         return;
     }
     let_go_done();
     let recorded = in_recordings();
-    let all: Vec<Arc<Pending>> = PENDING.lock().unwrap().as_ref().map_or(Vec::new(), |m| m.values().filter(|p| p.releasable && p.compute && p.driver.load(Ordering::Acquire) != 0 && p.code.load(Ordering::Acquire) != 0 && !recorded.contains(&p.real.load(Ordering::Acquire))).cloned().collect());
-    let sizes: Vec<(usize, u64)> = all.iter().map(|p| (p.code.load(Ordering::Acquire), p.last.load(Ordering::Acquire))).collect();
-    let mut n = 0;
-    for i in choose(&sizes, used(), limit, now_ms()) {
-        let p = &all[i];
-        let real = {
-            // (a build or a bind of it is going on: not unused)
-            let Ok(mut done) = p.done.try_lock() else { continue };
-            if !*done || p.last.load(Ordering::Acquire) + IDLE_MS > now_ms() || p.orphan.load(Ordering::Acquire) {
-                continue;
-            }
-            let real = p.real.swap(0, Ordering::AcqRel);
-            if real == 0 {
-                continue;
-            }
-            p.code.store(0, Ordering::Release);
-            *p.job.lock().unwrap() = p.again.lock().unwrap().take();
-            p.sent.store(false, Ordering::Release);
-            p.late.store(false, Ordering::Release);
-            p.gone.store(true, Ordering::Release);
-            p.demand.lock().unwrap().by_submit = false;
-            *done = false;
-            real
-        };
-        release(real);
-        n += 1;
-    }
+    let evict = |compute: bool, idle_ms: u64| -> usize {
+        let now = now_ms();
+        let all: Vec<Arc<Pending>> = PENDING.lock().unwrap().as_ref().map_or(Vec::new(), |m| {
+            m.values()
+                .filter(|p| {
+                    p.releasable
+                        && p.compute == compute
+                        && p.driver.load(Ordering::Acquire) != 0
+                        && p.code.load(Ordering::Acquire) != 0
+                        && p.last.load(Ordering::Acquire) + idle_ms <= now
+                        && !recorded.contains(&p.real.load(Ordering::Acquire))
+                })
+                .cloned()
+                .collect()
+        });
+        let sizes: Vec<(usize, u64)> = all.iter().map(|p| (p.code.load(Ordering::Acquire), p.last.load(Ordering::Acquire))).collect();
+        let mut n = 0;
+        for i in choose(&sizes, used(), limit, now) {
+            let p = &all[i];
+            let real = {
+                // (a build or a bind of it is going on: not unused)
+                let Ok(mut done) = p.done.try_lock() else { continue };
+                if !*done || p.last.load(Ordering::Acquire) + idle_ms > now_ms() || p.orphan.load(Ordering::Acquire) {
+                    continue;
+                }
+                let real = p.real.swap(0, Ordering::AcqRel);
+                if real == 0 {
+                    continue;
+                }
+                p.code.store(0, Ordering::Release);
+                *p.job.lock().unwrap() = p.again.lock().unwrap().take();
+                p.sent.store(false, Ordering::Release);
+                p.late.store(false, Ordering::Release);
+                p.gone.store(true, Ordering::Release);
+                p.demand.lock().unwrap().by_submit = false;
+                *done = false;
+                real
+            };
+            release(real);
+            n += 1;
+        }
+        n
+    };
+    let n_cs = evict(true, IDLE_MS);
+    let n_gfx = if used() > limit { evict(false, gfx_idle_ms) } else { 0 };
+    let n = n_cs + n_gfx;
     if n != 0 {
         static RELEASED: AtomicUsize = AtomicUsize::new(0);
         let all = RELEASED.fetch_add(n, Ordering::Relaxed) + n;
-        crate::xlog_info!("D3D12.X: {n} compute pipelines not used lately released ({} MB of shader code left in use; {all} released so far)", used() >> 20);
+        crate::xlog_info!(
+            "D3D12.X: {n} pipelines not used lately released ({n_cs} compute, {n_gfx} graphics; {} MB of shader code left in use; {all} released so far)",
+            used() >> 20
+        );
     }
 }
 

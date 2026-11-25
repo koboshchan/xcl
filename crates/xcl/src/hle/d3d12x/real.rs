@@ -4811,6 +4811,14 @@ pub(super) unsafe fn cached_blob_size(pso: *mut c_void) -> usize {
     read_pso_cached_blob(pso).map_or(0, |b| b.len())
 }
 
+/// Bytes of the driver's compiled companion compute pipeline owned by a two-pass mesh/GS `pso`.
+/// Reads `TWO_PASS` directly (not `two_pass_of`) because `shader_code::count` runs under a
+/// `pso_async::Pending` lock and must not re-enter `pso_async::resolve` / `PENDING`.
+pub(super) unsafe fn two_pass_code_bytes(pso: usize) -> usize {
+    let tp = TWO_PASS.lock().unwrap().as_ref().and_then(|m| m.get(&pso).cloned());
+    tp.map_or(0, |tp| cached_blob_size(tp.compute as *mut c_void))
+}
+
 /// Read `GetCachedBlob` from either an adopted or raw PC `ID3D12PipelineState`.
 unsafe fn read_pso_cached_blob(pso: *mut c_void) -> Option<Vec<u8>> {
     if pso.is_null() {

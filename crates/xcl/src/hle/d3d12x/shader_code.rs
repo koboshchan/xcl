@@ -158,7 +158,9 @@ pub unsafe fn count(pso: usize) -> usize {
         return n;
     }
     // (outside the lock: the driver's call)
-    let n = super::real::cached_blob_size(pso as *mut c_void);
+    let n = super::real::cached_blob_size(pso as *mut c_void)
+        + super::real::dispatch_chain::tail_code_bytes(pso)
+        + super::real::two_pass_code_bytes(pso);
     if SIZES.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, n).is_none() {
         USED.fetch_add(n, Ordering::AcqRel);
     }
@@ -174,7 +176,9 @@ pub fn freed(pso: usize) {
 
 /// The pipelines recordings use: released, they would take their room until those are done.
 pub fn in_recordings() -> HashSet<usize> {
-    BOUND.lock().unwrap().as_ref().map_or(HashSet::new(), |m| m.values().flat_map(|p| p.keys().copied()).collect())
+    let mut out = BOUND.lock().unwrap().as_ref().map_or(HashSet::new(), |m| m.values().flat_map(|p| p.keys().copied()).collect());
+    super::real::dispatch_chain::recorded_pipelines(&mut out);
+    out
 }
 
 /// Give back what the allocators hold whose lists are all reset and done on the GPU.
