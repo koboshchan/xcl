@@ -215,6 +215,14 @@ pub const GS_PRIMS_PER_GROUP: u32 = 21;
 pub const IO_GS_PRIMS: usize = 110;
 pub const IO_GS_VERTICES: usize = 111;
 pub const IO_UMA_BASE_HI: usize = 112;
+/// io slot (trap-temp range) of a compute dispatch whose groups were folded: the console's group
+/// count in X, 0 when not folded. The console takes up to 2^32 - 1 groups a dimension, D3D12
+/// 65 535 - a dispatch of more in X (and 1 in Y) runs as 65 535 x ceil(n / 65 535) groups, and
+/// the translated program takes `gid.x + gid.y * 65 535` as its group in X, leaving out the
+/// groups at or past `n`.
+pub const IO_GROUP_LIMIT: usize = 113;
+/// Groups a folded dispatch has in X.
+pub const FOLD_X: u32 = 65_535;
 /// High dword `s_getpc_b64` gives a program that has constant data in its code region
 /// (`Options::rodata`) and several memory windows: its code addresses are then above every
 /// address a title can have (user space ends at 0x7FFF_FFFF_FFFF), so a load from the data is
@@ -223,7 +231,6 @@ pub const CODE_ADDRESS_HI: u32 = 0xC0DE;
 /// io slots of a `DispatchX` with thread dimensions (flag 0x20): the thread count of each axis
 /// when it is not a whole number of groups (0: the last group is whole), so the program can leave
 /// the lanes past it out of EXEC. Written by D3D12.X now; read by the compute prologue later.
-/// (113 is left for the group-limit slot of #1428.)
 pub const IO_THREAD_LIMIT: [usize; 3] = [114, 115, 116];
 
 impl GsInterface {
