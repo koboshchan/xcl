@@ -809,6 +809,11 @@ unsafe fn try_native_depth_bias(list: *mut c_void, bias: DepthBias) -> bool {
     true
 }
 
+/// The allocator `list` records on (0: unknown).
+pub(super) fn allocator_of(list: usize) -> usize {
+    LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&list)).map_or(0, |s| s.allocator)
+}
+
 /// Record a newly created command list's allocator, initial pipeline, and type.
 ///
 /// # Safety
@@ -840,6 +845,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
         old
     };
     drop(old);
+    super::shader_code::bound(key);
     super::title_textures::list_reset(key);
     // Dynamic-depth-bias PSOs ignore baked RasterizerState depth bias; seed the list with the
     // initial PSO's static bias if non-zero (CreateCommandList resets RSSetDepthBias to 0).
@@ -2838,6 +2844,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
     };
 
     // the next segment is a recording of its own (reset or made here, not through `cl_reset`)
+    super::shader_code::bound_on(super::alloc_pool::current(alloc));
     super::dred::reset(next_pc);
     if init_pso != 0 {
         super::dred::mark_pipeline(next_pc, bound_pso, init_pso);
@@ -3422,6 +3429,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(target, PC_RESET)(target, pc_alloc, init_pso)
     });
     real::preserve_vtable(target, ext_closed);
+    super::shader_code::bound(target as usize);
     if reset_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
     }
@@ -3530,6 +3538,7 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
         if let Some(base) = need_restore_base {
             let resolved = super::pso_async::resolve_for_bind(base);
             pc::<unsafe extern "system" fn(*mut c_void, usize)>(this, PC_SET_PIPELINE_STATE)(this, resolved);
+            super::shader_code::bound(this as usize);
         }
         if !need_native_call {
             return;
@@ -3614,6 +3623,7 @@ pub(super) unsafe fn prepare_draw(list: *mut c_void) {
     };
     let resolved = super::pso_async::resolve_for_bind(target);
     pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_SET_PIPELINE_STATE)(list, resolved);
+    super::shader_code::bound(list as usize);
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
         s.using_fallback_pso = is_fallback;
     }
@@ -4086,6 +4096,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
     if hr < 0 {
         return hr;
     }
+    super::shader_code::bound(this as usize);
 
     reset_copy_scratch(this);
     reset_own_alloc(this);
