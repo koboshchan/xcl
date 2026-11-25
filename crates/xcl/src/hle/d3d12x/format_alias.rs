@@ -245,12 +245,27 @@ struct TrackedTex {
     /// Per-subresource PC states (only tracked for `Owner::TitlePlaced`).
     pc_states: Vec<u32>,
     is_writer: bool,
+    /// Whether this writer may hold GPU writes not yet copied to its format-aliased readers.
+    /// Starts `true`, clears after all current readers are synced, and re-arms on any write
+    /// transition/access, discard, copy-dest, or newly linked reader.
+    dirty: bool,
+    /// `bind::activity()` (`(draws, dispatches)`) at the writer's last completed sync.
+    last_sync_activity: Option<(u64, u64)>,
 }
 
 impl TrackedTex {
     fn new(device: usize, va: usize, shape: TexShape, owner: Owner, initial_state: u32, is_writer: bool) -> Self {
         let n = if owner == Owner::TitlePlaced { shape.subresource_count().max(1) as usize } else { 0 };
-        Self { device, va, shape, owner, pc_states: vec![initial_state; n], is_writer }
+        Self {
+            device,
+            va,
+            shape,
+            owner,
+            pc_states: vec![initial_state; n],
+            is_writer,
+            dirty: is_writer,
+            last_sync_activity: None,
+        }
     }
 
     fn uniform_state(&self) -> Option<u32> {
@@ -360,6 +375,10 @@ impl AliasTable {
             }
         }
         for pair in new_pairs {
+            if let Some(w) = self.by_res.get_mut(&pair.writer) {
+                w.dirty = true;
+                w.last_sync_activity = None;
+            }
             self.add_pair(pair);
         }
         self.by_va.entry(tex.va).or_default().push(res);
@@ -486,6 +505,33 @@ static LIST_STATES: Mutex<Option<HashMap<usize, ListSyncState>>> = Mutex::new(No
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| !std::env::var("XCL_FORMAT_ALIAS").is_ok_and(|v| v.trim() == "0"))
+}
+
+/// `XCL_FORMAT_ALIAS_DEDUP=0`: disable skipping redundant format-alias copies when the source
+/// texture was not written since its last sync.
+fn dedup_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("XCL_FORMAT_ALIAS_DEDUP").is_ok_and(|v| v.trim() == "0"))
+}
+
+fn note_skipped_sync() {
+    static SKIPPED: AtomicU64 = AtomicU64::new(0);
+    let n = SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || (n.is_power_of_two() && n >= 16) {
+        crate::xlog_info!("D3D12.X: skipped {n} redundant format-alias texture copies (source unchanged since last sync)");
+    }
+}
+
+fn mark_writer_dirty(res: usize) {
+    if TRACKED_TITLE_TEX.load(Ordering::Relaxed) == 0 && ACTIVE_PLACED_UAV_PAIRS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    if let Some(tex) = TABLE.lock().unwrap().as_mut().and_then(|t| t.by_res.get_mut(&res)) {
+        if tex.is_writer {
+            tex.dirty = true;
+            tex.last_sync_activity = None;
+        }
+    }
 }
 
 unsafe fn create_internal_texture(dev: *mut c_void, pc_desc: &[u8; 0x38], initial_state: u32) -> Option<ID3D12Resource> {
@@ -730,6 +776,7 @@ pub(super) fn forget(res: usize) {
 /// format-aliased readers need a copy. Ignores split-barrier `BEGIN_ONLY` flags.
 pub(super) fn note_title_transition(res: usize, subresource: u32, before: u32, after: u32, flags: u32, writers_to_sync: &mut Vec<(usize, u32)>) {
     const BARRIER_BEGIN_ONLY: u32 = 1;
+    const STATE_COPY_DEST: u32 = 0x400;
     if TRACKED_TITLE_TEX.load(Ordering::Relaxed) == 0 || flags == BARRIER_BEGIN_ONLY {
         return;
     }
@@ -744,6 +791,11 @@ pub(super) fn note_title_transition(res: usize, subresource: u32, before: u32, a
         return;
     }
     tex.update_state(subresource, after);
+    let write_bits = STATE_UAV | STATE_RENDER_TARGET | STATE_COPY_DEST;
+    if tex.is_writer && ((before & write_bits != 0) || (after & write_bits != 0)) {
+        tex.dirty = true;
+        tex.last_sync_activity = None;
+    }
     let uniform = tex.uniform_state();
     let is_writer = tex.is_writer;
     let leaving_write = (before & (STATE_UAV | STATE_RENDER_TARGET) != 0) && (after & (STATE_UAV | STATE_RENDER_TARGET) == 0);
@@ -808,6 +860,7 @@ pub(super) unsafe fn filter_enhanced_barriers(n: u32, groups: *const c_void, wri
                 | D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COPY_SOURCE
         )
     };
+    let dedup = dedup_enabled();
     let slice = std::slice::from_raw_parts(groups as *const D3D12_BARRIER_GROUP, group_count);
     for grp in slice {
         if grp.Type != D3D12_BARRIER_TYPE_TEXTURE {
@@ -823,34 +876,49 @@ pub(super) unsafe fn filter_enhanced_barriers(n: u32, groups: *const c_void, wri
             continue;
         }
         let tbs = std::slice::from_raw_parts(ptr, count);
-        let g = TABLE.lock().unwrap();
-        let Some(t) = g.as_ref() else {
+        let mut g = TABLE.lock().unwrap();
+        let Some(t) = g.as_mut() else {
             continue;
         };
         for tb in tbs {
-            let discard = (tb.Flags.0 as u32) & (D3D12_TEXTURE_BARRIER_FLAG_DISCARD.0 as u32) != 0
-                || tb.LayoutBefore == D3D12_BARRIER_LAYOUT_UNDEFINED;
-            if discard {
-                continue;
-            }
             let res: usize = std::mem::transmute_copy(&tb.pResource);
             if res == 0 {
                 continue;
             }
-            let Some(tex) = t.by_res.get(&res) else {
+            let has_pair = t.pairs.iter().any(|p| p.writer == res);
+            let Some(tex) = t.by_res.get_mut(&res) else {
                 continue;
             };
-            if tex.owner != Owner::TitlePlaced || !tex.is_writer || !t.pairs.iter().any(|p| p.writer == res) {
+            if tex.owner != Owner::TitlePlaced || !tex.is_writer || !has_pair {
+                continue;
+            }
+            let discard = (tb.Flags.0 as u32) & (D3D12_TEXTURE_BARRIER_FLAG_DISCARD.0 as u32) != 0
+                || tb.LayoutBefore == D3D12_BARRIER_LAYOUT_UNDEFINED;
+            if discard {
+                tex.dirty = true;
+                tex.last_sync_activity = None;
                 continue;
             }
             let ab = tb.AccessBefore.0 as u32;
             let aa = tb.AccessAfter.0 as u32;
             let before_write = (ab & write_access != 0) || is_write_layout(tb.LayoutBefore);
             let after_write = (aa & write_access != 0) || is_write_layout(tb.LayoutAfter);
+            if before_write || after_write {
+                tex.dirty = true;
+                tex.last_sync_activity = None;
+            }
             let common_to_read = ab == 0 && is_common_layout(tb.LayoutBefore) && ((aa & read_access != 0) || is_read_layout(tb.LayoutAfter));
-            if (before_write && !after_write) || common_to_read {
+            if before_write && !after_write {
                 if let Some(st) = tex.uniform_state() {
                     writers_to_sync.push((res, st));
+                }
+            } else if common_to_read {
+                if !dedup || tex.dirty {
+                    if let Some(st) = tex.uniform_state() {
+                        writers_to_sync.push((res, st));
+                    }
+                } else {
+                    note_skipped_sync();
                 }
             }
         }
@@ -981,11 +1049,11 @@ unsafe fn copy_one_subresource_through_buffer(
     true
 }
 
-unsafe fn sync_pair(list: *mut c_void, dev: &ID3D12Device, ty: D3D12_COMMAND_LIST_TYPE, pair: AliasPair, writer_state: u32) {
+unsafe fn sync_pair(list: *mut c_void, dev: &ID3D12Device, ty: D3D12_COMMAND_LIST_TYPE, pair: AliasPair, writer_state: u32) -> bool {
     let w_ptr = pair.writer as *mut c_void;
     let r_ptr = pair.reader as *mut c_void;
     let (Some(writer_res), Some(reader_res)) = (ID3D12Resource::from_raw_borrowed(&w_ptr), ID3D12Resource::from_raw_borrowed(&r_ptr)) else {
-        return;
+        return false;
     };
     let target_srv = if ty == D3D12_COMMAND_LIST_TYPE_DIRECT { STATE_SRV_ALL } else { STATE_SRV_NON_PIXEL };
 
@@ -1009,16 +1077,16 @@ unsafe fn sync_pair(list: *mut c_void, dev: &ID3D12Device, ty: D3D12_COMMAND_LIS
                 .and_then(|t| t.by_res.get(&pair.reader))
                 .and_then(TrackedTex::uniform_state)
             else {
-                return;
+                return false;
             };
             // On a compute list, never emit transitions referencing DIRECT-only states
             // (`RENDER_TARGET`, `INDEX_BUFFER`, `VERTEX_AND_CONSTANT_BUFFER`, `DEPTH_*`, `PIXEL_SHADER_RESOURCE`).
             if !state_valid_on_list(ty, st) {
-                return;
+                return false;
             }
             (st, st)
         }
-        Owner::PlacedUav => return,
+        Owner::PlacedUav => return false,
     };
 
     if writer_state != D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32 {
@@ -1062,6 +1130,7 @@ unsafe fn sync_pair(list: *mut c_void, dev: &ID3D12Device, ty: D3D12_COMMAND_LIS
             );
         }
     }
+    ok
 }
 
 /// Sync active placed-UAV -> format-aliased SRV pairs after a UAV barrier on `list`.
@@ -1077,12 +1146,14 @@ pub(super) unsafe fn on_uav_barrier(list: *mut c_void, specific_targets: Option<
     if ty != D3D12_COMMAND_LIST_TYPE_DIRECT && ty != D3D12_COMMAND_LIST_TYPE_COMPUTE {
         return;
     }
+    let act = super::bind::activity();
+    let dedup = dedup_enabled();
     // Skip duplicate back-to-back global UAV barriers when no draw or dispatch executed in between.
     if specific_targets.is_none() {
-        let act = super::bind::activity();
         let mut g = LIST_STATES.lock().unwrap();
         let ls = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
         if ls.last_activity == act && act != (0, 0) {
+            note_skipped_sync();
             return;
         }
         ls.last_activity = act;
@@ -1092,6 +1163,7 @@ pub(super) unsafe fn on_uav_barrier(list: *mut c_void, specific_targets: Option<
         return;
     };
     let dev_raw = dev.as_raw() as usize;
+    let mut skipped = 0usize;
     let pairs: Vec<AliasPair> = {
         let g = TABLE.lock().unwrap();
         match g.as_ref() {
@@ -1100,16 +1172,47 @@ pub(super) unsafe fn on_uav_barrier(list: *mut c_void, specific_targets: Option<
                 .iter()
                 .copied()
                 .filter(|p| {
-                    p.writer_owner == Owner::PlacedUav
-                        && p.device == dev_raw
-                        && specific_targets.is_none_or(|targets| targets.contains(&p.writer))
+                    if p.writer_owner != Owner::PlacedUav
+                        || p.device != dev_raw
+                        || !specific_targets.is_none_or(|targets| targets.contains(&p.writer))
+                    {
+                        return false;
+                    }
+                    if dedup && act != (0, 0) {
+                        if let Some(w) = t.by_res.get(&p.writer) {
+                            if !w.dirty && w.last_sync_activity == Some(act) {
+                                skipped += 1;
+                                return false;
+                            }
+                        }
+                    }
+                    true
                 })
                 .collect(),
             None => return,
         }
     };
+    for _ in 0..skipped {
+        note_skipped_sync();
+    }
+    let mut writer_ok: HashMap<usize, bool> = HashMap::new();
     for pair in pairs {
-        sync_pair(list, &dev, ty, pair, STATE_UAV);
+        let ok = sync_pair(list, &dev, ty, pair, STATE_UAV);
+        let entry = writer_ok.entry(pair.writer).or_insert(true);
+        *entry &= ok;
+    }
+    if !writer_ok.is_empty() {
+        let mut g = TABLE.lock().unwrap();
+        if let Some(t) = g.as_mut() {
+            for (writer, all_ok) in writer_ok {
+                if all_ok {
+                    if let Some(w) = t.by_res.get_mut(&writer) {
+                        w.dirty = false;
+                        w.last_sync_activity = Some(act);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1128,6 +1231,7 @@ pub(super) unsafe fn sync_title_writers(list: *mut c_void, writers: &[(usize, u3
         return;
     };
     let dev_raw = dev.as_raw() as usize;
+    let act = super::bind::activity();
     let mut seen = HashSet::new();
     for &(writer, state) in writers {
         if !seen.insert(writer) {
@@ -1140,8 +1244,19 @@ pub(super) unsafe fn sync_title_writers(list: *mut c_void, writers: &[(usize, u3
                 None => continue,
             }
         };
+        if pairs.is_empty() {
+            continue;
+        }
+        let mut all_ok = true;
         for pair in pairs {
-            sync_pair(list, &dev, ty, pair, state);
+            all_ok &= sync_pair(list, &dev, ty, pair, state);
+        }
+        if all_ok {
+            let mut g = TABLE.lock().unwrap();
+            if let Some(w) = g.as_mut().and_then(|t| t.by_res.get_mut(&writer)) {
+                w.dirty = false;
+                w.last_sync_activity = Some(act);
+            }
         }
     }
 }
@@ -1196,6 +1311,7 @@ pub(super) unsafe fn try_copy_resource(list: *mut c_void, dst: usize, src: usize
     };
     let ok = copy_all_subresources_through_buffer(list, &dev, d, s);
     if ok {
+        mark_writer_dirty(dst);
         static N: AtomicU64 = AtomicU64::new(0);
         let k = N.fetch_add(1, Ordering::Relaxed);
         if k < 8 || k.is_power_of_two() {
@@ -1247,7 +1363,7 @@ pub(super) unsafe fn try_copy_texture_region(
     let Some(dev) = list_x::device_of_list(list) else {
         return false;
     };
-    copy_one_subresource_through_buffer(
+    let ok = copy_one_subresource_through_buffer(
         list,
         &dev,
         d,
@@ -1256,7 +1372,11 @@ pub(super) unsafe fn try_copy_texture_region(
         s,
         &sd,
         src.Anonymous.SubresourceIndex,
-    )
+    );
+    if ok {
+        mark_writer_dirty(d.as_raw() as usize);
+    }
+    ok
 }
 
 #[cfg(test)]
@@ -1381,5 +1501,91 @@ mod tests {
         assert!(subresource_footprints_compatible(67, &fp(32, 32, 1), 42, &fp(32, 32, 1)));
         assert!(!subresource_footprints_compatible(10, &fp(32, 32, 1), 42, &fp(32, 32, 1)), "8 Bpp vs 4 Bpp must be rejected");
         assert!(subresource_footprints_compatible(98, &fp(64, 64, 1), 3, &fp(16, 16, 1)), "BC7 64x64 == R32G32B32A32 16x16");
+    }
+
+    #[test]
+    fn enhanced_common_to_read_skips_unchanged_writer_and_rearms_on_write() {
+        let dev = 0x7A00_0001usize;
+        let va = 0x7A00_0000_0000usize;
+        let writer = 0x7A00_1001usize;
+        let reader = 0x7A00_1002usize;
+        let reader2 = 0x7A00_1003usize;
+        let uav_shape = shape(42, 64, 64, 1, 1); // R32_UINT
+        let srv_shape = shape(67, 64, 64, 1, 1); // R9G9B9E5_SHAREDEXP
+
+        {
+            let mut g = TABLE.lock().unwrap();
+            let t = g.get_or_insert_with(AliasTable::new);
+            t.insert(writer, TrackedTex::new(dev, va, uav_shape, Owner::TitlePlaced, STATE_COMMON, true));
+            t.insert(reader, TrackedTex::new(dev, va, srv_shape, Owner::TitlePlaced, STATE_COMMON, false));
+        }
+
+        let mk_group = |tb: &D3D12_TEXTURE_BARRIER| D3D12_BARRIER_GROUP {
+            Type: D3D12_BARRIER_TYPE_TEXTURE,
+            NumBarriers: 1,
+            Anonymous: D3D12_BARRIER_GROUP_0 { pTextureBarriers: tb as *const _ },
+        };
+        let mk_tb = |ab: D3D12_BARRIER_ACCESS, aa: D3D12_BARRIER_ACCESS, lb: D3D12_BARRIER_LAYOUT, la: D3D12_BARRIER_LAYOUT, flags: D3D12_TEXTURE_BARRIER_FLAGS| -> D3D12_TEXTURE_BARRIER {
+            D3D12_TEXTURE_BARRIER {
+                SyncBefore: D3D12_BARRIER_SYNC_ALL,
+                SyncAfter: D3D12_BARRIER_SYNC_ALL,
+                AccessBefore: ab,
+                AccessAfter: aa,
+                LayoutBefore: lb,
+                LayoutAfter: la,
+                pResource: unsafe { std::mem::transmute_copy(&writer) },
+                Subresources: D3D12_BARRIER_SUBRESOURCE_RANGE::default(),
+                Flags: flags,
+            }
+        };
+
+        // 1. Fresh writer starts dirty: COMMON -> SRV triggers initial sync.
+        let tb_c2r = mk_tb(
+            D3D12_BARRIER_ACCESS_COMMON,
+            D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
+            D3D12_BARRIER_LAYOUT_COMMON,
+            D3D12_BARRIER_LAYOUT_SHADER_RESOURCE,
+            D3D12_TEXTURE_BARRIER_FLAG_NONE,
+        );
+        let grp = mk_group(&tb_c2r);
+        let mut out = Vec::new();
+        unsafe { filter_enhanced_barriers(1, &grp as *const _ as *const c_void, &mut out) };
+        assert_eq!(out, vec![(writer, STATE_COMMON)]);
+
+        // Simulate completed sync clearing dirty flag.
+        TABLE.lock().unwrap().as_mut().unwrap().by_res.get_mut(&writer).unwrap().dirty = false;
+
+        // 2. Second COMMON -> SRV with no intervening write must be skipped.
+        out.clear();
+        unsafe { filter_enhanced_barriers(1, &grp as *const _ as *const c_void, &mut out) };
+        assert!(out.is_empty(), "unchanged writer must skip redundant COMMON -> SRV copy");
+
+        // 3. Entering UAV layout (`COMMON -> UAV`) re-arms dirty without syncing yet.
+        let tb_c2u = mk_tb(
+            D3D12_BARRIER_ACCESS_COMMON,
+            D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+            D3D12_BARRIER_LAYOUT_COMMON,
+            D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS,
+            D3D12_TEXTURE_BARRIER_FLAG_NONE,
+        );
+        let grp_u = mk_group(&tb_c2u);
+        unsafe { filter_enhanced_barriers(1, &grp_u as *const _ as *const c_void, &mut out) };
+        assert!(out.is_empty());
+        assert!(TABLE.lock().unwrap().as_ref().unwrap().by_res.get(&writer).unwrap().dirty);
+
+        // 4. Subsequent COMMON -> SRV now syncs again.
+        unsafe { filter_enhanced_barriers(1, &grp as *const _ as *const c_void, &mut out) };
+        assert_eq!(out, vec![(writer, STATE_COMMON)]);
+
+        // 5. Linking a new format-aliased reader re-arms dirty on the writer.
+        TABLE.lock().unwrap().as_mut().unwrap().by_res.get_mut(&writer).unwrap().dirty = false;
+        TABLE.lock().unwrap().as_mut().unwrap().insert(reader2, TrackedTex::new(dev, va, srv_shape, Owner::TitlePlaced, STATE_COMMON, false));
+        assert!(TABLE.lock().unwrap().as_ref().unwrap().by_res.get(&writer).unwrap().dirty);
+
+        // Prevent ManuallyDrop::drop on synthetic pointer in tb_c2r / tb_c2u (already ManuallyDrop)
+        // and clean up test entries from global TABLE.
+        forget(reader2);
+        forget(reader);
+        forget(writer);
     }
 }
