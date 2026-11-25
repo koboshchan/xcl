@@ -5338,7 +5338,13 @@ impl Em {
                 if !self.ps_writes_mask && !ps.outputs.iter().any(|e| matches!(e.system_value, 64 | 65 | 67 | 68)) {
                     h.push_str("    float4 xcl_unused : SV_Target7;\n");
                 }
-                h.push_str("};\nXclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n");
+                h.push_str("};\n");
+                // the console tests depth first: without it the PC runs (and keeps the memory
+                // writes of) hidden pixels too
+                if ps.early_depth {
+                    h.push_str("[earlydepthstencil]\n");
+                }
+                h.push_str("XclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n");
                 if self.ps_writes_mask {
                     h.push_str("    xo.xcl_mask = 0xFFFFFFFFu;\n");
                 }

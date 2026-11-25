@@ -670,7 +670,8 @@ impl Lw {
         let mut dispatch_chain = None;
         let c = if matches!(stage, Stage::Vertex | Stage::Pixel) {
             let g = self.gfx.take().ok_or("graphics entry without graphics I/O")?;
-            let info = if stage == Stage::Pixel { super::graphics::StageInfo::Pixel { early_depth_stencil: false } } else { super::graphics::StageInfo::Vertex };
+            let early_depth_stencil = g.ps.as_ref().is_some_and(|p| p.early_depth);
+            let info = if stage == Stage::Pixel { super::graphics::StageInfo::Pixel { early_depth_stencil } } else { super::graphics::StageInfo::Vertex };
             self.s.try_finish_graphics(g.io, info)
         } else if limit > 0 && (numthreads == [32, 1, 1] || split_tid.is_some()) && hw == 32 {
             self.s.m.optimize();

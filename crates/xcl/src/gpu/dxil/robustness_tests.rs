@@ -68,6 +68,7 @@ fn translate_all() -> Vec<Vec<u8>> {
         outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
         input_ena: 0x302,
         attrs: None,
+        early_depth: false,
     };
     let cs = CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 };
     let o = |wave64, split| KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };

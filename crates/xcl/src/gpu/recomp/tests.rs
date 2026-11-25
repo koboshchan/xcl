@@ -1851,6 +1851,7 @@ fn gpu_graphics_vs_ps_draw() {
         outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
         input_ena: 0x302,
         attrs: None,
+        early_depth: false,
     };
     let (vo, po) = (Options { mode: Mode::Vertex(vsi), wave64: true, ..Default::default() }, Options { mode: Mode::Pixel(psi), wave64: true, ..Default::default() });
     let vt = translate(&vs_code, &vo).unwrap();
@@ -1935,6 +1936,7 @@ fn ps_exp_vm_hlsl_and_direct_dxil_codegen() {
         outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
         input_ena: 0x302,
         attrs: None,
+        early_depth: false,
     };
     let po = Options { mode: Mode::Pixel(psi.clone()), wave64: true, ..Default::default() };
     for (name, ps_code, has_vm) in ps_exp_vm_cases() {
@@ -1984,6 +1986,7 @@ fn gpu_ps_exp_vm_controls_pixel_survival() {
         outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
         input_ena: 0x302,
         attrs: None,
+        early_depth: false,
     };
     let vo = Options { mode: Mode::Vertex(vsi.clone()), wave64: true, ..Default::default() };
     let po = Options { mode: Mode::Pixel(psi.clone()), wave64: true, ..Default::default() };
@@ -2169,6 +2172,7 @@ fn gpu_rect_list_corners() {
         outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
         input_ena: 0x302,
         attrs: None,
+        early_depth: false,
     };
     let outputs = vsi.outputs.clone();
     let vt = translate(&vs_code, &Options { mode: Mode::Vertex(vsi), wave64: true, ..Default::default() }).unwrap();
@@ -2239,6 +2243,7 @@ fn draw_psi() -> super::PsInterface {
         outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
         input_ena: 0x302,
         attrs: None,
+        early_depth: false,
     }
 }
 
@@ -2752,7 +2757,7 @@ fn helper_lane_masks_ps(wave64: bool) -> super::Translation {
         ps_code.extend(encode("S_CBRANCH_EXECNZ", "ENC_SOPP", &[("SIMM16", back)], None).unwrap());
         ps_code.extend(enc(&tail));
         ps_code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
-        let psi = PsInterface { inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x302, attrs: None };
+        let psi = PsInterface { inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x302, attrs: None, early_depth: false };
         translate(&ps_code, &Options { mode: Mode::Pixel(psi), wave64, ..Default::default() }).unwrap()
     }
 }
@@ -6855,7 +6860,7 @@ fn isa_coverage() {
         let Ok(mut code) = encode(inst.name, enc, fields, lit) else { continue };
         code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
         let ok = std::panic::catch_unwind(|| {
-            try_mode(&code, Mode::Kernel) || try_mode(&code, Mode::Pixel(super::PsInterface { inputs: vec![], outputs: vec![], input_ena: 0x7F, attrs: None }))
+            try_mode(&code, Mode::Kernel) || try_mode(&code, Mode::Pixel(super::PsInterface { inputs: vec![], outputs: vec![], input_ena: 0x7F, attrs: None, early_depth: false }))
         })
         .unwrap_or(false);
         let e = per_enc.entry(enc.trim_start_matches("ENC_")).or_default();
@@ -8700,6 +8705,7 @@ fn ps_interp_p0_preserves_bits_and_p2_converts_to_float() {
         outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
         input_ena: 0x302,
         attrs: None,
+        early_depth: false,
     };
     let pt = translate(&ps_code, &Options { mode: Mode::Pixel(psi), wave64: true, ..Default::default() }).unwrap();
     assert!(pt.complete(), "{:?}\n{}", pt.unsupported_why, pt.hlsl);

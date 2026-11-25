@@ -159,6 +159,9 @@ pub struct PsInterface {
     pub input_ena: u32,
     /// the console's PS input table (`ps_input_table`; None: attributes in register order)
     pub attrs: Option<Vec<PsAttr>>,
+    /// DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER (`ps_shader_control`): depth and stencil are tested
+    /// before the program runs (`[earlydepthstencil]`), so it runs only for pixels that pass
+    pub early_depth: bool,
 }
 
 /// Mesh (NGG) shader interface.
@@ -430,6 +433,17 @@ pub fn ps_input_table(fssm: &[u8]) -> Option<(u32, Vec<PsAttr>)> {
     Some((ena, out))
 }
 
+/// DB_SHADER_CONTROL bit 12 (DEPTH_BEFORE_SHADER, as AMD's GFX10.3 register headers name it):
+/// the compiler sets it for `[earlydepthstencil]`.
+pub const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+
+/// DB_SHADER_CONTROL of an FSSM: the dword after SPI_PS_INPUT_ENA in the PS input table
+/// (`ps_input_table`, +0x114; the same layout VIctory's `native.rs` reads it from).
+pub fn ps_shader_control(fssm: &[u8]) -> Option<u32> {
+    let o = 0x130 + fssm_shift(fssm)? + 0x114;
+    fssm.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+}
+
 /// The VS output table of an FSSM: per `exp param N`, the OSG1 register it writes. 32 records
 /// of 6 bytes at +0x1D4 (+ the sub-version shift): kind (6 user, 0 position), register, param
 /// number, 0, 0, 0; the record count after them (+0xC0). Usually param N = the N-th output
@@ -579,7 +593,9 @@ pub fn interface(blob: &[u8], sh: &super::xbox::XboxShader, f: &super::xbox::Fss
                 Some((ena, t)) => (ena, Some(t)),
                 None => (f.data.get(0x248..0x24C).map(|b| u32::from_le_bytes(b.try_into().unwrap()))?, None),
             };
-            Some(Mode::Pixel(PsInterface { inputs, outputs, input_ena: ena, attrs }))
+            // only where the input table was found: elsewhere the layout is not known
+            let early_depth = attrs.is_some() && ps_shader_control(&f.data).is_some_and(|c| c & DEPTH_BEFORE_SHADER != 0);
+            Some(Mode::Pixel(PsInterface { inputs, outputs, input_ena: ena, attrs, early_depth }))
         }
         // ES variant of a VS (before a GS) and the GS itself, each translatable on its own
         ("VS", 2) => Some(Mode::Geometry(GsInterface { es_inputs: inputs, es_outputs: outputs, max_vertex_count: 1, ..Default::default() })),
@@ -1858,6 +1874,33 @@ mod attribute_tests {
         assert_eq!([regs(0), regs(1), regs(4), regs(5), regs(6)], [Some((vec![(1, 0), (2, 2)], true)), Some((vec![(3, 0)], false)), Some((vec![(7, 0), (8, 2)], true)), Some((vec![(9, 0)], true)), None]);
         // elements in `ranked` order: r7 holds two, r8 one
         assert_eq!(out_param_elements(&sig, Some(&params), 4), (vec![(6, 0), (7, 0), (8, 2)], true));
+    }
+
+    /// DB_SHADER_CONTROL follows SPI_PS_INPUT_ENA in the input table: DEPTH_BEFORE_SHADER (bit
+    /// 12) makes a PS early-depth; other bits (Z export, kill, the ordered-section bit 16) do not.
+    #[test]
+    fn ps_depth_before_shader_from_the_input_table() {
+        let early = |sub: u32, control: u32, valid: bool| {
+            let base = if sub == 5 { 0x130 } else { 0x138 };
+            let mut data = vec![0u8; 0x400];
+            data[0x10..0x14].copy_from_slice(&sub.to_le_bytes());
+            data[base..base + 8].copy_from_slice(&[6, 1, 0xF, 0, 0, 0, 1, 2]);
+            data[base + 0x100] = if valid { 1 } else { 33 };
+            data[base + 0x110] = 2;
+            data[base + 0x114..base + 0x118].copy_from_slice(&control.to_le_bytes());
+            assert_eq!(ps_shader_control(&data), Some(control));
+            let f = super::super::xbox::Fssm { data, stages: vec![super::super::xbox::HwStage { offset: 0, hw: 5, api: 1 }], ..Default::default() };
+            let sh = super::super::xbox::XboxShader { stage: "PS".into(), ..Default::default() };
+            let Some(Mode::Pixel(ps)) = interface(&[], &sh, &f) else { panic!("not a PS") };
+            ps.early_depth
+        };
+        for sub in [5, 6] {
+            assert!(early(sub, DEPTH_BEFORE_SHADER, true), "sub-version {sub}");
+            assert!(early(sub, DEPTH_BEFORE_SHADER | 1 << 16 | 0x41, true), "sub-version {sub}, with other bits");
+            assert!(!early(sub, 1 << 16 | 0x41, true), "sub-version {sub}, without the bit");
+            // no input table found: the layout is not known, the bit not trusted
+            assert!(!early(sub, DEPTH_BEFORE_SHADER, false), "sub-version {sub}, no table");
+        }
     }
 
     /// Minecraft's UI vertex shader: an ISG1 input the program never reads (NORMAL0, r1) gets
