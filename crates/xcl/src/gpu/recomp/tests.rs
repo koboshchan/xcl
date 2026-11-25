@@ -4153,6 +4153,67 @@ fn gpu_heap_windows_reject_out_of_uma_aliasing() {
     memory_windows_reject_out_of_uma_aliasing(true);
 }
 
+/// `XCL_WINDOW_NO_CARRY` (direct DXIL): accesses inside an allocation read the same words when
+/// the window comes from the base address as with the 64-bit sum (positive and negative offsets,
+/// scalar and global loads), with the windows in root UAVs and in the descriptor heap; a 32-bit
+/// (hi == 0) pointer still reads window 0 and a base outside the UMA still reads 0.
+#[test]
+fn gpu_window_no_carry_reads_inside_allocations_alike() {
+    if !gpu_ready() {
+        return;
+    }
+    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
+    let (w0, w1) = (arena.window(0).0 as u64, arena.window(1).0 as u64);
+    let base_hi = (w0 >> 32) as u32;
+    let word = |a: u64| unsafe { &mut *(a as *mut u32) };
+    *word(w1 + 0x0F0) = 0x1111_0F0F;
+    *word(w1 + 0x110) = 0x2222_1010;
+    *word(w1 + 0x120) = 0x3333_2020;
+    *word(w0 + 0x4000) = 0x4444_4000;
+    let glbl = |n: &'static str, f: &[(&'static str, u64)]| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) { (n, "ENC_FLAT_GLBL", f.to_vec(), None) };
+    let list = vec![
+        // s[20:21] = w1 + 0x100: + v16 (0x10) -> w1 + 0x110 (v17)
+        glbl("GLOBAL_LOAD_DWORD", &[("VDST", 17), ("ADDR", 16), ("SADDR", 20), ("OFFSET", 0)]),
+        // s[20:21] + v0 (0) + OFFSET -16 -> w1 + 0xF0 (v18)
+        glbl("GLOBAL_LOAD_DWORD", &[("VDST", 18), ("ADDR", 0), ("SADDR", 20), ("OFFSET", 0xFF0)]),
+        // s_load s[20:21] + 0x20 -> w1 + 0x120 (s30)
+        ("S_LOAD_DWORD", "ENC_SMEM", vec![("SDATA", 30), ("SBASE", 10), ("OFFSET", 0x20)], None),
+        // a 32-bit pointer (hi == 0) still reads window 0 (s31)
+        ("S_LOAD_DWORD", "ENC_SMEM", vec![("SDATA", 31), ("SBASE", 2), ("OFFSET", 0)], None),
+        // a base outside the UMA still reads 0 (s29)
+        ("S_LOAD_DWORD", "ENC_SMEM", vec![("SDATA", 29), ("SBASE", 1), ("OFFSET", 0)], None),
+    ];
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let p = prog(&refs);
+    let mut st = KernelState::default();
+    st.sgpr[2..4].copy_from_slice(&[0x1000, base_hi + 4]);
+    st.sgpr[4..6].copy_from_slice(&[0x4000, 0]);
+    st.sgpr[20..22].copy_from_slice(&[0x100, base_hi + 1]);
+    for r in st.vgpr.iter_mut() {
+        r[0] = 0;
+        r[16] = 0x10;
+        r[17] = 0x7777_7777;
+        r[18] = 0x7777_7777;
+    }
+    for heap in [false, true] {
+        let mem_windows = if heap { 2 | super::HEAP_WINDOWS } else { 2 };
+        let o = crate::gpu::dxil::kernel::KernelOptions { wave64: false, split: false, mem_windows, sampler_base: 0 };
+        let mut sizes = Vec::new();
+        for no_carry in [false, true] {
+            let dxil = crate::gpu::dxil::kernel::with_no_carry(no_carry, || crate::gpu::dxil::kernel::translate(&p, o)).unwrap_or_else(|e| panic!("direct DXIL: {e}"));
+            sizes.push(dxil.len());
+            let r = runner::run_in_arena(&dxil, &st, &arena).unwrap();
+            let what = format!("heap windows {heap}, no carry {no_carry}");
+            assert_eq!(r.vgpr[0][17], 0x2222_1010, "{what}: base + v16");
+            assert_eq!(r.vgpr[0][18], 0x1111_0F0F, "{what}: base - 16");
+            assert_eq!(r.sgpr[30], 0x3333_2020, "{what}: s_load base + 0x20");
+            assert_eq!(r.sgpr[31], 0x4444_4000, "{what}: hi == 0 reads window 0");
+            assert_eq!(r.sgpr[29], 0, "{what}: a base outside the UMA reads 0");
+        }
+        assert!(sizes[1] < sizes[0], "heap windows {heap}: no carry makes less DXIL ({sizes:?})");
+    }
+}
+
 fn memory_windows_reject_out_of_uma_aliasing(heap: bool) {
     if !gpu_ready() {
         return;

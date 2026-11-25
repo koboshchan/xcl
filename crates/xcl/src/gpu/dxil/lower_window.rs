@@ -59,6 +59,11 @@ impl Lw {
         if !self.windowed() {
             return;
         }
+        // `XCL_WINDOW_NO_CARRY=1`: the window of the base address (`no_carry`)
+        if no_carry() {
+            self.window_hi(hi, write);
+            return;
+        }
         let non_zero = |t: &Ea| match *t {
             Ea::K(0) => false,
             Ea::U(v) | Ea::S(v) => self.s.m.const_u64(v) != Some(0),
@@ -205,4 +210,32 @@ impl Lw {
         };
         self.window_at(hi, lo, &[Ea::U(l4), off], write);
     }
+}
+
+/// `XCL_WINDOW_NO_CARRY=1`: an access goes to the window of its base address. Allocations never
+/// straddle windows (`gpu::uma`), so an access inside the allocation its base points into never
+/// carries or borrows into the high dword, and the low dword is its offset in that window. Without
+/// the 64-bit sum, accesses off the same base share their window, its range check and its heap
+/// handle instead of computing them each, which makes the driver's code for big compute programs
+/// smaller (on NVIDIA its shader code heap is limited, #2403). An access that leaves its base's
+/// window (outside its allocation) stays in that window, wrapping its low dword.
+pub fn no_carry() -> bool {
+    if let Some(on) = NO_CARRY_TEST.with(|c| c.get()) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_WINDOW_NO_CARRY").is_ok_and(|v| v.trim() == "1"))
+}
+
+thread_local! {
+    /// `no_carry` for translations on this thread (`with_no_carry`; unset: `XCL_WINDOW_NO_CARRY`)
+    static NO_CARRY_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `f` with `no_carry` set to `on` on this thread (the translator thread takes its caller's).
+pub fn with_no_carry<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let old = NO_CARRY_TEST.with(|c| c.replace(Some(on)));
+    let r = f();
+    NO_CARRY_TEST.with(|c| c.set(old));
+    r
 }
