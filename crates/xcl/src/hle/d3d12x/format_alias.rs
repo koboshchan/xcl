@@ -186,6 +186,9 @@ pub(super) fn uav_resource_format(rdesc_fmt: u32, view_fmt: u32) -> u32 {
 /// `ALLOW_UNORDERED_ACCESS` and a UAV-compatible format so PC D3D12 never drops it to a null view.
 pub(super) fn prepare_placed_uav_desc(rdesc: &[u8; 0x38], view_fmt: u32) -> [u8; 0x38] {
     let mut x = *rdesc;
+    // Clear padding between `Dimension` and `Alignment` (title leaves stack bytes there) so
+    // the same placed view always maps to one cache key.
+    x[0x04..0x08].fill(0);
     x[0x34..].fill(0);
     let rdesc_fmt = u32::from_le_bytes(x[0x20..0x24].try_into().unwrap());
     let mut flags = u32::from_le_bytes(x[0x30..0x34].try_into().unwrap());
@@ -208,6 +211,7 @@ pub(super) fn prepare_placed_uav_desc(rdesc: &[u8; 0x38], view_fmt: u32) -> [u8;
 /// retire or overwrite GPU-owned target tracking at `va`.
 pub(super) fn prepare_placed_srv_desc(rdesc: &[u8; 0x38], view_fmt: u32) -> [u8; 0x38] {
     let mut x = *rdesc;
+    x[0x04..0x08].fill(0);
     x[0x34..].fill(0);
     let rdesc_fmt = u32::from_le_bytes(x[0x20..0x24].try_into().unwrap());
     let mut flags = u32::from_le_bytes(x[0x30..0x34].try_into().unwrap());
@@ -1485,6 +1489,20 @@ mod tests {
         let srv_flags = u32::from_le_bytes(srv_pc[0x30..0x34].try_into().unwrap());
         assert_eq!(srv_fmt, 67, "placed SRV must stay R9G9B9E5_SHAREDEXP");
         assert_eq!(srv_flags & (FLAG_RENDER_TARGET | FLAG_UAV), 0);
+    }
+
+    #[test]
+    fn placed_descs_ignore_the_padding_after_dimension() {
+        let mut x = [0u8; 0x38];
+        x[0..4].copy_from_slice(&3u32.to_le_bytes()); // Texture2D
+        x[0x10..0x18].copy_from_slice(&256u64.to_le_bytes());
+        x[0x18..0x1C].copy_from_slice(&256u32.to_le_bytes());
+        x[0x20..0x24].copy_from_slice(&28u32.to_le_bytes()); // R8G8B8A8_UNORM
+        let mut garbage = x;
+        garbage[0x04..0x08].copy_from_slice(&[0xd8, 0x7e, 0x3f, 0x01]);
+        assert_eq!(prepare_placed_srv_desc(&garbage, 28), prepare_placed_srv_desc(&x, 28));
+        assert_eq!(prepare_placed_uav_desc(&garbage, 28), prepare_placed_uav_desc(&x, 28));
+        assert_eq!(prepare_placed_srv_desc(&garbage, 28)[0x04..0x08], [0u8; 4]);
     }
 
     #[test]

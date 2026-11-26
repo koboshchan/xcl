@@ -502,7 +502,7 @@ pub fn init() -> Result<String, String> {
         // `XCL_DRED=1`: on a device removal the faulting address and the last GPU operations
         // (logged by `log_device_removed`); no debug layer needed. Opt-in: with it XDefiant
         // stalled in its first seconds twice.
-        if std::env::var_os("XCL_DRED").is_some() {
+        if std::env::var("XCL_DRED").ok().is_some_and(|v| v.trim() != "0") {
             match crate::gpu::agility::configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings>(
                 &CLSID_D3D12DeviceRemovedExtendedData,
             ) {
@@ -1201,7 +1201,7 @@ fn view_shape_desc(
 ) -> Option<(u32, crate::gpu::desc::ImageType, u32, u32, u32, u32, u32, u32)> {
     use crate::gpu::desc::ImageType as T;
     let f = if format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN { r.Format } else { format };
-    let fmt = crate::gpu::desc::gfx10_format(f).unwrap_or(0);
+    let fmt = view_tsharp_format(f);
     let (w, h, d) = (r.Width as u32, r.Height, r.DepthOrArraySize as u32);
     let ty = view_dim_to_image_type(dim)?;
     let depth = match ty {
@@ -1225,6 +1225,16 @@ fn view_shape_desc(
         (base, last, res_max_mip.min(15))
     };
     Some((fmt, ty, w, h, depth, base_level, last_level, max_mip))
+}
+
+/// The GFX10 format in the T# of a view in PC format `f` (0, a float image, when the table has
+/// none). The PC's stencil views (X32_TYPELESS_G8X24_UINT, X24_TYPELESS_G8_UINT) are not in the
+/// table but are UINT views: they get 8_UINT, so that translated shaders load them as integers
+/// (`img_cls`); a float load of a UINT view is undefined in D3D12.
+fn view_tsharp_format(f: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT) -> u32 {
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UINT, DXGI_FORMAT_X24_TYPELESS_G8_UINT, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT};
+    let f = if f == DXGI_FORMAT_X24_TYPELESS_G8_UINT || f == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT { DXGI_FORMAT_R8_UINT } else { f };
+    crate::gpu::desc::gfx10_format(f).unwrap_or(0)
 }
 
 /// Build the XCL shader-ABI T# for an SRV, populating GFX10 `BASE_LEVEL` (`t[3][15:12]`),
@@ -3576,8 +3586,11 @@ macro_rules! creator {
             let f: F = std::mem::transmute(orig_fn(this, slot_of(this, $method)));
             // the runtime calls the device's public methods from inside another one (a command
             // list's DRED breadcrumb buffer, made through CreatePlacedResource): that object
-            // is still being made – asking it for interfaces to adopt it crashes D3D12Core
-            if IN_CREATOR.with(|c| c.replace(true)) {
+            // is still being made – asking it for interfaces to adopt it crashes D3D12Core.
+            // XCL's own internal work (`title_textures::own_work`: tile-mapping queues, zero-fill
+            // command pairs, staging buffers, upload queues/fences) is never handed to the title
+            // and must stay unadopted so it never re-enters `q_execute_command_lists` or `alloc_pool`.
+            if super::title_textures::is_own_work() || IN_CREATOR.with(|c| c.replace(true)) {
                 return f(this, $($a,)* riid, ppv);
             }
             let mut hr = f(this, $($a,)* riid, ppv);
@@ -3633,6 +3646,47 @@ pub(super) unsafe fn create_raw_pc_command_list(
         hr
     };
     (hr >= 0 && !out.is_null()).then_some(out)
+}
+
+/// Create a raw, unadopted PC `(ID3D12CommandAllocator, ID3D12GraphicsCommandList)` pair for
+/// XCL's own internal passes (such as VRAM `io` prelude copies) so they never enter `alloc_pool`,
+/// `list_x`, or `bind::STATES`.
+pub(super) unsafe fn create_internal_command_pair(
+    dev: &ID3D12Device,
+    ty: D3D12_COMMAND_LIST_TYPE,
+) -> Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList), String> {
+    let dev_raw = dev.as_raw();
+    if is_ext(vt(dev_raw) as usize) {
+        type CreateAllocFn = unsafe extern "system" fn(*mut c_void, D3D12_COMMAND_LIST_TYPE, *const GUID, *mut *mut c_void) -> HRESULT;
+        type CreateListFn = unsafe extern "system" fn(*mut c_void, u32, D3D12_COMMAND_LIST_TYPE, *mut c_void, *mut c_void, *const GUID, *mut *mut c_void) -> HRESULT;
+        let create_alloc: CreateAllocFn = std::mem::transmute(orig_fn(dev_raw, slot_of(dev_raw, "CreateCommandAllocator")));
+        let create_list: CreateListFn = std::mem::transmute(orig_fn(dev_raw, slot_of(dev_raw, "CreateCommandList")));
+        let mut alloc_raw = std::ptr::null_mut();
+        let hr = create_alloc(dev_raw, ty, &ID3D12CommandAllocator::IID as *const _ as *const GUID, &mut alloc_raw);
+        if hr < 0 || alloc_raw.is_null() {
+            return Err(format!("prelude allocator create: {hr:#x}"));
+        }
+        let alloc = ID3D12CommandAllocator::from_raw(alloc_raw);
+        let mut list_raw = std::ptr::null_mut();
+        let hr = create_list(
+            dev_raw,
+            0,
+            ty,
+            alloc.as_raw(),
+            std::ptr::null_mut(),
+            &ID3D12GraphicsCommandList::IID as *const _ as *const GUID,
+            &mut list_raw,
+        );
+        if hr < 0 || list_raw.is_null() {
+            return Err(format!("prelude list create: {hr:#x}"));
+        }
+        let list = ID3D12GraphicsCommandList::from_raw(list_raw);
+        Ok((alloc, list))
+    } else {
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).map_err(|e| format!("prelude allocator create: {e}"))?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).map_err(|e| format!("prelude list create: {e}"))?;
+        Ok((alloc, list))
+    }
 }
 creator!(dev_create_descriptor_heap, "CreateDescriptorHeap", Kind::DescriptorHeap, [a1]);
 creator!(dev_create_committed_resource, "CreateCommittedResource", Kind::Resource, [a1, a2, a3, a4, a5]);
@@ -5330,13 +5384,15 @@ unsafe fn keep_graphics_blob(key: (u64, usize), pso: *mut c_void, dxil_len: usiz
         return;
     }
     let Some(bytes) = read_pso_cached_blob(pso) else { return };
-    let mut g = GRAPHICS_BLOBS.lock().unwrap();
-    let (m, total) = g.get_or_insert_with(|| (HashMap::new(), 0));
-    if bytes.is_empty() || *total + bytes.len() > GRAPHICS_BLOBS_MAX {
+    if bytes.is_empty() {
         return;
     }
-    *total += bytes.len();
-    m.insert(key, std::sync::Arc::new(bytes));
+    let mut g = GRAPHICS_BLOBS.lock().unwrap();
+    let (m, total) = g.get_or_insert_with(|| (HashMap::new(), 0));
+    if *total + bytes.len() <= GRAPHICS_BLOBS_MAX {
+        *total += bytes.len();
+        m.insert(key, std::sync::Arc::new(bytes));
+    }
 }
 
 /// Deterministic FNV-1a digest of every field in a translated PC graphics PSO (shaders, static
@@ -6636,7 +6692,6 @@ fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>
 
 /// Create the mesh pipeline (`stream`, RS and shaders already in it) and the compute pass;
 /// the title gets the mesh pipeline state.
-#[allow(clippy::too_many_arguments)]
 unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, kind: &'static str, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let Some(rs) = abi_rs_for(this, &tp.samplers) else { return E_INVALIDARG };
     let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
@@ -6649,7 +6704,9 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     if gate {
         crate::xlog_info!("D3D12.X: two-pass {kind} PSO ({bytes} B DXIL) gated, waited {} ms", waited.elapsed().as_millis());
     }
-    let hr = driver_compile(kind, stream.shader_bytes(), false, || finish_pso(this, fs, desc.as_ptr() as *const c_void, riid, ppv));
+    let (hr, _) = driver_compile_identified(kind, stream.shader_bytes(), false, None, || {
+        finish_pso(this, fs, desc.as_ptr() as *const c_void, riid, ppv)
+    });
     if hr < 0 || ppv.is_null() || (*ppv).is_null() {
         note_translation_error(format!("the driver rejected the mesh pipeline from the console {kind} ({hr:#x})"));
         return E_INVALIDARG;
@@ -6659,27 +6716,25 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
     cdesc.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     cdesc.CS = bytecode(&tp.cs);
-    // Reuse the compiled driver blob of the compute pass across all `(MS/GS, PS)` pipelines that
-    // share `tp.cs` (in memory and on disk), matching `translated_compute_pso_once`.
     let ckey = compute_blob_key(&tp.cs, rs as usize, 0);
-    let mut ccached = compute_blob(ckey);
-    let cdisk = driver_cache::path(&tp.cs, 0);
-    let cfrom_disk = ccached.is_none();
-    if cfrom_disk {
-        ccached = cdisk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
+    let mut cached = compute_blob(ckey);
+    let disk = driver_cache::path(&tp.cs, 0);
+    let from_disk = cached.is_none();
+    if from_disk {
+        cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
     }
-    if let Some(b) = &ccached {
+    if let Some(b) = &cached {
         cdesc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     }
     let iid = pc_iid(Kind::PipelineState);
     let mut compute: *mut c_void = std::ptr::null_mut();
-    let (mut hc, mut cin_driver) = driver_compile_identified("compute pass", tp.cs.len(), false, None, || {
+    let (mut hc, mut in_driver) = driver_compile_identified("compute pass", tp.cs.len(), false, None, || {
         driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute)
     });
-    if hc < 0 && ccached.is_some() {
+    if hc < 0 && cached.is_some() {
         forget_compute_blob(ckey);
-        if cfrom_disk {
-            driver_cache::note(false, cdisk.as_deref());
+        if from_disk {
+            driver_cache::note(false, disk.as_deref());
         }
         cdesc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
         compute = std::ptr::null_mut();
@@ -6687,15 +6742,15 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
             driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute)
         });
         hc = retried;
-        cin_driver += took;
+        in_driver += took;
     }
-    let creused = hc >= 0 && ccached.is_some() && cdesc.CachedPSO.CachedBlobSizeInBytes != 0;
-    if hc >= 0 && !creused && !compute.is_null() {
+    let reused = hc >= 0 && cached.is_some() && cdesc.CachedPSO.CachedBlobSizeInBytes != 0;
+    if hc >= 0 && !reused && !compute.is_null() {
         keep_compute_blob(ckey, compute, tp.cs.len());
-        if let (Some(p), Some(b)) = (cdisk.as_deref(), compute_blob(ckey)) {
-            driver_cache::keep(p, &b, cin_driver);
+        if let (Some(p), Some(b)) = (disk.as_deref(), compute_blob(ckey)) {
+            driver_cache::keep(p, &b, in_driver);
         }
-    } else if creused && cfrom_disk {
+    } else if reused && from_disk {
         driver_cache::note(true, None);
     }
     drop(_slot);
@@ -7437,6 +7492,86 @@ mod pso_blend_and_tsharp_tests {
         let img_arr = crate::gpu::desc::image(&srv_tsharp_from_desc(11, &msaa_arr, Some(&msaa_arr_srv)).unwrap()).unwrap();
         assert_eq!((img_arr.ty, img_arr.depth, img_arr.base_level, img_arr.last_level), (crate::gpu::desc::ImageType::D2MsaaArray, 4, 0, 2));
     }
+
+    /// A stencil view is a UINT view: its T# has a uint format, so translated shaders load it as
+    /// integers (`img_cls`: the buffer-format table's numeric type 4); the depth view stays float.
+    #[test]
+    fn srv_tsharp_of_a_stencil_view_has_a_uint_format() {
+        let class = |fmt: u32| (crate::gpu::recomp::emit::buf_format_info(fmt as usize) >> 3) & 7;
+        for (resource, stencil, depth) in [
+            (DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_X24_TYPELESS_G8_UINT, DXGI_FORMAT_R24_UNORM_X8_TYPELESS),
+            (DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS),
+        ] {
+            let rd = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 2560,
+                Height: 1440,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: resource,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                ..Default::default()
+            };
+            let view = |format, plane| D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: format,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, PlaneSlice: plane, ResourceMinLODClamp: 0.0 },
+                },
+            };
+            let s = crate::gpu::desc::image(&srv_tsharp_from_desc(5, &rd, Some(&view(stencil, 1))).unwrap()).unwrap();
+            assert_eq!((s.format, class(s.format)), (5, 4), "stencil view {stencil:?}: T# format 8_UINT, uint class");
+            assert_eq!((s.width, s.height), (2560, 1440));
+            let d = crate::gpu::desc::image(&srv_tsharp_from_desc(6, &rd, Some(&view(depth, 0))).unwrap()).unwrap();
+            assert_ne!(class(d.format), 4, "depth view {depth:?} stays a float image");
+        }
+    }
+
+    /// A translated `image_load` of a stencil view (the T# `srv_tsharp_from_desc` writes for it)
+    /// gives the stencil values: in the second component, as the PC view has them.
+    #[test]
+    fn gpu_image_load_of_a_stencil_view_gives_the_stencil() {
+        use crate::gpu::recomp::runner::{self, KernelState, TestTexture, TexDim};
+        use crate::gpu::rdna2::encode;
+        match (runner::adapter(), runner::wave64_programs_supported(), crate::gpu::recomp::dxc::location()) {
+            (Ok(_), Ok(true), Ok(_)) => {}
+            (a, _, d) => return runner::skip_test(if a.is_err() { "no GPU" } else if d.is_err() { "no DXC" } else { "no wave64" }),
+        }
+        let rd = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 8,
+            Height: 8,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R24G8_TYPELESS,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            ..Default::default()
+        };
+        let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_X24_TYPELESS_G8_UINT,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, PlaneSlice: 1, ResourceMinLODClamp: 0.0 } },
+        };
+        // the runner's SRV of texture 0 is at heap index 0
+        let t = srv_tsharp_from_desc(0, &rd, Some(&view)).unwrap();
+        let mut code = encode("IMAGE_LOAD", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x2), ("DIM", 1), ("UNORM", 1)], None).unwrap();
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let mut st = KernelState::default();
+        st.sgpr[16..24].copy_from_slice(&t);
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            r[0] = (l % 8) as u32;
+            r[1] = (l / 8) as u32;
+        }
+        let stencil: Vec<u8> = (0..64).map(|k| 0x40 + k as u8).collect();
+        let tex = [TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_X24_TYPELESS_G8_UINT, width: 8, height: 8, depth: 1, texel_bytes: 1, data: stencil, uav: false }];
+        let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
+        let bad: Vec<String> = (0..64).filter(|&l| r.vgpr[l][10] != 0x40 + l as u32).map(|l| format!("lane {l}: {:#x}", r.vgpr[l][10])).collect();
+        assert!(bad.is_empty(), "image_load of a stencil view (want 0x40 + lane):\n{}", bad.join("\n"));
+    }
 }
 
 enum StreamPipeline {
@@ -7996,6 +8131,16 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
     n
 }
 
+/// Release XCL-owned resources pinned to PC allocator `raw` (two-pass buffers, VRAM `io` slabs,
+/// UMA blocks, split dispatch chains) without invoking COM `ID3D12CommandAllocator::Reset`.
+/// Safe to call from any thread once `alloc_pool` has verified no list uses `raw` and all GPU
+/// submits on `raw` have completed.
+pub(super) unsafe fn release_pc_allocator_resources(raw: usize) {
+    dispatch_chain::allocator_reset(raw);
+    super::shader_code::allocator_reset(raw);
+    super::console_list::allocator_reset(raw as *mut c_void);
+}
+
 /// Reset the (adopted) PC allocator `raw` itself.
 pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
     type F = unsafe extern "system" fn(*mut c_void) -> HRESULT;
@@ -8004,9 +8149,7 @@ pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
     if hr >= 0 {
         // Only now is the GPU done with recordings backed by `raw` (`alloc_pool` may have put
         // an older backing allocator aside during a title `Reset` while its submits still run).
-        dispatch_chain::allocator_reset(raw as usize);
-        super::shader_code::allocator_reset(raw as usize);
-        super::console_list::allocator_reset(raw);
+        release_pc_allocator_resources(raw as usize);
     }
     hr
 }

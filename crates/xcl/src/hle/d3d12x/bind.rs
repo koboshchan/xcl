@@ -202,13 +202,13 @@ struct State {
 const SCRATCH_BLOCK: u64 = 1 << 20;
 const SCRATCH_CAP: u64 = 16 << 20;
 /// Most bytes of buffers kept for reuse (`FREE_RES`)
-const FREE_RES_CAP: u64 = 256 << 20;
+const FREE_RES_CAP: u64 = 128 << 20;
 /// Size of one pooled VRAM `io` (`u0`) slab (64 KiB = 256 distinct 256-byte `io` slots).
 const IO_BLOCK_BYTES: u64 = 64 << 10;
 /// Most bytes of VRAM `io` slabs kept for reuse (`FREE_IO`).
 const FREE_IO_CAP: u64 = 64 << 20;
 /// Most recycled prelude (allocator, list) pairs kept for reuse (`FREE_PRELUDE`).
-const FREE_PRELUDE_CAP: usize = 256;
+const FREE_PRELUDE_CAP: usize = 64;
 
 static ALLOC_RES: Mutex<Option<HashMap<usize, Vec<(ID3D12Resource, u64, usize)>>>> = Mutex::new(None);
 static FREE_RES: Mutex<Vec<(ID3D12Resource, u64, usize)>> = Mutex::new(Vec::new());
@@ -217,8 +217,71 @@ static FREE_IO: Mutex<Vec<IoBlock>> = Mutex::new(Vec::new());
 static ALLOC_PRELUDE: Mutex<Option<HashMap<usize, Vec<PreludeEntry>>>> = Mutex::new(None);
 static FREE_PRELUDE: Mutex<Vec<PreludeEntry>> = Mutex::new(Vec::new());
 
+fn recycle_res(bufs: Vec<(ID3D12Resource, u64, usize)>) {
+    if bufs.is_empty() {
+        return;
+    }
+    let mut dropped_res = Vec::new();
+    {
+        let mut free = FREE_RES.lock().unwrap();
+        for b in bufs {
+            let held: u64 = free.iter().map(|f| f.1).sum();
+            if pool_keeps(free.len(), held, b.1) {
+                free.push(b);
+            } else {
+                dropped_res.push(b);
+            }
+        }
+    }
+    drop(dropped_res);
+}
+
+fn recycle_io(blocks: Vec<IoBlock>) {
+    if blocks.is_empty() {
+        return;
+    }
+    let mut dropped_io = Vec::new();
+    {
+        let mut free = FREE_IO.lock().unwrap();
+        for mut b in blocks {
+            b.used = 0;
+            let held: u64 = free.iter().map(|f| f.cap).sum();
+            if io_pool_keeps(held, b.cap) {
+                free.push(b);
+            } else {
+                dropped_io.push(b);
+            }
+        }
+    }
+    drop(dropped_io);
+}
+
+fn recycle_prelude(entries: Vec<PreludeEntry>) {
+    if entries.is_empty() {
+        return;
+    }
+    // Drop overflow prelude entries outside `ALLOC_PRELUDE`/`FREE_PRELUDE` locks: dropping their
+    // `ID3D12CommandAllocator` re-enters `real::alloc_release` -> `release_allocator_res`.
+    let mut dropped_preludes = Vec::new();
+    {
+        let mut free = FREE_PRELUDE.lock().unwrap();
+        for e in entries {
+            if free.len() < FREE_PRELUDE_CAP {
+                free.push(e);
+            } else {
+                dropped_preludes.push(e);
+            }
+        }
+    }
+    drop(dropped_preludes);
+}
+
 fn hold_res_until_reset(allocator: usize, mut bufs: Vec<(ID3D12Resource, u64, usize)>) {
     if bufs.is_empty() || allocator == 0 {
+        return;
+    }
+    if super::alloc_pool::is_backing_reset_clean(allocator) {
+        recycle_res(bufs);
         return;
     }
     ALLOC_RES.lock().unwrap().get_or_insert_with(HashMap::new).entry(allocator).or_default().append(&mut bufs);
@@ -226,6 +289,10 @@ fn hold_res_until_reset(allocator: usize, mut bufs: Vec<(ID3D12Resource, u64, us
 
 fn hold_io_until_reset(allocator: usize, mut blocks: Vec<IoBlock>) {
     if blocks.is_empty() || allocator == 0 {
+        return;
+    }
+    if super::alloc_pool::is_backing_reset_clean(allocator) {
+        recycle_io(blocks);
         return;
     }
     ALLOC_IO.lock().unwrap().get_or_insert_with(HashMap::new).entry(allocator).or_default().append(&mut blocks);
@@ -236,36 +303,25 @@ fn hold_prelude_until_reset(allocator: usize, entry: Option<PreludeEntry>) {
     if allocator == 0 {
         return;
     }
+    if super::alloc_pool::is_backing_reset_clean(allocator) {
+        recycle_prelude(vec![entry]);
+        return;
+    }
     ALLOC_PRELUDE.lock().unwrap().get_or_insert_with(HashMap::new).entry(allocator).or_default().push(entry);
 }
 
 pub(super) fn release_allocator_res(allocator: usize) {
-    if let Some(bufs) = ALLOC_RES.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)) {
-        let mut free = FREE_RES.lock().unwrap();
-        for b in bufs {
-            let held: u64 = free.iter().map(|f| f.1).sum();
-            if pool_keeps(free.len(), held, b.1) {
-                free.push(b);
-            }
-        }
+    let bufs = ALLOC_RES.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator));
+    if let Some(bufs) = bufs {
+        recycle_res(bufs);
     }
-    if let Some(blocks) = ALLOC_IO.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)) {
-        let mut free = FREE_IO.lock().unwrap();
-        for mut b in blocks {
-            b.used = 0;
-            let held: u64 = free.iter().map(|f| f.cap).sum();
-            if io_pool_keeps(held, b.cap) {
-                free.push(b);
-            }
-        }
+    let blocks = ALLOC_IO.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator));
+    if let Some(blocks) = blocks {
+        recycle_io(blocks);
     }
-    if let Some(entries) = ALLOC_PRELUDE.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)) {
-        let mut free = FREE_PRELUDE.lock().unwrap();
-        for e in entries {
-            if free.len() < FREE_PRELUDE_CAP {
-                free.push(e);
-            }
-        }
+    let entries = ALLOC_PRELUDE.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator));
+    if let Some(entries) = entries {
+        recycle_prelude(entries);
     }
 }
 
@@ -421,9 +477,8 @@ pub(super) unsafe fn prelude_list_for(seg: *mut c_void) -> Option<*mut c_void> {
                 (a, l)
             }
             None => {
-                let a: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).map_err(|e| format!("prelude allocator create: {e}"))?;
+                let (a, l) = super::real::create_internal_command_pair(&dev, ty)?;
                 let _ = a.SetName(windows::core::w!("xcl prelude alloc"));
-                let l: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &a, None).map_err(|e| format!("prelude list create: {e}"))?;
                 let _ = l.SetName(windows::core::w!("xcl prelude"));
                 (a, l)
             }
@@ -669,6 +724,13 @@ fn backing_allocator(list: *mut c_void, allocator: usize) -> usize {
     super::alloc_pool::recording_backing(list as usize).unwrap_or_else(|| super::alloc_pool::current(allocator))
 }
 
+fn can_recycle_list_now(list: *mut c_void) -> bool {
+    matches!(
+        super::list_x::tracked_list_type(list),
+        Some(D3D12_COMMAND_LIST_TYPE_DIRECT | D3D12_COMMAND_LIST_TYPE_COMPUTE)
+    ) && unsafe { super::alloc_pool::list_gpu_done(list as usize) }
+}
+
 /// The list was created or reset onto `allocator` with `initial_pso`: the previous
 /// recording's memory is the previous allocator's until that one is reset, and pipeline
 /// and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
@@ -715,9 +777,17 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         (old, std::mem::take(&mut s.uma), res_bufs, io_blocks, prelude)
     });
     console_list::hold_until_reset(old, blocks);
-    hold_res_until_reset(old, res_bufs);
-    hold_io_until_reset(old, io_blocks);
-    hold_prelude_until_reset(old, prelude);
+    if can_recycle_list_now(list) {
+        recycle_res(res_bufs);
+        recycle_io(io_blocks);
+        if let Some(p) = prelude {
+            recycle_prelude(vec![p]);
+        }
+    } else {
+        hold_res_until_reset(old, res_bufs);
+        hold_io_until_reset(old, io_blocks);
+        hold_prelude_until_reset(old, prelude);
+    }
 }
 
 /// Update `list`'s tracked backing allocator after `alloc_pool::reset_list` rotates `list` onto a
@@ -856,14 +926,24 @@ pub(super) fn pass_arena(from: *mut c_void, to: *mut c_void) {
 
 /// The list is gone.
 pub(super) fn forget(list: *mut c_void) {
-    if let Some(mut s) = state_shard(list as usize).lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
+    let recycle_now = can_recycle_list_now(list);
+    let removed = state_shard(list as usize).lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize)));
+    if let Some(mut s) = removed {
         console_list::hold_until_reset(s.allocator, s.uma);
         if let Some(b) = s.res_buf.take() {
             s.res_retired.push(b);
         }
-        hold_res_until_reset(s.allocator, s.res_retired);
-        hold_io_until_reset(s.allocator, s.io_blocks);
-        hold_prelude_until_reset(s.allocator, s.prelude_owned.take());
+        if recycle_now {
+            recycle_res(s.res_retired);
+            recycle_io(s.io_blocks);
+            if let Some(p) = s.prelude_owned.take() {
+                recycle_prelude(vec![p]);
+            }
+        } else {
+            hold_res_until_reset(s.allocator, s.res_retired);
+            hold_io_until_reset(s.allocator, s.io_blocks);
+            hold_prelude_until_reset(s.allocator, s.prelude_owned.take());
+        }
     }
 }
 
@@ -4588,9 +4668,10 @@ void main(uint t : SV_GroupIndex) {
 
     #[test]
     fn freed_two_pass_buffers_kept_for_reuse_are_capped() {
-        assert!(pool_keeps(0, 0, 128 << 20));
-        assert!(pool_keeps(1, 128 << 20, 128 << 20));
-        assert!(!pool_keeps(2, 256 << 20, 4 << 20));
+        let half = FREE_RES_CAP / 2;
+        assert!(pool_keeps(0, 0, half));
+        assert!(pool_keeps(1, half, half));
+        assert!(!pool_keeps(2, FREE_RES_CAP, 4 << 20));
         assert!(!pool_keeps(16, 0, 1 << 20));
     }
 

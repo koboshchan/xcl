@@ -34,7 +34,11 @@ thread_local! {
 
 pub fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("XCL_DRED").is_some())
+    *ON.get_or_init(|| {
+        std::env::var("XCL_DRED")
+            .ok()
+            .is_some_and(|v| !v.eq_ignore_ascii_case("driver") && v.trim() != "0")
+    })
 }
 
 /// Name a translated pipeline by its console shaders (`("ms", bytes)`, …).

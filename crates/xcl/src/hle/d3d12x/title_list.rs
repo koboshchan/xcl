@@ -170,7 +170,7 @@ pub(super) unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso:
     if hr >= 0 {
         let active = stand_in.unwrap_or(primary as usize);
         *((this as usize + F_BACKING) as *mut usize) = active;
-        let moved = {
+        let (moved, dropped_spares) = {
             let mut sg = SEGMENTS.lock().unwrap();
             let m = sg.get_or_insert_with(HashMap::new);
             if stand_in.is_some() || m.contains_key(&(this as usize)) {
@@ -178,9 +178,22 @@ pub(super) unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso:
                 let mut old = std::mem::take(&mut b.extra_active);
                 old.extend(std::mem::replace(&mut b.first, stand_in));
                 b.spares.extend(old.iter().copied());
-                old
+                let mut excess = Vec::new();
+                const MAX_SPARES: usize = 8;
+                if b.spares.len() > MAX_SPARES {
+                    let mut keep = Vec::with_capacity(b.spares.len());
+                    for seg in b.spares.drain(..) {
+                        if keep.len() >= MAX_SPARES && !super::alloc_pool::in_flight(seg) {
+                            excess.push(seg);
+                        } else {
+                            keep.push(seg);
+                        }
+                    }
+                    b.spares = keep;
+                }
+                (old, excess)
             } else {
-                Vec::new()
+                (Vec::new(), Vec::new())
             }
         };
         if !moved.is_empty() || stand_in.is_some() {
@@ -194,7 +207,14 @@ pub(super) unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso:
             for seg in moved {
                 super::bind::reset(seg as *mut c_void, 0, 0);
                 super::list_x::clear_segment_state(seg);
+                super::alloc_pool::detach_list(seg);
             }
+        }
+        for seg in dropped_spares {
+            let raw = seg as *mut c_void;
+            super::bind::forget(raw);
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(raw, 2));
+            rel(raw);
         }
         *((this as usize + F_RING_AT) as *mut usize) = 0;
     }
@@ -318,6 +338,8 @@ pub(super) fn drop_segment(wrapper: *mut c_void, pc: *mut c_void) {
         b.extra_active.retain(|&p| p != pc as usize);
         b.spares.push(pc as usize);
     }
+    drop(sg);
+    super::alloc_pool::detach_list(pc as usize);
 }
 
 /// Add the closed segment `pc` to `wrapper`'s recording, after the ones it has.
