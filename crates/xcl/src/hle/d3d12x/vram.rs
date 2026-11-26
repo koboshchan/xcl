@@ -1867,14 +1867,16 @@ unsafe fn retire_heaps_and_sweep(dev: &ID3D12Device, dev_key: usize, newly_recla
 /// The largest side a new sampled texture keeps when the device's local video memory is
 /// `fill` (usage / budget) full; None: all of it.
 fn cap_for_fill(fill: f64) -> Option<u64> {
-    if fill < 0.75 {
+    if fill < 0.72 {
         None
-    } else if fill < 0.85 {
-        Some(2048)
-    } else if fill < 0.92 {
+    } else if fill < 0.80 {
         Some(1024)
-    } else {
+    } else if fill < 0.88 {
         Some(512)
+    } else if fill < 0.94 {
+        Some(256)
+    } else {
+        Some(128)
     }
 }
 
@@ -3130,11 +3132,12 @@ mod tests {
     #[test]
     fn the_cap_follows_how_full_video_memory_is() {
         assert_eq!(cap_for_fill(0.0), None);
-        assert_eq!(cap_for_fill(0.749), None);
-        assert_eq!(cap_for_fill(0.75), Some(2048));
-        assert_eq!(cap_for_fill(0.85), Some(1024));
-        assert_eq!(cap_for_fill(0.92), Some(512));
-        assert_eq!(cap_for_fill(1.3), Some(512));
+        assert_eq!(cap_for_fill(0.719), None);
+        assert_eq!(cap_for_fill(0.72), Some(1024));
+        assert_eq!(cap_for_fill(0.80), Some(512));
+        assert_eq!(cap_for_fill(0.88), Some(256));
+        assert_eq!(cap_for_fill(0.94), Some(128));
+        assert_eq!(cap_for_fill(1.3), Some(128));
     }
 
     #[test]
