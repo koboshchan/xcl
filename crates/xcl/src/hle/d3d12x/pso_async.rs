@@ -741,6 +741,44 @@ mod used_tests {
         }
     }
 
+    /// What a bind got before its pipeline was built stays "not built" for it after the build
+    /// ends (`bound_unbuilt`), where `is_pending` already says built: `ExecuteIndirect` skipped
+    /// on that and sent the stand-in to the PC call. A failed build's stand-in and a pipeline that
+    /// is no stand-in are not unbuilt.
+    #[test]
+    fn a_stand_in_bound_before_its_build_ended_stays_unbuilt_for_that_bind() {
+        let (standin, failed) = (0x7E57_B0D1usize, 0x7E57_B0D2usize);
+        let (go, finish) = mpsc::channel::<()>();
+        submit_lazy(standin, true, Box::new(move || {
+            let _ = finish.recv();
+            0x6161
+        }), 0);
+        // (a bind that does not wait: the stand-in while it is built)
+        image_only(standin);
+        let bound = resolve_wait_for(standin, None);
+        assert_eq!(bound, standin);
+        assert!(is_pending(standin) && bound_unbuilt(standin, bound));
+        go.send(()).unwrap();
+        let start = std::time::Instant::now();
+        while is_pending(standin) && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(resolve(standin), 0x6161);
+        assert!(!is_pending(standin), "built");
+        assert!(bound_unbuilt(standin, bound), "the bind got the stand-in, not the pipeline built after it");
+        assert!(!bound_unbuilt(standin, resolve_wait_for(standin, None)), "a bind after the build gets the real pipeline");
+        submit(failed, true, Box::new(|| 0));
+        let start = std::time::Instant::now();
+        while is_pending(failed) && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(resolve(failed), failed);
+        assert!(!bound_unbuilt(failed, failed), "a failed build's stand-in is not waiting for a build");
+        assert!(!bound_unbuilt(0x7E57_B0D3, 0x7E57_B0D3), "no stand-in");
+        let _ = released(standin);
+        let _ = released(failed);
+    }
+
     /// A bind waits for a pipeline still being built no longer than its budget and goes on with
     /// the stand-in; later binds do not wait for it again; once built it is the real one.
     #[test]
@@ -1480,6 +1518,17 @@ pub fn need_by_submit(pso: usize) {
         NEEDED.lock().unwrap().push_back(p);
         let _ = queue().lock().unwrap().send(Box::new(|| ()));
     }
+}
+
+/// `bound` – what `resolve_wait(standin)` gave a bind – is the stand-in of a pipeline that was not
+/// built yet then: still being built, or built since. Not after a failed build (that one is the
+/// stand-in for good). Unlike `is_pending(standin)` after the bind, a build that ends between
+/// the two does not make the stand-in look like the title's pipeline.
+pub fn bound_unbuilt(standin: usize, bound: usize) -> bool {
+    entry(standin).is_some_and(|p| {
+        let done = p.done.lock().unwrap();
+        bound == p.stand(standin) && !(*done && p.real.load(Ordering::Acquire) == 0)
+    })
 }
 
 /// (built in the background, failed, still building)
