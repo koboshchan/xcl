@@ -1150,7 +1150,11 @@ mod tests {
             return runner::skip_test("no DXC");
         }
         let text = crate::gpu::dxil::validate::disassemble(&dxil).unwrap();
-        let (_, after_entry) = text.split_once("\n  br ").unwrap_or_else(|| panic!("expected branch in program:\n{text}"));
+        // Skip the uniform dispatch-width early-exit guard (`ret void`) if present so we split
+        // at the entry whole-wave branch (`S_CBRANCH_EXECZ`), not the prologue guard.
+        let body = text.split_once("\n  ret void\n").map_or(text.as_str(), |(_, rest)| rest);
+        let (_, after_entry) = body.split_once("\n  br ").unwrap_or_else(|| panic!("expected branch in program:\n{text}"));
+        assert!(after_entry.contains("fcmp olt float"), "expected bridged float compare in body:\n{text}");
         let divergent_barriers = after_entry.lines().filter(|l| l.contains("call void @dx.op.barrier")).count();
         // after the entry whole-wave branch, only one half reaches the body so no group barrier may appear there
         assert_eq!(divergent_barriers, 0, "group barriers after entry branch:\n{text}");

@@ -6,9 +6,9 @@ use super::lower::Lw;
 use super::module::{BinOp, Pred, Value};
 use super::ops_core::op;
 
-/// Native RDNA float lowering (`XCL_RDNA_FLOAT`, default on, `=0` disables): emits single-op
-/// `dx.op.unary(Frc)` for `v_fract_f32` and eliminates redundant `== 0` checks in `mul_legacy` /
-/// `fma_legacy` whenever an operand is a known finite non-zero (or zero) constant.
+/// Native RDNA float lowering (`XCL_RDNA_FLOAT`, default on, `=0` disables): eliminates redundant
+/// `== 0` checks in `mul_legacy` / `fma_legacy` whenever an operand is a known finite non-zero
+/// (or zero) constant.
 pub fn rdna_float_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("XCL_RDNA_FLOAT").map_or(true, |v| v.trim() != "0"))
@@ -78,11 +78,9 @@ impl Lw {
         self.sub(h, one)
     }
 
-    /// `fract_f`: x - floor(x), below 1.0.
+    /// `fract_f`: x - floor(x), clamped strictly below 1.0 (matches RDNA2 `v_fract_f32` on
+    /// NVIDIA as well as AMD; `dx.op.unary(Frc)` returns `1.0` for `-2^-30` on NVIDIA).
     pub fn fract_f(&mut self, x: Value) -> Value {
-        if rdna_float_enabled() {
-            return self.un(op::FRC, x);
-        }
         let fl = self.un(op::ROUND_NI, x);
         let r = self.fsub(x, fl);
         let one = self.fc(1.0);
