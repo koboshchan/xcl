@@ -1871,12 +1871,8 @@ fn cap_for_fill(fill: f64) -> Option<u64> {
         None
     } else if fill < 0.80 {
         Some(1024)
-    } else if fill < 0.88 {
-        Some(512)
-    } else if fill < 0.94 {
-        Some(256)
     } else {
-        Some(128)
+        Some(512)
     }
 }
 
@@ -3155,9 +3151,7 @@ mod tests {
         assert_eq!(cap_for_fill(0.719), None);
         assert_eq!(cap_for_fill(0.72), Some(1024));
         assert_eq!(cap_for_fill(0.80), Some(512));
-        assert_eq!(cap_for_fill(0.88), Some(256));
-        assert_eq!(cap_for_fill(0.94), Some(128));
-        assert_eq!(cap_for_fill(1.3), Some(128));
+        assert_eq!(cap_for_fill(1.3), Some(512));
     }
 
     #[test]

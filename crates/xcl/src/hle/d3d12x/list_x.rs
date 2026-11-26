@@ -178,9 +178,8 @@ pub(super) unsafe fn restore_after_internal_pass(list: *mut c_void, clobbered_gf
     };
     restore_bindings(list, &bindings, ty);
     let (rs_gfx, rs_cs) = super::bind::tracked_root_sigs(list);
-    if clobbered_gfx || clobbered_cs {
-        super::bind::invalidate_pc_abi(list, clobbered_gfx, clobbered_cs);
-    }
+    // `restore_bindings` calls `SetDescriptorHeaps`, which invalidates PC root bindings on both stages.
+    super::bind::invalidate_pc_abi(list, true, true);
     if clobbered_gfx && rs_gfx != 0 {
         pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, 30)(list, rs_gfx);
     }

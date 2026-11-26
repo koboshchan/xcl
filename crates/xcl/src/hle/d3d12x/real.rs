@@ -6262,18 +6262,12 @@ const RT_COMPANION_CS_HASHES: &[u64] = &[
 ///
 /// While `XCL_RT_GATE=hold` holds back BVH traversal (`image_bvh*_intersect_ray`) and
 /// `ambient.rs` supplies indirect lighting on `CS_ScreenProbes_TemporalResolve` /
-/// `CS_UpdateHistory`, BVH build passes (`XboxBvhBuilder`) and ScreenProbes ray-generation /
-/// ray-binning passes have no active ray-tracing consumer.
+/// `CS_UpdateHistory`, BVH build passes (`XboxBvhBuilder`) have no active ray-tracing consumer.
+/// Do not gate ScreenProbes ray-binning / offset producers whose indirect buffers are consumed
+/// by downstream non-gated passes.
 const RT_COMPANION_CS_NAMES: &[&[u8]] = &[
     b"RaytracingResolve",
     b"ScreenProbes_ActivateRays",
-    b"ScreenProbes_EvaluateRayRequests",
-    b"ScreenProbes_GenerateShaderBins",
-    b"ScreenProbes_GenerateRayBins",
-    b"ScreenProbes_RadianceSpatialFilter",
-    b"GenerateRayCoords",
-    b"ClassifyRayTiles",
-    b"GenerateShaderBinOffsets",
     b"IrradianceCache_Shade",
     b"XboxBvhBuilder",
 ];
@@ -10567,9 +10561,7 @@ mod outside_buffer_tests {
         assert!(is_rt_gated_cs(b"HDR\0CS_RaytracingResolve_01\0"));
         assert!(is_rt_gated_cs(b"HDR\0CS_IrradianceCache_Shade_Low\0"));
         assert!(is_rt_gated_cs(b"HDR\0Microsoft\\XboxBvhBuilder\\Release\0"));
-        assert!(is_rt_gated_cs(b"HDR\0CS_ScreenProbes_EvaluateRayRequests_RayBinning\0"));
-        assert!(is_rt_gated_cs(b"HDR\0CS_ScreenProbes_GenerateShaderBins\0"));
-        assert!(is_rt_gated_cs(b"HDR\0CS_GenerateRayCoords\0"));
+        assert!(!is_rt_gated_cs(b"HDR\0CS_ScreenProbes_GenerateShaderBins\0"));
         assert!(!is_rt_gated_cs(b"HDR\0CS_ScreenProbes_TemporalResolve\0"));
         assert!(!is_rt_gated_cs(b"HDR\0CS_UpdateHistory\0"));
     }
