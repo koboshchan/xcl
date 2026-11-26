@@ -899,6 +899,7 @@ fn raw_loads_in_root_windows_are_branchless() {
         outputs: vec![sig("SV_Target", 0, 64, 3, 0, 0xF)],
         input_ena: 0x2,
         attrs: None,
+        early_depth: false,
     };
     let ps_k = super::kernel::translate_pixel(&ps_code, KernelOptions { wave64: false, split: false, mem_windows: 4, sampler_base: 0 }, &psi)
         .expect("pixel shader multi-window load translates");

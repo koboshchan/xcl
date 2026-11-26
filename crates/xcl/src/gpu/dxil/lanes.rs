@@ -670,7 +670,7 @@ mod ps_ballot_tests {
     }
 
     fn ps_interface() -> PsInterface {
-        PsInterface { inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x302, attrs: None }
+        PsInterface { inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x302, attrs: None, early_depth: false }
     }
 
     /// Pixel shader exercising `s_wqm`, `v_cndmask` + DPP `ddx`, `s_and_saveexec` + DPP `ddy`,

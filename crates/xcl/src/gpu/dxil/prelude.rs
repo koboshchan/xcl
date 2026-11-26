@@ -731,6 +731,7 @@ mod disable_math_refactoring_tests {
             outputs: vec![SigElement { name: "SV_Target".into(), index: 0, system_value: 64, component_type: 3, register: 0, mask: 0xF, rw_mask: 0xF, stream: 0 }],
             input_ena: 0x0F00,
             attrs: None,
+            early_depth: false,
         }
     }
 

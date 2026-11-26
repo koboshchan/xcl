@@ -8653,7 +8653,7 @@ fn ps_mrtz_sample_mask_writes_sv_coverage() {
             ("EXP", "ENC_EXP", mrtz, None),
             ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1), ("VM", 1)], None),
         ]);
-        let psi = PsInterface { inputs: vec![], outputs, input_ena: 0x2, attrs: None };
+        let psi = PsInterface { inputs: vec![], outputs, input_ena: 0x2, attrs: None, early_depth: false };
         let pt = translate(&code, &Options { mode: Mode::Pixel(psi), wave64: true, ..Default::default() }).unwrap();
         assert!(pt.complete(), "{:?}\n{}", pt.unsupported_why, pt.hlsl);
         if super::dxc::location().is_ok() {
@@ -10091,7 +10091,7 @@ fn list_loop_ps() -> super::Translation {
     code.extend(ins("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", back)], None));
     code.extend(tail);
     code.extend(ins("S_ENDPGM", "ENC_SOPP", &[], None));
-    let psi = PsInterface { inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x302, attrs: None };
+    let psi = PsInterface { inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x302, attrs: None, early_depth: false };
     translate(&code, &Options { mode: Mode::Pixel(psi), wave64: false, ..Default::default() }).unwrap()
 }
 
@@ -10172,7 +10172,7 @@ fn mask_loop_ps() -> super::Translation {
         ]
         .concat(),
     );
-    let psi = PsInterface { inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x302, attrs: None };
+    let psi = PsInterface { inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x302, attrs: None, early_depth: false };
     translate(&code, &Options { mode: Mode::Pixel(psi), wave64: false, ..Default::default() }).unwrap()
 }
 

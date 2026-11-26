@@ -1475,10 +1475,10 @@ fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
 pub fn describe(pso: usize) -> Option<String> {
     let p = entry(pso)?;
     let state = if p.real.load(Ordering::Acquire) != 0 { "" } else { ", not built yet" };
-    Some(match (p.compute, p.record) {
+    Some(match (p.compute, p.key) {
         (true, 0) => format!("a compute pipeline {pso:#x}{state}"),
-        (true, record) => format!("cs {record:016x}{state}"),
-        (false, _) => format!("a graphics pipeline {pso:#x} (shaders {:016x}){state}", p.key),
+        (true, key) => format!("cs {key:016x}{state}"),
+        (false, key) => format!("a graphics pipeline {pso:#x} (shaders {key:016x}){state}"),
     })
 }
 /// For binding: compute pipelines are waited for, graphics ones are not.
