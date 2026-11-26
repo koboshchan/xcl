@@ -1711,15 +1711,31 @@ pub(crate) fn needs_coherent_mem(insts: &[Decoded]) -> bool {
 /// every heap-window load in an atomic-using compute shader with `IsGloballyCoherent` forces
 /// uncached `LD.E.STRONG.SYS` PCIe snoops (turning 5 ms shaders into 350+ ms stalls).
 ///
-/// Direct DXIL marks every atomic (`heap_atomic_coherent`) and every individual non-atomic
-/// `GLC`/`DLC`/`SLC` instruction (`inst_mem_coherent`) coherent on demand, so shader-wide
-/// non-atomic coherence is only needed when the shader explicitly invalidates data caches.
+/// Keep non-atomic heap-window accesses L1-cached unless the shader explicitly invalidates data
+/// caches, uses CAS/swap atomics (spinlocks / cross-workgroup RMW), or uses non-atomic
+/// `GLC`/`DLC`/`SLC` memory ops (release/acquire protocols whose paired non-GLC payload accesses
+/// must also stay L1-coherent across workgroups).
 pub(crate) fn needs_coherent_non_atomic_mem(insts: &[Decoded]) -> bool {
     insts.iter().any(|d| {
+        let name = d.inst.name;
+        if matches!(name, "S_DCACHE_INV" | "S_GL1_INV" | "BUFFER_GL0_INV" | "BUFFER_GL1_INV") {
+            return true;
+        }
+        if name.starts_with("BUFFER_ATOMIC_")
+            || name.starts_with("GLOBAL_ATOMIC_")
+            || name.starts_with("FLAT_ATOMIC_")
+        {
+            return name.contains("_CMPSWAP")
+                || name.contains("_FCMPSWAP")
+                || name.ends_with("_SWAP")
+                || name.contains("_SWAP_");
+        }
         matches!(
-            d.inst.name,
-            "S_DCACHE_INV" | "S_GL1_INV" | "BUFFER_GL0_INV" | "BUFFER_GL1_INV"
-        )
+            d.enc.name,
+            "ENC_SMEM" | "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL"
+        ) && ["GLC", "DLC", "SLC"]
+            .iter()
+            .any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1))
     })
 }
 

@@ -538,46 +538,11 @@ impl Lw {
         self.sel(sz, w[0], x)
     }
     /// `st_part`: atomically replace the bits `m` of the dword at `b` by `v`.
-    ///
-    /// In compute shaders, reads `b` first (through the same coherent window handle) and skips
-    /// both global atomics when `(cur & m) == (v & m)`, skips `atomicAnd` when `vm == m`, and
-    /// skips `atomicOr` when `vm == 0` (huge win on high-contention 8/16-bit formatted stores
-    /// such as voxel visibility marks over PCIe UMA). Graphics/mesh/geom stages keep the flat
-    /// two-atomic form to avoid inflating large graphics PSOs' DXIL size and compile times.
     fn st_part(&mut self, b: Value, m: Value, v: Value) {
         let vm = self.and(v, m);
-        if self.gfx.is_some() || self.mesh.is_some() || self.geom.is_some() {
-            let nm = self.not(m);
-            self.mraw_atomic(AtomicOp::And, b, nm);
-            self.mraw_atomic(AtomicOp::Or, b, vm);
-            return;
-        }
         let nm = self.not(m);
-        let need_and = self.cmp(Pred::Ne, vm, m);
-        let need_or = self.cmpc(Pred::Ne, vm, 0);
-        self.with_mem_many_tys_coh(None, &[], self.heap_atomic_coherent, &mut |lw, mem| {
-            let cur = lw.s.raw_load(mem, b, 1)[0];
-            let cur_m = lw.and(cur, m);
-            let diff = lw.cmp(Pred::Ne, cur_m, vm);
-            let do_store = lw.s.m.new_block();
-            let done = lw.s.m.new_block();
-            lw.s.m.cond_br(diff, do_store, done);
-            lw.s.m.set_block(do_store);
-            let do_and = lw.s.m.new_block();
-            let chk_or = lw.s.m.new_block();
-            lw.s.m.cond_br(need_and, do_and, chk_or);
-            lw.s.m.set_block(do_and);
-            lw.s.raw_atomic(mem, AtomicOp::And, b, nm);
-            lw.s.m.br(chk_or);
-            lw.s.m.set_block(chk_or);
-            let do_or = lw.s.m.new_block();
-            lw.s.m.cond_br(need_or, do_or, done);
-            lw.s.m.set_block(do_or);
-            lw.s.raw_atomic(mem, AtomicOp::Or, b, vm);
-            lw.s.m.br(done);
-            lw.s.m.set_block(done);
-            Vec::new()
-        });
+        self.mraw_atomic(AtomicOp::And, b, nm);
+        self.mraw_atomic(AtomicOp::Or, b, vm);
     }
     /// `st_bytes`: store the low `n` bytes of `r` at byte address `a` (n ≤ 16; partial
     /// dwords through atomics so neighbours stay intact).
