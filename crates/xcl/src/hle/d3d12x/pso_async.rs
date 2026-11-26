@@ -461,13 +461,154 @@ pub fn earlier_used_keys() -> std::collections::HashSet<u64> {
 /// a build that skips a dispatch instead of waiting for its pipeline, ~2 170 dispatches were
 /// skipped in those frames without this and 94 – 150 with it.
 mod used {
-    use std::collections::HashSet;
-    use std::io::Write;
-    use std::sync::{Mutex, OnceLock, RwLock};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
+    use std::{collections::HashSet, fmt::Write as _, io::Write, path::PathBuf, thread::JoinHandle, time::{Duration, Instant}};
+
+    /// Coalesce first-use bursts into a single disk write off the bind lock.
+    const COALESCE_WINDOW: Duration = Duration::from_millis(25);
+    /// Flush immediately once a burst reaches this many unique keys.
+    const BATCH_IMMEDIATE: usize = 64;
+
+    enum Sink {
+        LazyFile(PathBuf, Option<std::fs::File>),
+        #[cfg(test)]
+        Writer(Box<dyn Write + Send>),
+    }
+
+    impl Sink {
+        fn write_batch(&mut self, bytes: &[u8]) {
+            match self {
+                Self::LazyFile(path, file) => {
+                    if file.is_none() {
+                        if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
+                        *file = std::fs::OpenOptions::new().create(true).append(true).open(&*path).ok();
+                    }
+                    if file.as_mut().is_some_and(|f| f.write_all(bytes).is_err() || f.flush().is_err()) { *file = None; }
+                }
+                #[cfg(test)]
+                Self::Writer(w) => if w.write_all(bytes).is_ok() { let _ = w.flush(); },
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct JournalState {
+        seen: HashSet<u64>,
+        pending: Vec<u64>,
+        enqueued_seq: u64,
+        completed_seq: u64,
+        flush_now: bool,
+        closed: bool,
+        writer_stopped: bool,
+    }
+
+    struct JournalShared {
+        state: Mutex<JournalState>,
+        wake_cv: Condvar,
+        flushed_cv: Condvar,
+    }
+
+    struct StopGuard<'a>(&'a JournalShared);
+    impl Drop for StopGuard<'_> {
+        fn drop(&mut self) {
+            self.0.state.lock().unwrap_or_else(|e| e.into_inner()).writer_stopped = true;
+            self.0.flushed_cv.notify_all();
+        }
+    }
+
+    pub(super) struct Journal {
+        shared: Arc<JournalShared>,
+        writer: Option<JoinHandle<()>>,
+    }
+
+    impl Journal {
+        fn new_shared(state: JournalState) -> Arc<JournalShared> {
+            Arc::new(JournalShared { state: Mutex::new(state), wake_cv: Condvar::new(), flushed_cv: Condvar::new() })
+        }
+        fn in_memory(seen: HashSet<u64>) -> Self {
+            Self { shared: Self::new_shared(JournalState { seen, writer_stopped: true, ..Default::default() }), writer: None }
+        }
+        fn with_sink(seen: HashSet<u64>, sink: Sink, coalesce: Duration) -> Self {
+            let shared = Self::new_shared(JournalState { seen, ..Default::default() });
+            let bg = Arc::clone(&shared);
+            let writer = std::thread::Builder::new().name("xcl-pso-used".into()).spawn(move || writer_loop(&bg, sink, coalesce)).ok();
+            if writer.is_none() {
+                shared.state.lock().unwrap().writer_stopped = true;
+                shared.flushed_cv.notify_all();
+            }
+            Self { shared, writer }
+        }
+        #[cfg(test)]
+        pub(super) fn with_writer(w: Box<dyn Write + Send>, c: Duration) -> Self { Self::with_sink(HashSet::new(), Sink::Writer(w), c) }
+        #[cfg(test)]
+        pub(super) fn with_file(p: PathBuf, c: Duration) -> Self { Self::with_sink(HashSet::new(), Sink::LazyFile(p, None), c) }
+
+        pub(super) fn note(&self, key: u64) {
+            if key == 0 { return; }
+            let mut g = self.shared.state.lock().unwrap();
+            if !g.seen.insert(key) || g.writer_stopped { return; }
+            g.pending.push(key);
+            g.enqueued_seq += 1;
+            if matches!(g.pending.len(), 1 | BATCH_IMMEDIATE) { self.shared.wake_cv.notify_one(); }
+        }
+
+        #[cfg(test)]
+        pub(super) fn noted(&self, key: u64) -> bool { self.shared.state.lock().unwrap().seen.contains(&key) }
+
+        #[allow(dead_code)]
+        pub(super) fn flush(&self) {
+            let mut g = self.shared.state.lock().unwrap();
+            let target = g.enqueued_seq;
+            if g.completed_seq >= target || g.writer_stopped { return; }
+            g.flush_now = true;
+            self.shared.wake_cv.notify_one();
+            while g.completed_seq < target && !g.writer_stopped { g = self.shared.flushed_cv.wait(g).unwrap(); }
+        }
+    }
+
+    impl Drop for Journal {
+        fn drop(&mut self) {
+            self.shared.state.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+            self.shared.wake_cv.notify_one();
+            if let Some(h) = self.writer.take() { let _ = h.join(); }
+        }
+    }
+
+    fn writer_loop(shared: &JournalShared, mut sink: Sink, coalesce: Duration) {
+        let _stop = StopGuard(shared);
+        let mut buf = String::new();
+        loop {
+            let (batch, batch_seq) = {
+                let mut g = shared.state.lock().unwrap();
+                while g.pending.is_empty() && !g.closed {
+                    if std::mem::take(&mut g.flush_now) { shared.flushed_cv.notify_all(); }
+                    g = shared.wake_cv.wait(g).unwrap();
+                }
+                if g.pending.is_empty() && g.closed { break; }
+                if !coalesce.is_zero() {
+                    let deadline = Instant::now() + coalesce;
+                    while g.pending.len() < BATCH_IMMEDIATE && !g.flush_now && !g.closed {
+                        let Some(rem) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else { break };
+                        let (guard, res) = shared.wake_cv.wait_timeout(g, rem).unwrap();
+                        g = guard;
+                        if res.timed_out() { break; }
+                    }
+                }
+                g.flush_now = false;
+                (std::mem::take(&mut g.pending), g.enqueued_seq)
+            };
+            buf.clear();
+            buf.reserve(batch.len() * 17);
+            for key in batch { let _ = writeln!(buf, "{key:016x}"); }
+            sink.write_batch(buf.as_bytes());
+            shared.state.lock().unwrap().completed_seq = batch_seq;
+            shared.flushed_cv.notify_all();
+        }
+    }
 
     struct Used {
         earlier: RwLock<HashSet<u64>>,
-        now: Mutex<(HashSet<u64>, Option<std::fs::File>)>,
+        now: Journal,
     }
 
     /// The keys in a `used-pipelines.txt` (lines that are not a hexadecimal key are passed over).
@@ -480,18 +621,15 @@ mod used {
         U.get_or_init(|| {
             // (a test neither reads nor writes the user's file)
             if cfg!(test) {
-                return Used { earlier: RwLock::new(HashSet::new()), now: Mutex::new((HashSet::new(), None)) };
+                return Used { earlier: RwLock::new(HashSet::new()), now: Journal::in_memory(HashSet::new()) };
             }
             let path = crate::gpu::recomp::dxc::cache_dir().join("used-pipelines.txt");
             let earlier = parse(&std::fs::read_to_string(&path).unwrap_or_default());
             if !earlier.is_empty() {
                 crate::xlog_info!("D3D12.X: the pipelines of {} shader sets an earlier run used are built ahead of their first use", earlier.len());
             }
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
-            Used { now: Mutex::new((earlier.clone(), file)), earlier: RwLock::new(earlier) }
+            let now = Journal::with_sink(earlier.clone(), Sink::LazyFile(path, None), COALESCE_WINDOW);
+            Used { earlier: RwLock::new(earlier), now }
         })
     }
 
@@ -502,21 +640,13 @@ mod used {
 
     /// A pipeline of these shaders is used now: kept for the next run.
     pub fn note(key: u64) {
-        if key == 0 {
-            return;
-        }
-        let mut g = get().now.lock().unwrap();
-        if g.0.insert(key) {
-            if let Some(f) = g.1.as_mut() {
-                let _ = writeln!(f, "{key:016x}");
-            }
-        }
+        get().now.note(key);
     }
 
     /// (tests) This run used a pipeline of these shaders.
     #[cfg(test)]
     pub fn noted(key: u64) -> bool {
-        get().now.lock().unwrap().0.contains(&key)
+        get().now.noted(key)
     }
 
     #[cfg(test)]
@@ -889,6 +1019,90 @@ mod used_tests {
         let keys = used::parse("00000000000000ff\n\nnot a key\n  1a2b \n0\n");
         assert_eq!(keys.len(), 2);
         assert!(keys.contains(&0xff) && keys.contains(&0x1a2b));
+    }
+
+    #[test]
+    fn used_note_does_not_block_on_slow_writer() {
+        use std::{io::Write, time::Duration};
+        struct Blocking(Option<mpsc::Sender<()>>, mpsc::Receiver<()>, Arc<Mutex<Vec<u8>>>);
+        impl Write for Blocking {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if let Some(tx) = self.0.take() { let _ = tx.send(()); let _ = self.1.recv(); }
+                self.2.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let ((entered_tx, entered_rx), (release_tx, release_rx)) = (mpsc::channel(), mpsc::channel());
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let j = used::Journal::with_writer(Box::new(Blocking(Some(entered_tx), release_rx, out.clone())), Duration::ZERO);
+        j.note(0x1111);
+        entered_rx.recv_timeout(Duration::from_secs(5)).expect("writer entered write_all");
+        j.note(0x2222);
+        j.note(0x3333);
+        assert!(j.noted(0x1111) && j.noted(0x2222) && j.noted(0x3333), "note/noted must not block on writer I/O");
+        release_tx.send(()).unwrap();
+        j.flush();
+        assert_eq!(used::parse(std::str::from_utf8(&out.lock().unwrap()).unwrap()), [0x1111, 0x2222, 0x3333].into());
+    }
+
+    #[test]
+    fn used_burst_coalesces_writes_and_deduplicates_keys() {
+        use std::{io::Write, time::Duration};
+        struct Counting(Arc<Mutex<(usize, Vec<u8>)>>);
+        impl Write for Counting {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let mut g = self.0.lock().unwrap();
+                g.0 += 1;
+                g.1.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let rec = Arc::new(Mutex::new((0usize, Vec::new())));
+        let j = used::Journal::with_writer(Box::new(Counting(rec.clone())), Duration::from_millis(500));
+        for k in (0u64..=40).chain(0u64..=40) { j.note(k); }
+        j.flush();
+        let (writes, bytes) = { let g = rec.lock().unwrap(); (g.0, g.1.clone()) };
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(writes >= 1 && writes < 40, "expected coalesced writes (< 40), got {writes}");
+        assert_eq!(text.lines().count(), 40);
+        assert_eq!(used::parse(&text), (1u64..=40).collect());
+    }
+
+    #[test]
+    fn used_flush_drop_lazy_file_and_io_error_are_graceful() {
+        use std::{io::Write, time::Duration};
+        let dir = std::env::temp_dir().join(format!("xcl-used-journal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("nested").join("used-pipelines.txt");
+        let j = used::Journal::with_file(path.clone(), Duration::from_secs(5));
+        assert!(!dir.exists() && !path.exists(), "dir/file must open lazily on first batch write");
+        j.note(0xAA01);
+        j.note(0xAA02);
+        j.flush();
+        assert_eq!(used::parse(&std::fs::read_to_string(&path).unwrap()), [0xAA01, 0xAA02].into());
+        j.note(0xAA03);
+        drop(j);
+        assert_eq!(used::parse(&std::fs::read_to_string(&path).unwrap()), [0xAA01, 0xAA02, 0xAA03].into());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        struct Failing(Arc<AtomicUsize>);
+        impl Write for Failing {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Err(std::io::Error::other("disk full"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Err(std::io::Error::other("disk full")) }
+        }
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let j = used::Journal::with_writer(Box::new(Failing(attempts.clone())), Duration::ZERO);
+        j.note(0xBAD1);
+        j.note(0xBAD2);
+        j.flush();
+        j.note(0xBAD3);
+        j.flush();
+        assert!(attempts.load(Ordering::Acquire) >= 1 && j.noted(0xBAD1) && j.noted(0xBAD2) && j.noted(0xBAD3));
     }
 
     /// A lazy pipeline of shaders an earlier run used is built without a bind; another one is
