@@ -1645,8 +1645,8 @@ unsafe fn place_on_pages(
         dev.GetResourceTiling(res, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
         None
     };
-    // sampled textures only: what the GPU renders to keeps all of its memory
-    let (skipped_mips, skip) = if require_aligned { (0, Vec::new()) } else { top_mip_tiles(dev, res, &tiled, total) };
+    // non-aliased sampled textures only: GPU-owned targets and GPU-aliased SRVs keep all mips
+    let (skipped_mips, skip) = if require_aligned || use_phys { (0, Vec::new()) } else { top_mip_tiles(dev, res, &tiled, total) };
     let skip_tiles = skip.iter().filter(|&&s| s).count();
     let phys = physical_pages_under(va, console_bytes, total as usize, use_phys);
     let bound = {
@@ -1938,10 +1938,20 @@ unsafe fn local_fill(dev: &ID3D12Device) -> Option<f64> {
     Some(c.fill)
 }
 
+/// Whether DXGI format `fmt` is block-compressed (BC1–BC7): pure streaming asset textures that
+/// are never render targets, UAVs, or screen-space post-process buffers sampled via `Load(mip=0)`.
+fn is_bc_format(fmt: i32) -> bool {
+    matches!(fmt, 70..=84 | 94..=99)
+}
+
 /// For a new sampled texture `res` (`desc`, `total` tiles): how many top mips get no video
 /// memory now, and which of its tiles those are (empty: none).
 unsafe fn top_mip_tiles(dev: &ID3D12Device, res: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC, total: u32) -> (u32, Vec<bool>) {
-    if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.MipLevels < 2 || desc.SampleDesc.Count > 1 {
+    if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || desc.MipLevels < 2
+        || desc.SampleDesc.Count > 1
+        || !is_bc_format(desc.Format.0)
+    {
         return (0, Vec::new());
     }
     let Some(cap) = texture_cap(dev) else { return (0, Vec::new()) };
@@ -3126,6 +3136,16 @@ mod tests {
                 "AFTER  ({TEX_COUNT} x 2MiB textures, {new_calls} UpdateTileMappings + {TEX_COUNT} Signals): submit={new_submit:?} gpu_done={new_total:?}"
             );
             assert!(new_calls < old_calls);
+        }
+    }
+
+    #[test]
+    fn is_bc_format_allows_only_block_compressed_streaming_textures() {
+        for fmt in [70, 71, 72, 77, 80, 83, 84, 94, 95, 98, 99] {
+            assert!(is_bc_format(fmt), "BC format {fmt} should allow mip-budget trimming");
+        }
+        for fmt in [2, 10, 24, 26, 28, 29, 41, 61, 87, 91] {
+            assert!(!is_bc_format(fmt), "uncompressed format {fmt} must keep all mips");
         }
     }
 
