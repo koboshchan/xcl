@@ -159,8 +159,18 @@ impl Lw {
     /// jump to `join` (reads 0, stores and atomics dropped), matching `#1693` semantics.
     pub(crate) fn with_mem_many_tys(
         &mut self,
+        guard: Option<Value>,
+        out_tys: &[super::module::Ty],
+        f: &mut dyn FnMut(&mut Lw, RawUav) -> Vec<Value>,
+    ) -> Vec<Value> {
+        self.with_mem_many_tys_coh(guard, out_tys, false, f)
+    }
+
+    fn with_mem_many_tys_coh(
+        &mut self,
         mut guard: Option<Value>,
         out_tys: &[super::module::Ty],
+        force_coherent: bool,
         f: &mut dyn FnMut(&mut Lw, RawUav) -> Vec<Value>,
     ) -> Vec<Value> {
         if let Some(c) = guard {
@@ -173,6 +183,7 @@ impl Lw {
         // Descriptor-heap windows (`#1693`, `XCL_HEAP_WINDOWS=1`): single guarded heap lookup
         // combined with `guard`, stacking cleanly with vector loads/stores & FormatLoad opt.
         if let Some(coherent) = self.heap_mem {
+            let coherent = coherent || force_coherent;
             let windows = self.mems.len() as u32;
             let w = self.rd(super::lower::VAR_WIN);
             let inside = self.cmpc(Pred::ULt, w, windows);
@@ -447,11 +458,11 @@ impl Lw {
     }
     fn mraw_atomic(&mut self, op: AtomicOp, a: Value, v: Value) -> Value {
         let ty = self.s.m.type_of(v);
-        self.with_mem_many_tys(None, &[ty], &mut |lw, m| vec![lw.s.raw_atomic(m, op, a, v)])[0]
+        self.with_mem_many_tys_coh(None, &[ty], self.heap_atomic_coherent, &mut |lw, m| vec![lw.s.raw_atomic(m, op, a, v)])[0]
     }
     fn mraw_cmpxchg(&mut self, a: Value, c: Value, n: Value) -> Value {
         let ty = self.s.m.type_of(c);
-        self.with_mem_many_tys(None, &[ty], &mut |lw, m| vec![lw.s.raw_cmpxchg(m, a, c, n)])[0]
+        self.with_mem_many_tys_coh(None, &[ty], self.heap_atomic_coherent, &mut |lw, m| vec![lw.s.raw_cmpxchg(m, a, c, n)])[0]
     }
     /// `mem.Load(a & ~3)`
     pub fn mem_ld(&mut self, a: Value) -> Value {

@@ -10427,6 +10427,40 @@ fn compute_globallycoherent_only_when_needed() {
             assert!(coh_dis.contains("i32 20491"), "direct DXIL atomic CS (mw={mw:#x}) must set IsGloballyCoherent:\n{coh_dis}");
         }
     }
+
+    // With heap windows, an append-style atomic (even with RDNA2 GLC=1 _rtn) keeps non-atomic
+    // loads/stores cached (i32 4107) while annotating the atomic coherent (i32 20491); combining
+    // atomics with s_barrier or CAS/swap keeps all heap accesses coherent (i32 20491).
+    let atomic_load_store = prog(&[
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125)]),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 1), ("SADDR", 0)]),
+        ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128), ("GLC", 1)]),
+    ]);
+    let atomic_barrier = prog(&[
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125)]),
+        ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128)]),
+        ("S_BARRIER", "ENC_SOPP", &[]),
+    ]);
+    let atomic_cas = prog(&[
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125)]),
+        ("BUFFER_ATOMIC_CMPSWAP", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128), ("GLC", 1)]),
+    ]);
+    let o = crate::gpu::dxil::kernel::KernelOptions { wave64: false, split: false, mem_windows: super::HEAP_WINDOWS | 2, sampler_base: 0 };
+    let mixed = crate::gpu::dxil::kernel::translate_compute(&atomic_load_store, o, &cs).unwrap();
+    let bar_k = crate::gpu::dxil::kernel::translate_compute(&atomic_barrier, o, &cs).unwrap();
+    let cas_k = crate::gpu::dxil::kernel::translate_compute(&atomic_cas, o, &cs).unwrap();
+    if super::dxc::location().is_ok() {
+        let dis = crate::gpu::dxil::validate::disassemble(&mixed.dxil).unwrap();
+        // u0 (`io`) plus heap load and heap store are cached (4107); the atomic is coherent (20491).
+        assert_eq!(dis.matches("i32 4107").count(), 3, "append-style atomic CS must cache non-atomic load/store:\n{dis}");
+        assert_eq!(dis.matches("i32 20491").count(), 1, "atomic op must stay coherent:\n{dis}");
+        for (label, k) in [("atomic+barrier", &bar_k), ("atomic+cmpswap", &cas_k)] {
+            let d = crate::gpu::dxil::validate::disassemble(&k.dxil).unwrap();
+            // Only u0 (`io`) is 4107; both the heap load and atomic must be coherent (20491).
+            assert_eq!(d.matches("i32 4107").count(), 1, "{label} must not emit cached heap handle:\n{d}");
+            assert_eq!(d.matches("i32 20491").count(), 2, "{label} must keep heap load and atomic coherent:\n{d}");
+        }
+    }
 }
 
 /// Real GPU check of both non-coherent (cached) and coherent (cross-workgroup atomic + GLC)

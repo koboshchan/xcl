@@ -553,7 +553,9 @@ impl Lw {
             s.enable_rov();
         }
         let coherent = cs.is_some() && crate::gpu::recomp::needs_coherent_mem(insts);
+        let coherent_non_atomic = cs.is_some() && crate::gpu::recomp::needs_coherent_non_atomic_mem(insts);
         let (mems, heap_mem) = mem_windows(&mut s, o.mem_windows, coherent);
+        let heap_mem = heap_mem.map(|_| coherent_non_atomic);
         let i32 = s.m.i32();
         let z = s.m.i32c(0);
         let mut lw = Lw {
@@ -568,6 +570,7 @@ impl Lw {
             half: z,
             mems,
             heap_mem,
+            heap_atomic_coherent: coherent,
             heap_flat: heap_mem.is_some() && !gfx && o.mem_windows & crate::gpu::recomp::HEAP_FLAT != 0,
             res,
             fmt_table: None,

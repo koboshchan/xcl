@@ -187,8 +187,10 @@ pub struct Lw {
     /// the memory windows `mem`, `mem1`.. (u2..)
     pub mems: Vec<RawUav>,
     /// the windows come from the descriptor heap (`lower_window`; `mems` only counts them):
-    /// Some(globallycoherent)
+    /// Some(globallycoherent) for non-atomic loads/stores
     pub heap_mem: Option<bool>,
+    /// whether heap-window atomics use `globallycoherent` independently of `heap_mem`
+    pub heap_atomic_coherent: bool,
     /// heap windows read without a branch (`recomp::HEAP_FLAT`; not in VS / PS)
     pub heap_flat: bool,
     pub res: Option<RawUav>,
