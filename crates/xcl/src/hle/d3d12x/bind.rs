@@ -1162,7 +1162,8 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
 unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList> {
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?.clone();
     let pso = with(this, |s| s.pso);
-    // a pipeline still being built in the background is waited for (its stand-in draws nothing)
+    // a pipeline still being built in the background: its stand-in, which draws nothing
+    // (`resolve_wait` waits for it only up to `XCL_PSO_WAIT_MS`)
     let real = super::pso_async::resolve_wait(pso);
     if !super::real::is_translated_graphics(real) {
         // A finished two-pass MS/GS pipeline is a PC mesh shader pipeline (MS+PS) registered in
@@ -1692,7 +1693,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
         Ok(p as usize)
     };
-    // a pipeline still being built in the background is waited for
+    // (only reached with a translated pipeline: built, `resolve_wait` returns it at once)
     let real = super::pso_async::resolve_wait(pso);
     // a compute shader takes no more arguments from registers than it has (`inline_for`)
     let user_sgprs = if gfx { None } else { super::real::pso_user_sgprs(real) };
@@ -1793,8 +1794,8 @@ mod tests {
         pso_async::submit_lazy(built, false, Box::new(|| 0x1235), 0);
         pso_async::submit_lazy(failed, false, Box::new(|| 0), 0);
         assert!(pso_async::is_pending(building));
-        assert_eq!(pso_async::resolve_wait(built), 0x1235);
-        assert_eq!(pso_async::resolve_wait(failed), failed);
+        assert_eq!(pso_async::wait_built(built), 0x1235);
+        assert_eq!(pso_async::wait_built(failed), failed);
         assert!(!pso_async::is_pending(built) && !pso_async::is_pending(failed));
         // never resolved: still pending (the skip case), then forgotten
         assert!(pso_async::is_pending(building));
@@ -2201,7 +2202,7 @@ void main(uint t : SV_GroupIndex) {
                 real_ok
             }),
         );
-        assert_eq!(pso_async::resolve_wait(standin_ok), real_ok);
+        assert_eq!(pso_async::wait_built(standin_ok), real_ok);
         assert!(!real::is_translated_compute(standin_ok));
         assert!(real::is_translated_compute(real_ok));
 
@@ -2222,7 +2223,7 @@ void main(uint t : SV_GroupIndex) {
         // onto S_fail, and ExecuteIndirect must not enter bind_abi either.
         let standin_fail = 0x7200_0003usize;
         pso_async::submit(standin_fail, true, Box::new(|| 0));
-        assert_eq!(pso_async::resolve_wait(standin_fail), standin_fail);
+        assert_eq!(pso_async::wait_built(standin_fail), standin_fail);
         assert!(!real::is_translated_compute(standin_fail));
 
         reset(list_ptr, 0x7200_0100, standin_fail);
@@ -2316,7 +2317,7 @@ void main(uint t : SV_GroupIndex) {
         let list_ptr = &*fake as *const FakeAdoptedList as *mut c_void;
 
         // With shared stand-ins (`standin::shell`), `dev_create_compute_pso` registers the
-        // title-facing shell in `CONSOLE_COMPUTE`, while `pso_async::resolve_wait` returns the
+        // title-facing shell in `CONSOLE_COMPUTE`, while `pso_async::wait_built` returns the
         // shared driver pipeline when the background build fails.
         let shell_fail = 0x7210_0001usize;
         let shell_ok = 0x7210_0002usize;
@@ -2343,7 +2344,7 @@ void main(uint t : SV_GroupIndex) {
         pso_async::shared(shell_ok, shared_driver);
         real::register_console_compute_for_test(shell_ok);
 
-        assert_eq!(pso_async::resolve_wait(shell_fail), shared_driver);
+        assert_eq!(pso_async::wait_built(shell_fail), shared_driver);
         assert!(!pso_async::is_pending(shell_fail));
         assert!(real::is_console_compute(shell_fail));
         assert!(!real::is_console_compute(shared_driver));
@@ -2365,6 +2366,8 @@ void main(uint t : SV_GroupIndex) {
 
         // 2. Another shell sharing the same driver pipeline whose build succeeds still takes the
         // translated path (caught here by the root-changing guard rather than falling through to PC).
+        // (built first: a bind does not build it, `resolve_wait`)
+        assert_eq!(pso_async::wait_built(shell_ok), real_ok);
         reset(list_ptr, 0x7210_0100, shell_ok);
         unsafe {
             execute_indirect(list_ptr, sig_root_changing, 1, 0, 0, 0, 0);
@@ -2453,7 +2456,7 @@ void main(uint t : SV_GroupIndex) {
                 real_tp
             }),
         );
-        assert_eq!(pso_async::resolve_wait(standin_tp), real_tp);
+        assert_eq!(pso_async::wait_built(standin_tp), real_tp);
         assert!(real::two_pass_of(real_tp).is_some());
         assert!(!real::is_translated_graphics(real_tp));
 
@@ -2531,7 +2534,7 @@ void main(uint t : SV_GroupIndex) {
             let standin = 0x7300_0001usize;
             let pso1_raw = pso1.as_raw() as usize;
             pso_async::submit(standin, true, Box::new(move || pso1_raw));
-            assert_eq!(pso_async::resolve_wait(standin), pso1_raw);
+            assert_eq!(pso_async::wait_built(standin), pso1_raw);
 
             let mut raw_list: *mut c_void = std::ptr::null_mut();
             let iid = windows_sys::core::GUID::from_u128(0x5b160d0f_ac1b_4185_8ba8_b3ae42a5a455);

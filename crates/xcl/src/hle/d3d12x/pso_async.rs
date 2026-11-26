@@ -3,8 +3,9 @@
 //! it loads. When a pipeline's DXIL is not in the disk cache yet, the title gets a stand-in
 //! pipeline (shaders that draw nothing) at once and the real one is built on a worker; binding
 //! (`SetPipelineState`, console list replay, the two-pass lookups) uses the real one as soon
-//! as it is there. A graphics pipeline draws nothing until then; a compute pipeline is waited
-//! for where it is used, a `Dispatch` at its submit (a skipped dispatch would corrupt what it computes).
+//! as it is there. Until then a graphics pipeline draws nothing and a compute pipeline's
+//! dispatches are skipped: a bind never builds a pipeline on the title's thread, and waits for
+//! one only up to `XCL_PSO_WAIT_MS` (`resolve_wait`), so no dispatch is put off to the submit.
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
 use std::collections::HashMap;
@@ -12,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 
 struct Pending {
-    /// the build, until a worker – or a bind that cannot wait for the queue – takes it
+    /// the build, until a worker takes it
     job: Mutex<Option<Job>>,
     /// the same build, for when the pipeline was released (`shader_code`)
     again: Mutex<Option<Job>>,
@@ -38,7 +39,8 @@ struct Pending {
     used: std::sync::atomic::AtomicBool,
     /// the stand-in was released before the real pipeline was built
     orphan: std::sync::atomic::AtomicBool,
-    /// a bind waited for it longer than `wait_budget`: binds go on without it until it is built
+    /// a bind went on without it (past `wait_budget`, or with none): binds do not wait for it
+    /// until it is built
     late: std::sync::atomic::AtomicBool,
     /// its dispatches may be left out while it is built (`image_only`): binds do not wait for it
     spared: std::sync::atomic::AtomicBool,
@@ -346,7 +348,7 @@ fn build_queued(p: &Arc<Pending>) {
         drop_unstarted_job(p);
         return;
     }
-    // (None: a bind took it and builds it itself)
+    // (None: a preload worker took it)
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
         build(p, job, false);
@@ -393,10 +395,9 @@ pub fn submit(standin: usize, compute: bool, job: Job) {
 }
 
 /// Lazy pipeline creation (`XCL_LAZY_PSO=0`: off): a title's pipelines with console shaders get
-/// their stand-in when made and are built when first used – the first bind of a graphics one
-/// sends it to the workers, a compute one is built at its first bind. A retail game makes
-/// ~51 000 pipelines in its first 30 s and uses few; each one built stays in the driver
-/// (~400 KB), and the process ran out of commit.
+/// their stand-in when made and are built when first used – the first bind of one sends it to
+/// the workers. A retail game makes ~51 000 pipelines in its first 30 s and uses few; each one
+/// built stays in the driver (~400 KB), and the process ran out of commit.
 pub fn lazy() -> bool {
     static L: OnceLock<bool> = OnceLock::new();
     *L.get_or_init(|| enabled() && std::env::var("XCL_LAZY_PSO").map_or(true, |v| v != "0"))
@@ -454,11 +455,11 @@ pub fn earlier_used_keys() -> std::collections::HashSet<u64> {
 /// (`used-pipelines.txt` beside the DXIL cache, a key a line).
 ///
 /// A lazy pipeline is built at its first use: until then a graphics one draws nothing, and a
-/// compute one is waited for on the title's thread. A retail title's first frames of its world
-/// use hundreds of pipelines for the first time at once. The pipelines of an earlier run are
-/// built while the title loads instead (`preload`): measured on a build that skips a dispatch
-/// instead of waiting for its pipeline, ~2 170 dispatches were skipped in those frames without
-/// this and 94 – 150 with it.
+/// compute one's dispatches are skipped (after a wait of up to `XCL_PSO_WAIT_MS`). A retail
+/// title's first frames of its world use hundreds of pipelines for the first time at once. The
+/// pipelines of an earlier run are built while the title loads instead (`preload`): measured on
+/// a build that skips a dispatch instead of waiting for its pipeline, ~2 170 dispatches were
+/// skipped in those frames without this and 94 – 150 with it.
 mod used {
     use std::collections::HashSet;
     use std::io::Write;
@@ -568,7 +569,7 @@ fn preload() -> Option<&'static Preload> {
                         drop_unstarted_job(&p);
                         continue;
                     }
-                    // (None: a bind took it and builds it itself)
+                    // (None: a worker a bind sent it to took it)
                     let job = p.job.lock().unwrap().take();
                     if let Some(job) = job {
                         build(&p, job, true);
@@ -625,8 +626,8 @@ mod used_tests {
         calls.end(20, 8, now);
     }
 
-    /// While a bind waits for a pipeline still being built, the title is held (`title_held`):
-    /// `kernelx::Sleep` does not count that time.
+    /// While a bind waits (within its budget) for a pipeline still being built, the title is held
+    /// (`title_held`): `kernelx::Sleep` does not count that time.
     #[test]
     fn a_bind_waiting_for_a_build_holds_the_title() {
         let standin = 0x7E57_B002usize;
@@ -637,9 +638,9 @@ mod used_tests {
             let _ = finish.recv();
             0x5252
         }), 0);
-        let bind = std::thread::spawn(move || resolve_wait_for(standin, None));
+        let bind = std::thread::spawn(move || resolve_wait_for(standin, Some(std::time::Duration::from_secs(30))));
         building.recv_timeout(std::time::Duration::from_secs(10)).expect("the pipeline is being built");
-        // (built in the bind, or by a worker with the bind about to wait for it)
+        // (built by a worker, with the bind about to wait for it)
         let t = std::time::Instant::now();
         while !title_held() && t.elapsed() < std::time::Duration::from_secs(10) {
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -662,9 +663,11 @@ mod used_tests {
             shared(s, driver);
             assert_eq!(entry(s).unwrap().stand(s), driver);
         }
-        assert_eq!(resolve_wait_for(fails, None), driver, "its build failed");
+        assert_eq!(resolve_wait_for(fails, None), driver, "not built yet");
+        assert_eq!(wait_built(fails), driver, "its build failed");
         assert_eq!(resolve(fails), driver);
-        assert_eq!(resolve_wait_for(builds, None), 0x1234);
+        assert_eq!(resolve_wait_for(builds, None), driver, "not built yet");
+        assert_eq!(wait_built(builds), 0x1234);
         assert_eq!(resolve_for_bind(builds), 0x1234);
         // (0x1234 is no pipeline: taken, not released)
         assert_eq!((released(fails), released(builds)), (0, 0x1234));
@@ -672,8 +675,8 @@ mod used_tests {
 
     /// A bind does not wait for a compute pipeline that writes only images: it gets the stand-in
     /// at once, with no budget, the build goes to the workers
-    /// unwanted, and once built the bind gets the real one. Without `image_only` the same bind
-    /// waits until the pipeline is built.
+    /// unwanted, and once built the bind gets the real one. Without `image_only` a bind with a
+    /// budget waits for it.
     #[test]
     fn a_bind_does_not_wait_for_a_pipeline_that_writes_only_images() {
         let (spared, waited) = (0x7E57_B0A1usize, 0x7E57_B0A2usize);
@@ -703,12 +706,12 @@ mod used_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(resolve_wait_for(spared, None), 0x5A5A, "built by a worker");
-        // the same build without the mark: the bind waits for it
+        // the same build without the mark: a bind with a budget waits for it
         submit_lazy(waited, true, Box::new(|| {
             std::thread::sleep(std::time::Duration::from_millis(100));
             0x5B5B
         }), 0);
-        assert_eq!(resolve_wait_for(waited, None), 0x5B5B);
+        assert_eq!(resolve_wait_for(waited, Some(std::time::Duration::from_secs(30))), 0x5B5B);
         let _ = released(spared);
         let _ = released(waited);
     }
@@ -803,6 +806,41 @@ mod used_tests {
         let _ = released(standin);
     }
 
+    /// A bind with no budget neither builds a cold pipeline on its own thread nor waits for it,
+    /// compute or graphics: it gets the stand-in at once, a worker builds the pipeline wanted, and
+    /// once built binds get the real one.
+    #[test]
+    fn a_bind_with_no_budget_neither_builds_nor_waits_for_the_pipeline() {
+        for (standin, compute, real) in [(0x7E57_B0C1usize, true, 0x5C5Cusize), (0x7E57_B0C2, false, 0x5D5D)] {
+            let (go, finish) = mpsc::channel::<()>();
+            let (tx, rx) = mpsc::channel();
+            submit_lazy(standin, compute, Box::new(move || {
+                let _ = tx.send((std::thread::current().name().map(str::to_owned), wanted_here()()));
+                let _ = finish.recv();
+                real
+            }), 0);
+            // (on a thread: a bind that builds or waits would wait for `go`, below)
+            let (bound_tx, bound) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = bound_tx.send((resolve_wait_for(standin, None), resolve_wait_for(standin, None)));
+            });
+            let binds = bound.recv_timeout(std::time::Duration::from_secs(5));
+            if binds.is_err() {
+                let _ = go.send(());
+            }
+            assert_eq!(binds.expect("the binds built or waited for the pipeline"), (standin, standin), "still being built: the stand-in");
+            let (thread, wanted) = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("a worker builds it");
+            assert!(thread.as_deref().is_some_and(|n| n.starts_with("xcl-pso")), "built on {thread:?}, not on a worker");
+            assert!(wanted, "the title binds it: its build is wanted");
+            assert!(is_pending(standin));
+            go.send(()).unwrap();
+            assert_eq!(wait_built(standin), real);
+            assert_eq!(resolve_wait_for(standin, None), real, "built: the real one");
+            assert!(!is_pending(standin));
+            let _ = released(standin);
+        }
+    }
+
     /// A compile a worker's build starts is wanted once a bind waits for the build – asked from
     /// another thread, as the DXC workers do; a thread that builds nothing (no title runs here)
     /// wants nothing.
@@ -820,7 +858,7 @@ mod used_tests {
         }));
         let wanted = rx.recv().unwrap();
         assert!(!wanted(), "nobody waits yet");
-        assert_eq!(resolve_wait_for(standin, None), 0x5454);
+        assert_eq!(resolve_wait_for(standin, Some(std::time::Duration::from_secs(30))), 0x5454);
         assert!(wanted());
         assert!(!wanted_here()());
         let _ = released(standin);
@@ -842,7 +880,7 @@ mod used_tests {
         }));
         started.recv().unwrap();
         assert!(!build_is_wanted(), "this thread builds nothing");
-        assert_eq!(resolve_wait_for(standin, None), 0x5353, "the bind's wait reached the build");
+        assert_eq!(resolve_wait_for(standin, Some(std::time::Duration::from_secs(30))), 0x5353, "the bind's wait reached the build");
         let _ = released(standin);
     }
 
@@ -870,7 +908,8 @@ mod used_tests {
         assert_eq!(resolve(known), 0x4321);
         assert!(is_pending(unknown), "nobody used it and no earlier run did");
         assert!(!used::noted(unknown_key));
-        assert_eq!(resolve_wait(unknown), 0x4322);
+        assert_eq!(resolve_wait_for(unknown, None), unknown, "a bind does not wait for it");
+        assert_eq!(wait_built(unknown), 0x4322);
         assert!(used::noted(unknown_key) && used::noted(known_key), "a first use is kept for the next run");
         released(known);
         released(unknown);
@@ -1350,50 +1389,39 @@ pub fn resolve(pso: usize) -> usize {
     }
 }
 
-/// `resolve`, waiting for a pipeline still being built – built here if no worker has started
-/// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
+/// `resolve` for a bind that needs the pipeline itself (a dispatch, a draw): waits up to
+/// `wait_budget` for a pipeline still being built, else gets the stand-in at once.
 pub fn resolve_wait(pso: usize) -> usize {
     resolve_wait_for(pso, wait_budget())
 }
 
-/// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
+/// `resolve_wait`, waiting at most `budget` (None: not at all).
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
     if p.spared.load(Ordering::Acquire) {
         return resolve_spared(&p, pso);
     }
+    let Some(budget) = budget else { return resolve_unwaited(&p, pso) };
     // (the title's thread is held from here until the pipeline is built or the budget is over)
     let _held = (!*p.done.lock().unwrap()).then(Held::new);
-    if let Some(budget) = budget {
-        return resolve_within(&p, pso, budget);
-    }
-    let job = p.job.lock().unwrap().take();
-    if let Some(job) = job {
-        run(&p, job);
-    }
-    p.want();
-    let mut done = p.done.lock().unwrap();
-    while !*done {
-        done = p.cv.wait(done).unwrap();
-    }
-    drop(done);
-    p.take(pso)
+    resolve_within(&p, pso, budget)
 }
 
-/// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset or 0: until
-/// it is built). A retail game builds compute programs on its own threads: the driver takes up to
-/// 30 s for the biggest translated ones, and the title's watchdog ends it when its main thread
-/// has been held 30 s.
-pub(super) fn wait_budget() -> Option<std::time::Duration> {
+/// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset or 0: not at
+/// all, `resolve_unwaited`). A retail game builds compute programs on its own threads: the driver
+/// takes up to 30 s for the biggest translated ones, and the title's watchdog ends it when its
+/// main thread has been held 30 s.
+fn wait_budget() -> Option<std::time::Duration> {
     static B: OnceLock<Option<std::time::Duration>> = OnceLock::new();
     *B.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map(std::time::Duration::from_millis))
 }
 
-/// Binds wait at most `XCL_PSO_WAIT_MS`: a dispatch is then not put off to the submit
-/// (`list_x::defer`), where it would only wait as long.
-pub fn waits_bounded() -> bool {
-    wait_budget().is_some()
+/// Whether a bind or a submit waits for a pipeline still being built until it is built. Not since
+/// a bind with no budget gets the stand-in at once (`resolve_unwaited`): `list_x::defer` then puts
+/// no call off to the submit.
+pub fn waits_until_built() -> bool {
+    false
 }
 
 /// `resolve_wait` for at most `budget`: the build goes to the workers (not this thread), and a
@@ -1424,6 +1452,35 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
         crate::xlog_warn!("D3D12.X: a pipeline still being built after {} ms: its binds go on without it until it is built ({} so far)", budget.as_millis(), n + 1);
     }
     p.stand(pso)
+}
+
+/// `resolve_wait` with no budget: the real pipeline once built, else the stand-in at once (its
+/// dispatches and draws are left out), with the build sent to the workers.
+///
+/// The title's thread neither builds the pipeline nor waits for it. A bind that built a cold
+/// pipeline itself and waited for it kept a retail title's thread in the driver's compile of a
+/// 2.4 MB compute program for 466 s, with no frame shown after it (it never finished). Unlike
+/// `resolve_spared` the build is `wanted`: the title binds it now, so it goes before the builds
+/// made ahead and does not wait for free commit (up to `real::big_compile_turn`'s cap).
+fn resolve_unwaited(p: &Arc<Pending>, pso: usize) -> usize {
+    match p.real.load(Ordering::Acquire) {
+        0 => {
+            // (before it is sent: the worker's compiles see it wanted from their start)
+            p.want();
+            if !p.sent.swap(true, Ordering::AcqRel) {
+                enqueue(p.clone());
+            }
+            if !*p.done.lock().unwrap() && !p.late.swap(true, Ordering::AcqRel) {
+                static N: AtomicUsize = AtomicUsize::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                if n < 16 || n.is_power_of_two() {
+                    crate::xlog_info!("D3D12.X: a pipeline bound while it is still being built: its binds go on without it until it is ({} so far)", n + 1);
+                }
+            }
+            p.stand(pso)
+        }
+        r => r,
+    }
 }
 
 /// `XCL_PSO_IMAGE_SKIP=1`: a bind does not wait for a big compute program that writes nothing
@@ -1481,7 +1538,9 @@ pub fn describe(pso: usize) -> Option<String> {
         (false, key) => format!("a graphics pipeline {pso:#x} (shaders {key:016x}){state}"),
     })
 }
-/// For binding: compute pipelines are waited for, graphics ones are not.
+
+/// For binding: compute pipelines are waited for up to `XCL_PSO_WAIT_MS` (`resolve_wait`),
+/// graphics ones are not.
 pub fn resolve_for_bind(pso: usize) -> usize {
     match entry(pso) {
         Some(p) if p.compute => resolve_wait(pso),
@@ -1508,6 +1567,26 @@ pub fn released(pso: usize) -> usize {
     }
     drop_unstarted_job(&p);
     0
+}
+
+/// The pipeline of stand-in `pso` once its build is over: the real one, or the stand-in's
+/// driver pipeline when the build failed; `pso` itself at once when it is no stand-in (also with
+/// `XCL_ASYNC_PSO=0`: pipelines are built in the call, none is pending). Waits as long as the
+/// build takes – for tools and tests, never for a bind (`resolve_wait`).
+pub fn wait_built(pso: usize) -> usize {
+    let Some(p) = entry(pso) else { return pso };
+    if !p.sent.swap(true, Ordering::AcqRel) {
+        enqueue(p.clone());
+    }
+    let mut done = p.done.lock().unwrap();
+    while !*done {
+        done = p.cv.wait(done).unwrap();
+    }
+    drop(done);
+    match p.real.load(Ordering::Acquire) {
+        0 => p.stand(pso),
+        r => r,
+    }
 }
 
 /// `pso` is a stand-in whose real pipeline is still being built.

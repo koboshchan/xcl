@@ -2787,11 +2787,11 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
 
 /// Gives a dispatch whose pipeline is still being built a segment of its own, recorded at the submit.
 pub(super) unsafe fn defer(list: *mut c_void, what: Deferred) -> bool {
-    // With bounded waits (`XCL_PSO_WAIT_MS`) the call is recorded now and its bind waits at most
-    // that long, as before calls were put off: a segment per unbuilt call ran a retail title out
-    // of command list memory (Close: E_OUTOFMEMORY, then the device was removed, 0x887a0001)
-    // when its world start bound thousands of them with `XCL_PSO_WAIT_MS=1`.
-    if super::pso_async::waits_bounded() {
+    // Not while no bind or submit waits for a pipeline until it is built (`pso_async::resolve_wait`
+    // waits at most `XCL_PSO_WAIT_MS`): the call would only be skipped later, at the submit, and
+    // each put-off call costs a segment (a PC command list). Thousands of them ran a retail title
+    // out of command lists (#2581). It is recorded now and skipped as a stand-in's.
+    if !super::pso_async::waits_until_built() {
         return false;
     }
     if split(list, Some(what)).is_none() {
@@ -7231,7 +7231,7 @@ mod tests {
     }
 
     #[test]
-    fn a_dispatch_with_a_pipeline_still_building_waits_at_the_submit() {
+    fn a_dispatch_with_a_pipeline_still_building_is_recorded_at_once_and_skipped() {
         use super::super::{bind, pso_async, title_list};
         use std::time::{Duration, Instant};
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
@@ -7271,31 +7271,32 @@ mod tests {
             bind::reset(pc0, alloc.as_raw() as usize, standin);
             let wrap = title_list::wrap(pc0);
 
+            // (no `XCL_PSO_WAIT_MS`: nothing waits for the build, so no dispatch is put off to the
+            // submit; each is recorded at once and skipped as a stand-in's)
             const DISPATCHES: usize = 210;
-            let mut segs = vec![pc0];
+            let skipped = bind::counts_snapshot()[4];
             for n in 1..=DISPATCHES {
                 let t = Instant::now();
-                bind::dispatch(*segs.last().unwrap(), 1, 1, 1);
+                bind::dispatch(pc0, 1, 1, 1);
                 assert!(t.elapsed() < Duration::from_millis(700), "dispatch {n} waited for the build ({:?})", t.elapsed());
-                segs.clear();
-                assert!(title_list::push_segments(wrap, &mut segs));
             }
-            assert_eq!(segs.len(), 1 + 2 * DISPATCHES, "the list before each dispatch, the dispatch, the list after it");
+            let mut segs = Vec::new();
+            assert!(title_list::push_segments(wrap, &mut segs));
+            assert_eq!(segs.len(), 1, "a dispatch was put off to the submit");
+            assert!(bind::counts_snapshot()[4] >= skipped + DISPATCHES as u64, "each dispatch is skipped at the bind");
             assert!(pso_async::is_pending(standin));
 
             let close_fn: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(9));
             assert_eq!(close_fn(wrap), 0);
             assert!(pso_async::is_pending(standin), "Close waited for the build");
 
-            let skipped = bind::counts_snapshot()[4];
-            let build = std::thread::spawn(|| {
-                std::thread::sleep(Duration::from_millis(300));
-                BUILD.store(true, Ordering::Release);
-            });
             record_deferred(wrap);
-            assert!(!pso_async::is_pending(standin), "the submit waits for the build");
-            assert!(bind::counts_snapshot()[4] > skipped, "the dispatch of a build that failed is skipped, at the submit");
-            build.join().unwrap();
+            assert!(pso_async::is_pending(standin), "the submit waited for the build");
+            BUILD.store(true, Ordering::Release);
+            let t = Instant::now();
+            while pso_async::is_pending(standin) && t.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
 
             type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
             let exec: ExecFn = std::mem::transmute(*(*(queue.as_raw() as *const *const usize)).add(PC_QUEUE_EXECUTE_COMMAND_LISTS));
