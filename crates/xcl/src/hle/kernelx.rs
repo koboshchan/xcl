@@ -1218,6 +1218,25 @@ pub fn physical_page_at(va: usize) -> bool {
     AWAY.lock().unwrap().as_ref().is_some_and(|a| a.at.contains_key(&(va & !(PHYS_PAGE - 1))))
 }
 
+/// The live title physical page number mapped at the 64 KiB page holding `va`, if any.
+pub fn physical_page_number(va: usize) -> Option<usize> {
+    let g = AWAY.lock().unwrap();
+    g.as_ref()?.title_page(va & !(PHYS_PAGE - 1))
+}
+
+/// The live title physical page numbers mapped at `count` consecutive 64 KiB pages from `first`.
+/// Returns an empty `Vec` when no title physical-page mappings exist.
+pub fn physical_pages(first: usize, count: usize) -> Vec<Option<usize>> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let g = AWAY.lock().unwrap();
+    let Some(a) = g.as_ref().filter(|a| !a.title.is_empty()) else {
+        return Vec::new();
+    };
+    (0..count).map(|i| a.title_page(first.wrapping_add(i.wrapping_mul(PHYS_PAGE)))).collect()
+}
+
 /// Counts the calls that map or unmap physical pages in a GPU view (`mirrors`): what
 /// `physical_page_at` says there may have changed.
 static GPU_VIEW_MAP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
