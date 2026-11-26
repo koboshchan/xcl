@@ -218,6 +218,14 @@ pub fn window_views_failed() -> bool {
     WINDOW_VIEWS_FAILED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+static WINDOW_VIEWS_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the memory windows' raw UAV descriptors are published at `MEM_HEAP_BASE + k` in
+/// the shared shader-visible descriptor heap (`set_window_views` succeeded).
+pub fn window_views_ready() -> bool {
+    WINDOW_VIEWS_READY.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// The memory windows' buffers `(resource, bytes)` as raw UAVs at `MEM_HEAP_BASE + k` of the
 /// shared heap, made now if need be (`Options::heap_windows`: shaders take window k from there).
 /// Active windows (`bytes > 0`) in wider layouts (8 / 16) must all have a valid buffer; unused
@@ -241,6 +249,7 @@ pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -
         }
         true
     };
+    WINDOW_VIEWS_READY.store(ok, std::sync::atomic::Ordering::Release);
     if !ok {
         WINDOW_VIEWS_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
         crate::xlog_warn!("memory windows: could not bind {count} window(s) in the shared descriptor heap");

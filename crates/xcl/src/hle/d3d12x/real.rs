@@ -209,14 +209,16 @@ pub(super) fn uma_window_buffer(p: usize, len: usize) -> Option<(usize, u64)> {
     if p - base + len > size {
         return None;
     }
-    Some((UMA_BUFFER.lock().ok()?.get(k)?.0, (p - base) as u64))
+    let buf = UMA_BUFFER.lock().ok()?.get(k)?.0;
+    (buf != 0).then(|| (buf, (p - base) as u64))
 }
 
 /// GPU virtual address of a UMA address (None: not in UMA or not open on the GPU).
 pub fn uma_va_of(p: usize) -> Option<u64> {
     let u = crate::gpu::uma::get()?;
     let k = u.window_of(p)?;
-    Some(*uma_window_vas().get(k)? + (p - u.window(k).0) as u64)
+    let base = *uma_window_vas().get(k)?;
+    (base != 0).then(|| base + (p - u.window(k).0) as u64)
 }
 
 /// What the start-up check of the coherent UMA windows found (`check_uma_import`): empty – not
@@ -7980,6 +7982,7 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
     if n == 0 {
         dispatch_chain::allocator_reset(this as usize);
         super::shader_code::allocator_reset(this as usize);
+        super::console_list::allocator_reset(this);
         super::alloc_pool::forget(this as usize);
         super::list_x::on_allocator_release(this as usize);
     }
@@ -7992,23 +7995,21 @@ pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
     let f: F = std::mem::transmute(orig_fn(raw, slot_of(raw, "Reset")));
     let hr = f(raw);
     if hr >= 0 {
+        // Only now is the GPU done with recordings backed by `raw` (`alloc_pool` may have put
+        // an older backing allocator aside during a title `Reset` while its submits still run).
         dispatch_chain::allocator_reset(raw as usize);
         super::shader_code::allocator_reset(raw as usize);
+        super::console_list::allocator_reset(raw);
     }
     hr
 }
 
 unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
     // (lists may still hold recordings on it that the title submits again: `alloc_pool`)
-    let hr = match super::alloc_pool::title_reset(this) {
+    match super::alloc_pool::title_reset(this) {
         Some(hr) => hr,
         None => reset_pc_allocator(this),
-    };
-    if hr >= 0 {
-        // the GPU is done with what lists recorded from this allocator used
-        super::console_list::allocator_reset(this);
     }
-    hr
 }
 
 // ---------------------------------------------------------------------------------------

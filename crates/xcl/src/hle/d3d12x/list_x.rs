@@ -2890,6 +2890,7 @@ pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
             super::bind::dispatch_dropped();
             continue;
         }
+        super::bind::rebind_allocator(seg, own as usize);
         reset_copy_scratch(seg);
         restore_bindings(seg, &bindings, ty);
         if ty == D3D12_COMMAND_LIST_TYPE_DIRECT {
@@ -3651,6 +3652,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if reset_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
     }
+    super::bind::rebind_allocator(target, alloc);
     reset_copy_scratch(target);
     let bindings = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(target as usize))).map(|s| s.bindings.clone());
     if let Some(b) = bindings {

@@ -116,12 +116,24 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
     f(STATES.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default())
 }
 
+/// Resolve the PC backing allocator that actually owns `list`'s recording (`alloc_pool` can swap
+/// a title allocator to a new PC allocator while recordings on the old backing are still in flight,
+/// so UMA arena blocks and scratch buffers must stay pinned to the backing allocator until
+/// `reset_pc_allocator` genuinely resets it).
+fn backing_allocator(list: *mut c_void, allocator: usize) -> usize {
+    if allocator == 0 || !super::alloc_pool::enabled() {
+        return allocator;
+    }
+    super::alloc_pool::recording_backing(list as usize).unwrap_or_else(|| super::alloc_pool::current(allocator))
+}
+
 /// The list was created or reset onto `allocator` with `initial_pso`: the previous
 /// recording's memory is the previous allocator's until that one is reset, and pipeline
 /// and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
 pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
+    let backing = backing_allocator(list, allocator);
     let (old, blocks, res_bufs) = with(list, |s| {
-        let old = std::mem::replace(&mut s.allocator, allocator);
+        let old = std::mem::replace(&mut s.allocator, backing);
         s.arena = Default::default();
         s.pso = initial_pso;
         s.layout = None;
@@ -132,6 +144,28 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.rs_cs = 0;
         s.heaps = [0; 2];
         // (the scratch blocks are in `res_retired` already)
+        (s.scratch, s.scratch_used, s.scratch_taken) = (None, 0, 0);
+        let mut res_bufs = std::mem::take(&mut s.res_retired);
+        if let Some(b) = s.res_buf.take() {
+            res_bufs.push(b);
+        }
+        (old, std::mem::take(&mut s.uma), res_bufs)
+    });
+    console_list::hold_until_reset(old, blocks);
+    hold_res_until_reset(old, res_bufs);
+}
+
+/// Update `list`'s tracked backing allocator after `alloc_pool::reset_list` rotates `list` onto a
+/// fresh PC command allocator (e.g., `KickoffX` or `record_deferred`), retiring any prior
+/// recording buffers on the old allocator first without clearing pipeline/root bindings.
+pub(super) fn rebind_allocator(list: *mut c_void, allocator: usize) {
+    let backing = backing_allocator(list, allocator);
+    let (old, blocks, res_bufs) = with(list, |s| {
+        if s.allocator == backing {
+            return (0, Vec::new(), Vec::new());
+        }
+        let old = std::mem::replace(&mut s.allocator, backing);
+        s.arena = Default::default();
         (s.scratch, s.scratch_used, s.scratch_taken) = (None, 0, 0);
         let mut res_bufs = std::mem::take(&mut s.res_retired);
         if let Some(b) = s.res_buf.take() {
@@ -162,11 +196,12 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
 /// deferred mid-list split (`to` records into `allocator` with its own fresh UMA arena while
 /// `from` retains its previously allocated blocks until `allocator` resets).
 pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: usize) {
+    let backing = backing_allocator(to, allocator);
     let (layout, args, layout_gfx, args_gfx, rs_gfx, rs_cs, pso, heaps) = with(from, |s| {
         (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.rs_cs, s.pso, s.heaps)
     });
-    let (old, blocks) = with(to, |s| {
-        let old = std::mem::replace(&mut s.allocator, allocator);
+    let (old, blocks, res_bufs) = with(to, |s| {
+        let old = std::mem::replace(&mut s.allocator, backing);
         s.arena = Default::default();
         s.layout = layout;
         s.args = args;
@@ -176,9 +211,15 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         s.rs_cs = rs_cs;
         s.pso = pso;
         s.heaps = heaps;
-        (old, std::mem::take(&mut s.uma))
+        (s.scratch, s.scratch_used, s.scratch_taken) = (None, 0, 0);
+        let mut res_bufs = std::mem::take(&mut s.res_retired);
+        if let Some(b) = s.res_buf.take() {
+            res_bufs.push(b);
+        }
+        (old, std::mem::take(&mut s.uma), res_bufs)
     });
     console_list::hold_until_reset(old, blocks);
+    hold_res_until_reset(old, res_bufs);
 }
 
 /// A submit is about to wait for the pipeline `this` has bound.
@@ -714,6 +755,100 @@ void main() {
 }
 "#;
 
+/// Descriptor-heap + inline root-constants form of `SCALE_ARGS_HLSL`: reads `src` and `cnt`
+/// through the shared descriptor heap's raw window UAVs (`MEM_HEAP_BASE + win`, so unmapped
+/// sparse tiles safely read as zero instead of faulting on a raw root UAV) and passes all scalar
+/// parameters inline in `b0` (zero UMA arena allocation).
+pub(super) const SCALE_ARGS_HEAP_HLSL: &str = r#"cbuffer Args : register(b0) {
+    uint count, stride, offset, split, cap, src_slot, src_off, has_cnt, cnt_slot, cnt_off;
+};
+RWByteAddressBuffer dst : register(u0);
+[numthreads(64, 1, 1)]
+void main(uint tid : SV_DispatchThreadID) {
+    if (tid >= count) return;
+    RWByteAddressBuffer src = ResourceDescriptorHeap[src_slot];
+    uint live = count;
+    if (has_cnt != 0u) {
+        RWByteAddressBuffer cnt = ResourceDescriptorHeap[cnt_slot];
+        live = min(count, cnt.Load(cnt_off));
+    }
+    uint s = src_off + tid * stride, d = tid * stride, m = d + count * stride;
+    for (uint i = 0u; i < stride; i += 4u) {
+        uint w = src.Load(s + i);
+        dst.Store(d + i, w);
+        dst.Store(m + i, w);
+    }
+    uint3 g = src.Load3(s + offset);
+    uint n = 0u;
+    if (tid < live && g.x != 0u && g.y != 0u && g.z != 0u) {
+        n = min(g.x, cap);
+        n = g.y > cap / n ? cap : n * g.y;
+        n = g.z > cap / n ? cap : n * g.z;
+    }
+    dst.Store3(d + offset, uint3(n, 1u, 1u));
+    dst.Store3(m + offset, uint3(n * split, 1u, 1u));
+}
+"#;
+
+/// Descriptor-heap + inline root-constants form of `GUARD_ARGS_HLSL`.
+pub(super) const GUARD_ARGS_HEAP_HLSL: &str = r#"cbuffer Args : register(b0) {
+    uint src_slot, src_off, most, lim_off;
+};
+RWByteAddressBuffer dst : register(u0);
+RWByteAddressBuffer lim : register(u1);
+[numthreads(1, 1, 1)]
+void main() {
+    RWByteAddressBuffer src = ResourceDescriptorHeap[src_slot];
+    uint3 g = src.Load3(src_off);
+    uint3 out_g = uint3(0u, 0u, 0u);
+    uint limit = 0u;
+    if (g.x != 0u && g.y != 0u && g.z != 0u && all(g <= most)) {
+        if (g.x <= most / g.y) {
+            if (g.x * g.y <= most / g.z) {
+                if (g.x > 65535u && g.y == 1u && g.z <= 65535u) {
+                    uint rows = (g.x - 1u) / 65535u + 1u;
+                    if (rows <= 65535u) {
+                        out_g = uint3(65535u, rows, g.z);
+                        limit = g.x;
+                    } else {
+                        out_g = min(g, 65535u.xxx);
+                    }
+                } else {
+                    out_g = min(g, 65535u.xxx);
+                }
+            }
+        }
+    }
+    dst.Store3(0, out_g);
+    if (lim_off != 0u) {
+        lim.Store(lim_off, limit);
+    }
+}
+"#;
+
+/// Top byte bound of a raw window UAV created by `runner::raw_window_uav`.
+const RAW_WINDOW_UAV_MAX: usize = (1usize << 32) - 32;
+
+/// Map a 4-byte-aligned UMA host address + byte span to `(heap_slot, byte_offset)` within the
+/// shared descriptor heap's window UAVs (`MEM_HEAP_BASE + win`), respecting `raw_window_uav`'s
+/// 32-byte top margin on 4 GiB windows.
+fn uma_heap_slot_off(u: &crate::gpu::uma::Uma, p: usize, span: usize) -> Option<(u32, u32)> {
+    if p % 4 != 0 || span == 0 {
+        return None;
+    }
+    let k = u.window_of(p)?;
+    if k >= crate::gpu::uma::MAX_HEAP_WINDOWS {
+        return None;
+    }
+    let (base, size) = u.window(k);
+    let off = p.checked_sub(base)?;
+    let end = off.checked_add(span)?;
+    if end > size.min(RAW_WINDOW_UAV_MAX) {
+        return None;
+    }
+    Some((crate::gpu::recomp::MEM_HEAP_BASE + k as u32, off as u32))
+}
+
 /// The groups of an indirect dispatch above which they are not the title's (`GUARD_ARGS_HLSL`):
 /// a 4K target in groups of 2x2 pixels is 2.1 million.
 const MOST_GROUPS: u32 = 1 << 22;
@@ -727,12 +862,85 @@ fn most_groups() -> u32 {
 /// Align a GPU virtual address down to a 256-byte root UAV base and its 4-byte-aligned shader
 /// byte offset (`RWByteAddressBuffer::Load` requires 4-byte alignment, and D3D12 root raw UAVs
 /// require >= 16-byte alignment; UMA window buffers are 64 KiB-aligned so `va & !255` stays in
-/// the same buffer and sparse tile).
+/// the same buffer and sparse tile). Rejects addresses `< 256` so the aligned base is never 0.
 fn align_root_uav(va: u64) -> Result<(u64, u32), String> {
-    if va % 4 != 0 {
-        return Err(format!("indirect buffer address {va:#x} is not 4-byte aligned"));
+    if va < 256 || va % 4 != 0 {
+        return Err(format!("indirect buffer address {va:#x} is invalid or not 4-byte aligned"));
     }
     Ok((va & !255, (va & 255) as u32))
+}
+
+type ArgsPipelines = Mutex<Option<HashMap<usize, (ID3D12RootSignature, ID3D12PipelineState)>>>;
+
+unsafe fn heap_args_root_signature(dev: &ID3D12Device, num_consts: u32, uav_regs: &[u32]) -> Result<ID3D12RootSignature, String> {
+    let mut params = Vec::with_capacity(1 + uav_regs.len());
+    params.push(D3D12_ROOT_PARAMETER1 {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: num_consts },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    });
+    for &reg in uav_regs {
+        params.push(D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: reg,
+                    RegisterSpace: 0,
+                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        });
+    }
+    let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+        Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+        Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+            Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                NumParameters: params.len() as u32,
+                pParameters: params.as_ptr(),
+                NumStaticSamplers: 0,
+                pStaticSamplers: std::ptr::null(),
+                Flags: D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED,
+            },
+        },
+    };
+    let mut blob: Option<windows::Win32::Graphics::Direct3D::ID3DBlob> = None;
+    D3D12SerializeVersionedRootSignature(&desc, &mut blob, None).map_err(|e| format!("heap args root signature serialize: {e}"))?;
+    let blob = blob.ok_or("heap args root signature blob")?;
+    dev.CreateRootSignature(0, std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()))
+        .map_err(|e| format!("heap args root signature create: {e}"))
+}
+
+unsafe fn heap_args_pipeline(dev: &ID3D12Device, hlsl: &str, label: &str, num_consts: u32, uav_regs: &[u32], cache: &'static ArgsPipelines) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+    let key = dev.as_raw() as usize;
+    if let Some(pair) = cache.lock().unwrap().as_ref().and_then(|m| m.get(&key).cloned()) {
+        return Ok(pair);
+    }
+    let dxil = crate::gpu::recomp::dxc::compile_cached(hlsl, "main", "cs_6_6")?.0;
+    let rs = heap_args_root_signature(dev, num_consts, uav_regs)?;
+    let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+        CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const c_void, BytecodeLength: dxil.len() },
+        ..Default::default()
+    };
+    let res_pso: Result<ID3D12PipelineState, _> = dev.CreateComputePipelineState(&cdesc);
+    std::mem::ManuallyDrop::drop(&mut cdesc.pRootSignature);
+    let pso = res_pso.map_err(|e| format!("{label} heap pso create: {e}"))?;
+    let _ = pso.SetName(&windows::core::HSTRING::from(label));
+    cache.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, (rs.clone(), pso.clone()));
+    Ok((rs, pso))
+}
+
+unsafe fn guard_indirect_heap_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+    static CACHE: ArgsPipelines = Mutex::new(None);
+    heap_args_pipeline(dev, GUARD_ARGS_HEAP_HLSL, "xcl guard_dispatch_args", 4, &[0, 1], &CACHE)
+}
+
+unsafe fn scale_indirect_heap_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+    static CACHE: ArgsPipelines = Mutex::new(None);
+    heap_args_pipeline(dev, SCALE_ARGS_HEAP_HLSL, "xcl make_scaled_args_buffer", 10, &[0], &CACHE)
 }
 
 unsafe fn guard_indirect_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
@@ -770,13 +978,31 @@ unsafe fn guard_dispatch_args(this: *mut c_void, list: &ID3D12GraphicsCommandLis
         return Err("command bundles cannot record indirect argument barriers".into());
     }
     let dev = super::real::list_device(this).ok_or("no device")?;
-    let (rs, pso) = guard_indirect_pipeline(&dev)?;
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     super::real::uma_window_buffer(src, 12).ok_or("the indirect arguments are not in one memory window")?;
+    let (dst, dst_off) = scratch_args(this, &dev, 256)?;
+    let dst_va = dst.GetGPUVirtualAddress() + dst_off;
+    let lim_off = (crate::gpu::recomp::IO_GROUP_LIMIT * 4) as u32;
+    if super::console_heap::window_views_ready() {
+        if let Some((src_slot, src_off)) = uma_heap_slot_off(u, src, 12) {
+            let (rs, pso) = guard_indirect_heap_pipeline(&dev)?;
+            let consts = [src_slot, src_off, most_groups(), lim_off];
+            super::list_x::ensure_view_heap(this);
+            // the title's writes of the arguments before this (`fresh_indirect_arguments`)
+            emit_uav_and_transition(list, &dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            list.SetComputeRootSignature(&rs);
+            list.SetPipelineState(&pso);
+            list.SetComputeRoot32BitConstants(0, consts.len() as u32, consts.as_ptr() as *const c_void, 0);
+            list.SetComputeRootUnorderedAccessView(1, dst_va);
+            list.SetComputeRootUnorderedAccessView(2, dispatch_io_va);
+            list.Dispatch(1, 1, 1);
+            emit_transition_and_uav(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+            return Ok((dst, dst_off));
+        }
+    }
+    let (rs, pso) = guard_indirect_pipeline(&dev)?;
     let src_va = super::real::uma_va_of(src).ok_or("unified memory is not open on the GPU")?;
     let (src_base, src_off) = align_root_uav(src_va)?;
-    let (dst, dst_off) = scratch_args(this, &dev, 256)?;
-    let lim_off = (crate::gpu::recomp::IO_GROUP_LIMIT * 4) as u32;
     let consts = [src_off, most_groups(), 0, lim_off];
     let p = arena_take(this, u, std::mem::size_of_val(&consts), 256).ok_or("unified memory is full")?;
     std::ptr::copy_nonoverlapping(consts.as_ptr().cast::<u8>(), p, std::mem::size_of_val(&consts));
@@ -787,7 +1013,7 @@ unsafe fn guard_dispatch_args(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     list.SetPipelineState(&pso);
     list.SetComputeRootUnorderedAccessView(0, consts_va);
     list.SetComputeRootUnorderedAccessView(2, src_base);
-    list.SetComputeRootUnorderedAccessView(3, dst.GetGPUVirtualAddress() + dst_off);
+    list.SetComputeRootUnorderedAccessView(3, dst_va);
     list.SetComputeRootUnorderedAccessView(4, dispatch_io_va);
     list.Dispatch(1, 1, 1);
     // Transition scratch to INDIRECT_ARGUMENT and flush the `IO_GROUP_LIMIT` store in `dispatch_io_va`.
@@ -874,10 +1100,34 @@ fn scale_views(consts: u64, src: u64, dst: u64, count: Option<u64>) -> [(u32, u6
 #[allow(clippy::too_many_arguments)]
 unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsCommandList, src: usize, count: Option<usize>, max: u32, stride: u32, mesh_offset: u32, split: u32, cap: u32) -> Result<(ID3D12Resource, u64), String> {
     let dev = super::real::list_device(this).ok_or("no device")?;
-    let (rs, pso) = scale_indirect_pipeline(&dev)?;
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let commands = (max as u64).saturating_mul(stride as u64);
     super::real::uma_window_buffer(src, commands as usize).ok_or("the indirect arguments are not in one memory window")?;
+    let (dst, dst_off) = scratch_args(this, &dev, commands.saturating_mul(2))?;
+    let dst_va = dst.GetGPUVirtualAddress() + dst_off;
+    if super::console_heap::window_views_ready() {
+        if let Some((src_slot, src_off)) = uma_heap_slot_off(u, src, commands as usize) {
+            let cnt_loc = match count {
+                Some(p) => uma_heap_slot_off(u, p, 4).map(|(sl, off)| (1u32, sl, off)),
+                None => Some((0u32, src_slot, 0u32)),
+            };
+            if let Some((has_cnt, cnt_slot, cnt_off)) = cnt_loc {
+                let (rs, pso) = scale_indirect_heap_pipeline(&dev)?;
+                let consts = [max, stride, mesh_offset, split, cap, src_slot, src_off, has_cnt, cnt_slot, cnt_off];
+                super::list_x::ensure_view_heap(this);
+                // the title's writes of the arguments before this (`fresh_indirect_arguments`)
+                emit_uav_and_transition(list, &dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                list.SetComputeRootSignature(&rs);
+                list.SetPipelineState(&pso);
+                list.SetComputeRoot32BitConstants(0, consts.len() as u32, consts.as_ptr() as *const c_void, 0);
+                list.SetComputeRootUnorderedAccessView(1, dst_va);
+                list.Dispatch(max.div_ceil(64), 1, 1);
+                emit_transition(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+                return Ok((dst, dst_off));
+            }
+        }
+    }
+    let (rs, pso) = scale_indirect_pipeline(&dev)?;
     let src_va = super::real::uma_va_of(src).ok_or("unified memory is not open on the GPU")?;
     let count_va = match count {
         Some(p) => {
@@ -886,7 +1136,6 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
         }
         None => None,
     };
-    let (dst, dst_off) = scratch_args(this, &dev, commands.saturating_mul(2))?;
     let consts: Vec<u8> = [max, stride, mesh_offset, split, cap, 0, 0, count_va.is_some() as u32, 0].iter().flat_map(|w| w.to_le_bytes()).collect();
     let p = arena_take(this, u, consts.len(), 256).ok_or("unified memory is full")?;
     std::ptr::copy_nonoverlapping(consts.as_ptr(), p, consts.len());
@@ -896,7 +1145,7 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
     emit_transition(list, &dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     list.SetComputeRootSignature(&rs);
     list.SetPipelineState(&pso);
-    for (slot, va) in scale_views(consts_va, src_va, dst.GetGPUVirtualAddress() + dst_off, count_va) {
+    for (slot, va) in scale_views(consts_va, src_va, dst_va, count_va) {
         list.SetComputeRootUnorderedAccessView(slot, va);
     }
     list.Dispatch(max.div_ceil(64), 1, 1);
@@ -3357,9 +3606,29 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
         assert_eq!(align_root_uav(0x1_0000_000c).unwrap(), (0x1_0000_0000, 12));
         assert_eq!(align_root_uav(0x1_0000_0018).unwrap(), (0x1_0000_0000, 24));
         assert_eq!(align_root_uav(0x1_0000_01fc).unwrap(), (0x1_0000_0100, 252));
+        assert!(align_root_uav(0).is_err());
+        assert!(align_root_uav(0xfc).is_err());
+        assert_eq!(align_root_uav(0x100).unwrap(), (0x100, 0));
         assert!(align_root_uav(0x1_0000_0001).is_err());
         assert!(align_root_uav(0x1_0000_0002).is_err());
         assert!(align_root_uav(0x1_0000_0003).is_err());
+    }
+
+    #[test]
+    fn rebind_allocator_retires_old_blocks_and_preserves_bindings() {
+        let list = 0x7500_2011usize as *mut c_void;
+        let old_alloc = 0x7500_2012usize;
+        let new_alloc = 0x7500_2013usize;
+        seed_reset_state_for_test(list, old_alloc, 0xCAFE, vec![0xDEAD_0000]);
+        rebind_allocator(list, new_alloc);
+        let (alloc, pso, args, args_gfx, uma) = reset_state_for_test(list);
+        assert_eq!(alloc, new_alloc);
+        assert_eq!(pso, 0xCAFE);
+        assert_eq!(args, vec![1, 2, 3, 4]);
+        assert_eq!(args_gfx, vec![5, 6, 7, 8]);
+        assert!(uma.is_empty());
+        remove_state_for_test(list);
+        super::console_list::allocator_reset(old_alloc as *mut c_void);
     }
 
     #[test]
