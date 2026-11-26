@@ -762,6 +762,21 @@ pub const ARENA_BLOCK: usize = 4 * GRAIN;
 impl Arena {
     /// `n` bytes at an `align`-aligned address in committed unified memory (not zeroed), or
     /// None when committed unified memory is full.
+    /// Install an externally allocated block (e.g. a sparse fallback block when the coherent
+    /// window is full) and return `n` bytes aligned to `align` from it.
+    pub fn install(&mut self, block: usize, block_size: usize, n: usize, align: usize, blocks: &mut Vec<usize>) -> *mut u8 {
+        let align = align.max(16).next_power_of_two();
+        let n = n.max(1);
+        blocks.push(block);
+        if n <= block_size / 2 {
+            self.at = block + n;
+            self.end = block + block_size;
+        }
+        debug_assert!(block % align == 0);
+        block as *mut u8
+    }
+
+    /// Take `n` bytes (aligned to `align`), appending any newly allocated block to `blocks`.
     pub fn take(&mut self, u: &Uma, n: usize, align: usize, blocks: &mut Vec<usize>) -> Option<*mut u8> {
         let align = align.max(16).next_power_of_two();
         let n = n.max(1);

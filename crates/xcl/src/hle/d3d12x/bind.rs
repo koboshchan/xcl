@@ -231,6 +231,27 @@ pub(crate) fn remove_state_for_test(list: *mut c_void) {
     STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize)));
 }
 
+/// Allocate `n` bytes (aligned to `align`) from `this`'s UMA arena, falling back to a sparse
+/// window block outside `STATES.lock()` when the coherent window is full (`#505`).
+unsafe fn arena_take(this: *mut c_void, u: &crate::gpu::uma::Uma, n: usize, align: usize) -> Option<*mut u8> {
+    if let Some(p) = with(this, |s| s.arena.take(u, n, align, &mut s.uma)) {
+        return Some(p);
+    }
+    if !u.has_sparse() {
+        return None;
+    }
+    let n = n.max(1);
+    let align = align.max(16).next_power_of_two();
+    let block_size = if n > crate::gpu::uma::ARENA_BLOCK / 2 { n } else { crate::gpu::uma::ARENA_BLOCK };
+    let block_align = align.max(crate::gpu::uma::GRAIN);
+    let (block, _) = super::sparse::alloc(block_size, block_align)?;
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        crate::xlog_info!("D3D12.X: coherent UMA window full – arena blocks falling back to sparse windows");
+    }
+    Some(with(this, |s| s.arena.install(block, block_size, n, align, &mut s.uma)))
+}
+
 /// SetDescriptorHeaps: the console addresses of `heaps`, for shaders that index them themselves
 /// (`Layout::heaps`).
 pub(super) fn set_heaps(list: *mut c_void, heaps: &[usize]) {
@@ -583,7 +604,7 @@ unsafe fn bind_two_pass_stage(
     let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
     let (layout, args, heaps) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone(), s.heaps));
     let copy = |bytes: &[u8]| -> Result<usize, String> {
-        let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
+        let p = arena_take(this, u, bytes.len().max(16), 256).ok_or("unified memory is full")?;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
         Ok(p as usize)
     };
@@ -733,10 +754,11 @@ unsafe fn guard_indirect_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSigna
     Ok((rs, pso))
 }
 
-/// `XCL_INDIRECT_GUARD=0`: indirect dispatches run the groups memory holds, whatever they are.
+/// `XCL_INDIRECT_GUARD=1`: opt in to guarding and folding indirect dispatch group counts.
+/// Default off: folding non-count indirect arguments triggers `0x887A0006` device removals on NVIDIA.
 fn indirect_guard() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XCL_INDIRECT_GUARD").map_or(true, |v| v.trim() != "0"))
+    *ON.get_or_init(|| std::env::var("XCL_INDIRECT_GUARD").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// The arguments of one indirect dispatch at UMA address `src`, checked and >65 535 X-folded
@@ -756,7 +778,7 @@ unsafe fn guard_dispatch_args(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     let (dst, dst_off) = scratch_args(this, &dev, 256)?;
     let lim_off = (crate::gpu::recomp::IO_GROUP_LIMIT * 4) as u32;
     let consts = [src_off, most_groups(), 0, lim_off];
-    let p = with(this, |s| s.arena.take(u, std::mem::size_of_val(&consts), 256, &mut s.uma)).ok_or("unified memory is full")?;
+    let p = arena_take(this, u, std::mem::size_of_val(&consts), 256).ok_or("unified memory is full")?;
     std::ptr::copy_nonoverlapping(consts.as_ptr().cast::<u8>(), p, std::mem::size_of_val(&consts));
     let consts_va = super::real::uma_va_of(p as usize).ok_or("unified memory is not open on the GPU")?;
     // the title's writes of the arguments before this (`fresh_indirect_arguments`)
@@ -866,7 +888,7 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
     };
     let (dst, dst_off) = scratch_args(this, &dev, commands.saturating_mul(2))?;
     let consts: Vec<u8> = [max, stride, mesh_offset, split, cap, 0, 0, count_va.is_some() as u32, 0].iter().flat_map(|w| w.to_le_bytes()).collect();
-    let p = with(this, |s| s.arena.take(u, consts.len(), 256, &mut s.uma)).ok_or("unified memory is full")?;
+    let p = arena_take(this, u, consts.len(), 256).ok_or("unified memory is full")?;
     std::ptr::copy_nonoverlapping(consts.as_ptr(), p, consts.len());
     let consts_va = super::real::uma_va_of(p as usize).ok_or("unified memory is not open on the GPU")?;
     // the title's writes of the arguments before this (`fresh_indirect_arguments`)
@@ -1151,10 +1173,16 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     Ok(super::real::dispatch_chain::WholePso::Ready(whole)) => list.SetPipelineState(&whole),
                     Ok(super::real::dispatch_chain::WholePso::None) => {}
                     Ok(super::real::dispatch_chain::WholePso::Pending) => {
+                        if let Some((b, _)) = guarded {
+                            emit_transition(list, &b, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
+                        }
                         count(DISPATCHES_SKIPPED);
                         return;
                     }
                     Err(e) => {
+                        if let Some((b, _)) = guarded {
+                            emit_transition(list, &b, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
+                        }
                         crate::xlog_warn!("D3D12.X: ExecuteIndirect whole compute PSO: {e}");
                         count(DISPATCHES_SKIPPED);
                         return;
@@ -1944,7 +1972,7 @@ unsafe fn alloc_fresh_compute_io(this: *mut c_void, pso: usize) -> Result<u64, S
     let user_sgprs = super::real::pso_user_sgprs(real);
     let (layout, args, heaps) = with(this, |s| (s.layout.clone(), s.args.clone(), s.heaps));
     let copy = |bytes: &[u8]| -> Result<usize, String> {
-        let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
+        let p = arena_take(this, u, bytes.len().max(16), 256).ok_or("unified memory is full")?;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
         Ok(p as usize)
     };
@@ -1972,7 +2000,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
     // 32-bit console addresses: window 0; pieces of the list's arena (not a 64 KiB grain each)
     let copy = |bytes: &[u8]| -> Result<usize, String> {
-        let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
+        let p = arena_take(this, u, bytes.len().max(16), 256).ok_or("unified memory is full")?;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
         Ok(p as usize)
     };
