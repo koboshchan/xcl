@@ -890,6 +890,22 @@ pub(crate) fn remove_state_for_test(list: *mut c_void) {
     state_shard(list as usize).lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize)));
 }
 
+/// Process-wide zeroed 256-byte UMA dummy table for empty inline root-argument tails, shared
+/// across all command allocators so allocators with inline-only root arguments do not each pin a
+/// 256 KiB coherent UMA arena block for 16 bytes of zeros.
+unsafe fn shared_dummy_table_p(u: &crate::gpu::uma::Uma) -> Option<usize> {
+    static SHARED: Mutex<(usize, usize)> = Mutex::new((0, 0));
+    let base = u.base();
+    let mut g = SHARED.lock().unwrap();
+    if g.0 == base && g.1 != 0 {
+        return Some(g.1);
+    }
+    let p = u.alloc(256, 256)?;
+    std::ptr::write_bytes(p, 0, 256);
+    *g = (base, p as usize);
+    Some(p as usize)
+}
+
 /// Allocate `n` bytes (aligned to `align`) from `this`'s UMA arena, falling back to a sparse
 /// window block outside `STATES.lock()` when the coherent window is full (`#505`).
 unsafe fn arena_take(this: *mut c_void, u: &crate::gpu::uma::Uma, n: usize, align: usize) -> Option<*mut u8> {
@@ -1331,11 +1347,11 @@ unsafe fn bind_two_pass_stage(
             let tail = &args[inline..];
             let table_p = if tail.is_empty() {
                 if s.dummy_table_p == 0 {
-                    let Some(p) = s.arena.take(u, 16, 256, &mut s.uma) else {
+                    let Some(p) = shared_dummy_table_p(u).or_else(|| s.arena.take(u, 16, 256, &mut s.uma).map(|p| p as usize)) else {
                         need_table_fallback = Some(16);
                         return Ok(None);
                     };
-                    s.dummy_table_p = p as usize;
+                    s.dummy_table_p = p;
                 }
                 s.dummy_table_p
             } else {
@@ -3445,13 +3461,13 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
             let tail = &args[inline..];
             let table_p = if tail.is_empty() {
                 if s.dummy_table_p == 0 {
-                    let Some(p) = s.arena.take(u, 16, 256, &mut s.uma) else {
+                    let Some(p) = shared_dummy_table_p(u).or_else(|| s.arena.take(u, 16, 256, &mut s.uma).map(|p| p as usize)) else {
                         if !gfx {
                             s.limits = limits;
                         }
                         return Ok(None);
                     };
-                    s.dummy_table_p = p as usize;
+                    s.dummy_table_p = p;
                 }
                 s.dummy_table_p
             } else {
