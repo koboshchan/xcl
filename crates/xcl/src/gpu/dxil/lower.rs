@@ -191,6 +191,8 @@ pub struct Lw {
     pub heap_mem: Option<bool>,
     /// whether heap-window atomics use `globallycoherent` independently of `heap_mem`
     pub heap_atomic_coherent: bool,
+    /// whether the instruction currently being lowered explicitly sets `GLC`/`DLC`/`SLC`
+    pub inst_mem_coherent: bool,
     /// heap windows read without a branch (`recomp::HEAP_FLAT`; not in VS / PS)
     pub heap_flat: bool,
     pub res: Option<RawUav>,
@@ -977,7 +979,11 @@ impl Lw {
         if NOOPS.contains(&name.as_str()) {
             return Ok(());
         }
-        match d.enc.name {
+        let prev_coh = self.inst_mem_coherent;
+        self.inst_mem_coherent = self.heap_atomic_coherent
+            && matches!(d.enc.name, "ENC_SMEM" | "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL")
+            && ["GLC", "DLC", "SLC"].iter().any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1));
+        let res = match d.enc.name {
             "ENC_SOPP" => self.sopp(d, &name),
             "ENC_SOP1" | "ENC_SOP2" | "ENC_SOPC" | "ENC_SOPK" => self.salu(d, &name),
             "ENC_SMEM" => self.smem(d, &name),
@@ -989,7 +995,9 @@ impl Lw {
             "ENC_FLAT" | "ENC_FLAT_GLBL" | "ENC_FLAT_SCRATCH" => self.flat(d, &name),
             e if e.starts_with("ENC_VOP") || e.starts_with("VOP") => self.valu(d, &name),
             _ => err(d, "encoding"),
-        }
+        };
+        self.inst_mem_coherent = prev_coh;
+        res
     }
 
     /// The condition of a conditional branch (i1).

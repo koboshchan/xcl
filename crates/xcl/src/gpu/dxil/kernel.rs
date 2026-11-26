@@ -571,6 +571,7 @@ impl Lw {
             mems,
             heap_mem,
             heap_atomic_coherent: coherent,
+            inst_mem_coherent: false,
             heap_flat: heap_mem.is_some() && !gfx && o.mem_windows & crate::gpu::recomp::HEAP_FLAT != 0,
             res,
             fmt_table: None,

@@ -10428,9 +10428,10 @@ fn compute_globallycoherent_only_when_needed() {
         }
     }
 
-    // With heap windows, an append-style atomic (even with RDNA2 GLC=1 _rtn) keeps non-atomic
-    // loads/stores cached (i32 4107) while annotating the atomic coherent (i32 20491); combining
-    // atomics with s_barrier or CAS/swap keeps all heap accesses coherent (i32 20491).
+    // With heap windows, atomics and explicit GLC/DLC/SLC instructions stay coherent (i32 20491)
+    // while unrelated non-GLC loads/stores stay cached (i32 4107) — even when combined with
+    // s_barrier or CAS; explicit cache invalidation (`S_DCACHE_INV`) keeps all heap accesses
+    // coherent (i32 20491).
     let atomic_load_store = prog(&[
         ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125)]),
         ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 1), ("SADDR", 0)]),
@@ -10441,25 +10442,37 @@ fn compute_globallycoherent_only_when_needed() {
         ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128)]),
         ("S_BARRIER", "ENC_SOPP", &[]),
     ]);
-    let atomic_cas = prog(&[
+    let glc_mixed = prog(&[
         ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125)]),
-        ("BUFFER_ATOMIC_CMPSWAP", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128), ("GLC", 1)]),
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128), ("GLC", 1)]),
+        ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128)]),
+    ]);
+    let dcache_inv = prog(&[
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125)]),
+        ("S_DCACHE_INV", "ENC_SMEM", &[]),
     ]);
     let o = crate::gpu::dxil::kernel::KernelOptions { wave64: false, split: false, mem_windows: super::HEAP_WINDOWS | 2, sampler_base: 0 };
     let mixed = crate::gpu::dxil::kernel::translate_compute(&atomic_load_store, o, &cs).unwrap();
     let bar_k = crate::gpu::dxil::kernel::translate_compute(&atomic_barrier, o, &cs).unwrap();
-    let cas_k = crate::gpu::dxil::kernel::translate_compute(&atomic_cas, o, &cs).unwrap();
+    let glc_k = crate::gpu::dxil::kernel::translate_compute(&glc_mixed, o, &cs).unwrap();
+    let inv_k = crate::gpu::dxil::kernel::translate_compute(&dcache_inv, o, &cs).unwrap();
     if super::dxc::location().is_ok() {
         let dis = crate::gpu::dxil::validate::disassemble(&mixed.dxil).unwrap();
         // u0 (`io`) plus heap load and heap store are cached (4107); the atomic is coherent (20491).
         assert_eq!(dis.matches("i32 4107").count(), 3, "append-style atomic CS must cache non-atomic load/store:\n{dis}");
         assert_eq!(dis.matches("i32 20491").count(), 1, "atomic op must stay coherent:\n{dis}");
-        for (label, k) in [("atomic+barrier", &bar_k), ("atomic+cmpswap", &cas_k)] {
-            let d = crate::gpu::dxil::validate::disassemble(&k.dxil).unwrap();
-            // Only u0 (`io`) is 4107; both the heap load and atomic must be coherent (20491).
-            assert_eq!(d.matches("i32 4107").count(), 1, "{label} must not emit cached heap handle:\n{d}");
-            assert_eq!(d.matches("i32 20491").count(), 2, "{label} must keep heap load and atomic coherent:\n{d}");
-        }
+        let bar_dis = crate::gpu::dxil::validate::disassemble(&bar_k.dxil).unwrap();
+        // u0 (`io`) + non-GLC SMEM load are cached (4107); the atomic is coherent (20491).
+        assert_eq!(bar_dis.matches("i32 4107").count(), 2, "atomic+barrier must keep non-GLC load cached:\n{bar_dis}");
+        assert_eq!(bar_dis.matches("i32 20491").count(), 1, "atomic+barrier must keep atomic coherent:\n{bar_dis}");
+        let glc_dis = crate::gpu::dxil::validate::disassemble(&glc_k.dxil).unwrap();
+        // u0 (`io`) + non-GLC SMEM load are cached (4107); GLC load + atomic are coherent (20491).
+        assert_eq!(glc_dis.matches("i32 4107").count(), 2, "per-instruction GLC must keep non-GLC load cached:\n{glc_dis}");
+        assert_eq!(glc_dis.matches("i32 20491").count(), 2, "per-instruction GLC must mark GLC load and atomic coherent:\n{glc_dis}");
+        let inv_dis = crate::gpu::dxil::validate::disassemble(&inv_k.dxil).unwrap();
+        // Only u0 (`io`) is 4107; S_DCACHE_INV keeps the heap load coherent (20491).
+        assert_eq!(inv_dis.matches("i32 4107").count(), 1, "S_DCACHE_INV must not emit cached heap handle:\n{inv_dis}");
+        assert_eq!(inv_dis.matches("i32 20491").count(), 1, "S_DCACHE_INV must keep heap load coherent:\n{inv_dis}");
     }
 }
 

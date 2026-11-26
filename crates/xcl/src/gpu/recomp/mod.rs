@@ -1703,48 +1703,24 @@ pub(crate) fn needs_coherent_mem(insts: &[Decoded]) -> bool {
     })
 }
 
-/// Whether non-atomic memory accesses need `globallycoherent` on heap memory windows.
+/// Whether all non-atomic memory accesses need shader-wide `globallycoherent` on heap memory windows.
 ///
 /// On RDNA2, `GLC=1` on `*_ATOMIC_*` selects the return-value (`_rtn`) variant rather than
-/// requesting uncached L1/L2 bypass on unrelated descriptor/constant/buffer loads. On NVIDIA,
-/// annotating every heap-window load in an atomic-using compute shader with `IsGloballyCoherent`
-/// forces uncached `LD.E.STRONG.SYS` PCIe snoops (turning 0.5 ms shaders into 2-5 s stalls).
-/// Keep non-atomic heap-window accesses cached unless the shader issues cache invalidations,
-/// non-atomic `GLC`/`DLC`/`SLC` accesses, CAS/swap atomics (spinlocks / cross-workgroup RMW),
-/// or combines atomics with `s_barrier` (atomic → barrier → load on the same buffer).
+/// requesting uncached L1/L2 bypass on unrelated descriptor/constant/buffer loads, and `s_barrier`
+/// only synchronizes threads within a workgroup without invalidating L0/L1. On NVIDIA, annotating
+/// every heap-window load in an atomic-using compute shader with `IsGloballyCoherent` forces
+/// uncached `LD.E.STRONG.SYS` PCIe snoops (turning 5 ms shaders into 350+ ms stalls).
+///
+/// Direct DXIL marks every atomic (`heap_atomic_coherent`) and every individual non-atomic
+/// `GLC`/`DLC`/`SLC` instruction (`inst_mem_coherent`) coherent on demand, so shader-wide
+/// non-atomic coherence is only needed when the shader explicitly invalidates data caches.
 pub(crate) fn needs_coherent_non_atomic_mem(insts: &[Decoded]) -> bool {
-    let mut has_atomic = false;
-    let mut has_barrier = false;
-    for d in insts {
-        let name = d.inst.name;
-        if matches!(name, "S_DCACHE_INV" | "S_GL1_INV" | "BUFFER_GL0_INV" | "BUFFER_GL1_INV") {
-            return true;
-        }
-        if name == "S_BARRIER" {
-            has_barrier = true;
-            continue;
-        }
-        if name.starts_with("BUFFER_ATOMIC_")
-            || name.starts_with("GLOBAL_ATOMIC_")
-            || name.starts_with("FLAT_ATOMIC_")
-        {
-            has_atomic = true;
-            if name.contains("_CMPSWAP") || name.contains("_FCMPSWAP") || name.ends_with("_SWAP") || name.contains("_SWAP_") {
-                return true;
-            }
-            continue;
-        }
-        if matches!(
-            d.enc.name,
-            "ENC_SMEM" | "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL"
-        ) && ["GLC", "DLC", "SLC"]
-            .iter()
-            .any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1))
-        {
-            return true;
-        }
-    }
-    has_atomic && has_barrier
+    insts.iter().any(|d| {
+        matches!(
+            d.inst.name,
+            "S_DCACHE_INV" | "S_GL1_INV" | "BUFFER_GL0_INV" | "BUFFER_GL1_INV"
+        )
+    })
 }
 
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {

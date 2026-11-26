@@ -183,7 +183,7 @@ impl Lw {
         // Descriptor-heap windows (`#1693`, `XCL_HEAP_WINDOWS=1`): single guarded heap lookup
         // combined with `guard`, stacking cleanly with vector loads/stores & FormatLoad opt.
         if let Some(coherent) = self.heap_mem {
-            let coherent = coherent || force_coherent;
+            let coherent = coherent || force_coherent || self.inst_mem_coherent;
             let windows = self.mems.len() as u32;
             let w = self.rd(super::lower::VAR_WIN);
             let inside = self.cmpc(Pred::ULt, w, windows);
@@ -436,7 +436,7 @@ impl Lw {
             };
             let w = self.sel(ok, w, z);
             let i = self.addc(w, crate::gpu::recomp::MEM_HEAP_BASE);
-            let m = self.s.heap_raw_buffer_uav(i, coherent);
+            let m = self.s.heap_raw_buffer_uav(i, coherent || self.inst_mem_coherent);
             let vals = f(self, m);
             debug_assert_eq!(vals.len(), n);
             return vals.into_iter().map(|v| self.sel(ok, v, z)).collect();
