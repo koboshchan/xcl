@@ -97,6 +97,17 @@ impl Drop for IoBlock {
     }
 }
 
+/// Cached resolved ABI metadata for a translated PSO on one command list, skipping repeated
+/// `pso_async` / `real` map lookups across consecutive draws/dispatches with the same PSO.
+#[derive(Clone, Copy, Debug)]
+struct CachedPsoAbi {
+    query_pso: usize,
+    real_pso: usize,
+    rs_raw: usize,
+    user_sgprs: Option<u32>,
+    is_gfx: bool,
+}
+
 type PreludeEntry = (ID3D12CommandAllocator, ID3D12GraphicsCommandList, usize, i32);
 
 #[derive(Default)]
@@ -173,6 +184,10 @@ struct State {
     /// last bound PC ABI root signature and root UAVs (u0..u5) per stage
     pc_abi_gfx: AbiBound,
     pc_abi_cs: AbiBound,
+    /// true once `list_x::ensure_view_heap` confirmed required shared heaps are bound on this list
+    heaps_ensured: bool,
+    /// cached resolved ABI metadata for the active translated PSO on this list
+    pso_abi_cache: Option<CachedPsoAbi>,
     /// L1 VRAM `io` (`u0`) slabs populated during this recording and copied in `prelude_list_for`
     io_blocks: Vec<IoBlock>,
     /// lazily cached device eligible for VRAM `io` on this segment
@@ -584,7 +599,17 @@ pub(super) fn invalidate_pc_abi(list: *mut c_void, gfx: bool, cs: bool) {
         if cs {
             s.pc_abi_cs = AbiBound::default();
         }
+        s.heaps_ensured = false;
     });
+}
+
+unsafe fn ensure_heaps_cached(this: *mut c_void) {
+    if with(this, |s| s.heaps_ensured) {
+        return;
+    }
+    if super::list_x::ensure_view_heap(this) {
+        with(this, |s| s.heaps_ensured = true);
+    }
 }
 
 /// Note that `list` issued a GPU buffer write, UAV barrier, or wait: subsequent two-pass indirect
@@ -671,6 +696,8 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.io_cache_tp_ms = None;
         s.pc_abi_gfx = AbiBound::default();
         s.pc_abi_cs = AbiBound::default();
+        s.heaps_ensured = false;
+        s.pso_abi_cache = None;
         s.vram_io_dev = None;
         s.prelude_blocked = false;
         s.prelude_scratch = Default::default();
@@ -710,6 +737,8 @@ pub(super) fn rebind_allocator(list: *mut c_void, allocator: usize) {
         s.io_cache_tp_ms = None;
         s.pc_abi_gfx = AbiBound::default();
         s.pc_abi_cs = AbiBound::default();
+        s.heaps_ensured = false;
+        s.pso_abi_cache = None;
         s.vram_io_dev = None;
         s.prelude_blocked = false;
         s.prelude_scratch = Default::default();
@@ -751,6 +780,8 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
         s.io_cache_tp_ms = None;
         s.pc_abi_gfx = AbiBound::default();
         s.pc_abi_cs = AbiBound::default();
+        s.heaps_ensured = false;
+        s.pso_abi_cache = None;
     });
 }
 
@@ -784,6 +815,8 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         s.io_cache_tp_ms = None;
         s.pc_abi_gfx = AbiBound::default();
         s.pc_abi_cs = AbiBound::default();
+        s.heaps_ensured = false;
+        s.pso_abi_cache = None;
         s.vram_io_dev = None;
         s.prelude_blocked = true;
         s.prelude_scratch = Default::default();
@@ -886,6 +919,7 @@ pub(super) fn set_heaps(list: *mut c_void, heaps: &[usize]) {
         bases[sampler as usize] = base;
     }
     with(list, |s| {
+        s.heaps_ensured = false;
         if s.heaps != bases {
             s.heaps = bases;
             s.args_gen_gfx = s.args_gen_gfx.wrapping_add(1);
@@ -1257,7 +1291,7 @@ unsafe fn bind_two_pass_stage(
     compute_pass: bool,
 ) -> Result<(), String> {
     // the pair is translated with heap windows when they are on (`pso::mem_windows`): as `bind_abi`
-    super::list_x::ensure_view_heap(this);
+    ensure_heaps_cached(this);
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let rs_raw = if compute_pass { tp.compute_rs } else { tp.mesh_rs };
     let rs_ptr = rs_raw as *mut c_void;
@@ -1956,7 +1990,7 @@ unsafe fn guard_dispatch_args(this: *mut c_void, list: &ID3D12GraphicsCommandLis
         if let Some((src_slot, src_off)) = uma_heap_slot_off(u, src, 12) {
             let (rs, pso) = guard_indirect_heap_pipeline(&dev)?;
             let consts = [src_slot, src_off, most_groups(), lim_off];
-            super::list_x::ensure_view_heap(this);
+            ensure_heaps_cached(this);
             // the title's writes of the arguments before this (`fresh_indirect_arguments`)
             emit_uav_and_transition(list, &dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             list.SetComputeRootSignature(&rs);
@@ -2123,7 +2157,7 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
             if let Some((has_cnt, cnt_slot, cnt_off)) = cnt_loc {
                 let (rs, pso) = scale_indirect_heap_pipeline(&dev)?;
                 let consts = [max, stride, mesh_offset, split, cap, src_slot, src_off, has_cnt, cnt_slot, cnt_off];
-                super::list_x::ensure_view_heap(this);
+                ensure_heaps_cached(this);
                 // the title's writes of the arguments before this (`fresh_indirect_arguments`)
                 emit_uav_and_transition(list, &dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 list.SetComputeRootSignature(&rs);
@@ -2754,11 +2788,12 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
 /// translation, or no unified memory).
 unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList> {
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?.clone();
-    let pso = with(this, |s| s.pso);
-    // a pipeline still being built in the background: its stand-in, which draws nothing
-    // (`resolve_wait` waits for it only up to `XCL_PSO_WAIT_MS`)
-    let real = super::pso_async::resolve_wait(pso);
-    if !super::real::is_translated_graphics(real) {
+    let (pso, cached_gfx) = with(this, |s| (s.pso, s.pso_abi_cache.is_some_and(|c| c.query_pso == s.pso && c.is_gfx)));
+    if !cached_gfx {
+        // a pipeline still being built in the background: its stand-in, which draws nothing
+        // (`resolve_wait` waits for it only up to `XCL_PSO_WAIT_MS`)
+        let real = super::pso_async::resolve_wait(pso);
+        if !super::real::is_translated_graphics(real) {
         // A finished two-pass MS/GS pipeline is a PC mesh shader pipeline (MS+PS) registered in
         // TWO_PASS rather than TRANSLATED_GRAPHICS. Binding the title's graphics RS and issuing
         // DrawInstanced / DrawIndexedInstanced against a mesh PSO invalidates the command list
@@ -2804,6 +2839,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
             list.SetGraphicsRootSignature(r);
         }
         return Some(list);
+        }
     }
     if super::present::trace_frame() {
         trace_ui_draw(this, pso);
@@ -3086,7 +3122,12 @@ pub(super) unsafe extern "system" fn set_compute_root_descriptor(this: *mut c_vo
 
 /// #25 SetPipelineState: noted, then bound as on the PC
 pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
-    with(this, |s| s.pso = pso as usize);
+    with(this, |s| {
+        if s.pso != pso as usize {
+            s.pso = pso as usize;
+            s.pso_abi_cache = None;
+        }
+    });
     super::real::bind_pipeline(this, pso);
 }
 
@@ -3339,18 +3380,29 @@ unsafe fn alloc_fresh_compute_io(this: *mut c_void, pso: usize) -> Result<u64, S
 /// memory, u1 res, u2… the memory windows; then the pipeline. `group_limit`: a folded
 /// dispatch's group count in X (`recomp::IO_GROUP_LIMIT`), 0 for any other.
 unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool, group_limit: u32, preset_io_va: Option<u64>) -> Result<(), String> {
-    super::list_x::ensure_view_heap(this);
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
-    // (only reached with a translated pipeline: built, `resolve_wait` returns it at once)
-    let real = super::pso_async::resolve_wait(pso);
-    let user_sgprs = if gfx { None } else { super::real::pso_user_sgprs(real) };
-    let rs_raw = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
+    let (need_heaps, cached_pso, io_dev) = with(this, |s| {
+        let c = s.pso_abi_cache.filter(|c| c.query_pso == pso && c.is_gfx == gfx);
+        (!s.heaps_ensured, c, s.vram_io_dev.clone())
+    });
+    if need_heaps {
+        ensure_heaps_cached(this);
+    }
+    let (real, user_sgprs, rs_raw, store_pso_cache) = match cached_pso {
+        Some(c) => (c.real_pso, c.user_sgprs, c.rs_raw, false),
+        None => {
+            // (only reached with a translated pipeline: built, `resolve_wait` returns it at once)
+            let real = super::pso_async::resolve_wait(pso);
+            let user_sgprs = if gfx { None } else { super::real::pso_user_sgprs(real) };
+            let rs_raw = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
+            (real, user_sgprs, rs_raw, true)
+        }
+    };
     let rs_ptr = rs_raw as *mut c_void;
     let rs = ID3D12RootSignature::from_raw_borrowed(&rs_ptr).ok_or("root signature")?;
     let real_ptr = real as *mut c_void;
     let pc = ID3D12PipelineState::from_raw_borrowed(&real_ptr).ok_or("pipeline")?;
 
-    let io_dev = with(this, |s| s.vram_io_dev.clone());
     let io_dev = match io_dev {
         Some(cached) => cached,
         None => {
@@ -3361,6 +3413,15 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     };
 
     let try_fast = with(this, |s| -> Result<Option<(bool, u8, [u64; 6])>, String> {
+        if store_pso_cache {
+            s.pso_abi_cache = Some(CachedPsoAbi {
+                query_pso: pso,
+                real_pso: real,
+                rs_raw,
+                user_sgprs,
+                is_gfx: gfx,
+            });
+        }
         if s.uma_windows.as_ref().is_none_or(Vec::is_empty) {
             let w = super::real::uma_window_vas();
             if w.is_empty() {

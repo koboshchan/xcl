@@ -317,6 +317,21 @@ pub fn global_heap() -> Option<ID3D12DescriptorHeap> {
     GLOBAL.lock().unwrap().as_ref().map(|s| s.heap.clone())
 }
 
+/// Raw COM pointer of the shared shader-visible view heap without COM refcount traffic.
+pub fn global_heap_raw() -> Option<usize> {
+    GLOBAL.lock().unwrap().as_ref().map(|s| s.heap.as_raw() as usize)
+}
+
+fn find_heap_idx(heaps: &[Heap], cpu: u64) -> Option<usize> {
+    let idx = heaps.partition_point(|h| (h.shadow as u64) <= cpu);
+    if idx == 0 {
+        return None;
+    }
+    let h = &heaps[idx - 1];
+    let end = (h.shadow as u64).wrapping_add((h.n as u64) * (h.slot_bytes() as u64));
+    (cpu < end).then_some(idx - 1)
+}
+
 /// Whether `obj` (a title's view heap) has its descriptors in the shared heap.
 pub fn in_global(obj: usize) -> bool {
     HEAPS.lock().unwrap().iter().any(|h| h.obj == obj && !h.sampler && !h.pages.is_empty())
@@ -385,7 +400,11 @@ pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler:
     } else {
         Vec::new()
     };
-    HEAPS.lock().unwrap().push(Heap { obj, shadow: p as usize, n, pc_cpu, pc_gpu, inc, sampler, pages, visible, memory });
+    {
+        let mut heaps = HEAPS.lock().unwrap();
+        let idx = heaps.partition_point(|h| h.shadow < p as usize);
+        heaps.insert(idx, Heap { obj, shadow: p as usize, n, pc_cpu, pc_gpu, inc, sampler, pages, visible, memory });
+    }
     true
 }
 
@@ -393,7 +412,7 @@ pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler:
 pub fn unregister(obj: usize) {
     let gone = {
         let mut heaps = HEAPS.lock().unwrap();
-        heaps.iter().position(|h| h.obj == obj).map(|i| heaps.swap_remove(i))
+        heaps.iter().position(|h| h.obj == obj).map(|i| heaps.remove(i))
     };
     if let Some(h) = gone {
         for (p, &f) in h.pages.iter().enumerate().filter(|&(_, &f)| f != UNMAPPED) {
@@ -445,11 +464,7 @@ pub struct Slot {
     pub k: u32,
 }
 
-/// The slot behind a console CPU handle (None: not one of XCL's console heaps). A view slot
-/// of a heap in the shared heap gets its page's place there now if the page has none yet.
-pub fn slot(cpu: u64) -> Option<Slot> {
-    let mut heaps = HEAPS.lock().unwrap();
-    let h = heaps.iter_mut().find(|h| cpu >= h.shadow as u64 && cpu < (h.shadow + (h.n * h.slot_bytes()) as usize) as u64)?;
+fn resolve_slot(h: &mut Heap, cpu: u64) -> Slot {
     let k = ((cpu - h.shadow as u64) / h.slot_bytes() as u64) as u32;
     if h.sampler {
         let shared = sampler_page_of(h, k).and_then(|(first, k0)| {
@@ -462,7 +477,7 @@ pub fn slot(cpu: u64) -> Option<Slot> {
         // shared heap must map overflowed slots to reserved zero-sampler slot 0 rather than
         // aliasing unrelated heap entries at local index `k`.
         let (index, shared_srv) = shared.unwrap_or_else(|| (sampler_unmapped_index(!h.pages.is_empty(), k), 0));
-        return Some(Slot { at: h.shadow + (k * SAMPLER_SLOT) as usize, index, pc_srv: h.pc_cpu + (k * h.inc) as u64, pc_uav: 0, pc_gpu_uav: 0, sampler: true, shared_srv, k });
+        return Slot { at: h.shadow + (k * SAMPLER_SLOT) as usize, index, pc_srv: h.pc_cpu + (k * h.inc) as u64, pc_uav: 0, pc_gpu_uav: 0, sampler: true, shared_srv, k };
     }
     let uav = ((2 * k + 1) * h.inc) as u64;
     let shared = page_of(h, k).and_then(|(first, k0)| {
@@ -472,7 +487,25 @@ pub fn slot(cpu: u64) -> Option<Slot> {
         Some((i, g.gpu + (i as u64 + 1) * g.inc as u64, g.cpu + i as u64 * g.inc as u64))
     });
     let (index, pc_gpu_uav, shared_srv) = shared.unwrap_or((2 * k, if h.pc_gpu == 0 { 0 } else { h.pc_gpu + uav }, 0));
-    Some(Slot { at: h.shadow + (k * SLOT) as usize, index, pc_srv: h.pc_cpu + (2 * k * h.inc) as u64, pc_uav: h.pc_cpu + uav, pc_gpu_uav, sampler: false, shared_srv, k })
+    Slot { at: h.shadow + (k * SLOT) as usize, index, pc_srv: h.pc_cpu + (2 * k * h.inc) as u64, pc_uav: h.pc_cpu + uav, pc_gpu_uav, sampler: false, shared_srv, k }
+}
+
+/// The slot behind a console CPU handle (None: not one of XCL's console heaps). A view slot
+/// of a heap in the shared heap gets its page's place there now if the page has none yet.
+pub fn slot(cpu: u64) -> Option<Slot> {
+    let mut heaps = HEAPS.lock().unwrap();
+    let idx = find_heap_idx(&heaps, cpu)?;
+    Some(resolve_slot(&mut heaps[idx], cpu))
+}
+
+/// Resolve both `dst` and `src` console handles under a single `HEAPS` lock.
+pub fn slot_pair(dst: u64, src: u64) -> Option<(Slot, Slot)> {
+    let mut heaps = HEAPS.lock().unwrap();
+    let id = find_heap_idx(&heaps, dst)?;
+    let is = find_heap_idx(&heaps, src)?;
+    let d = resolve_slot(&mut heaps[id], dst);
+    let s = resolve_slot(&mut heaps[is], src);
+    Some((d, s))
 }
 
 /// The view (or sampler) just made in slot `s` (its SRV, or with `uav` its UAV) goes to the shared heap.
@@ -815,6 +848,11 @@ fn release_global_sampler(first: u32, count: u32) {
 /// The shared shader-visible PC sampler heap lists bind (None: no shared sampler heap).
 pub fn global_sampler_heap() -> Option<ID3D12DescriptorHeap> {
     GLOBAL_SAMPLER.lock().unwrap().as_ref().map(|s| s.heap.clone())
+}
+
+/// Raw COM pointer of the shared shader-visible sampler heap without COM refcount traffic.
+pub fn global_sampler_heap_raw() -> Option<usize> {
+    GLOBAL_SAMPLER.lock().unwrap().as_ref().map(|s| s.heap.as_raw() as usize)
 }
 
 /// Whether `obj` (a title's sampler heap) has its descriptors in the shared sampler heap.
@@ -1263,6 +1301,7 @@ mod tests {
                 let mut heaps = HEAPS.lock().unwrap();
                 heaps.push(Heap { obj: 0xA1, shadow: view_shadow.as_ptr() as usize, n: 260, pc_cpu: 0x30_0000, pc_gpu: 0, inc: 32, sampler: false, pages: vec![UNMAPPED; 2], visible: true, memory: Memory::Uma });
                 heaps.push(Heap { obj: 0xA2, shadow: samp_shadow.as_ptr() as usize, n: 12, pc_cpu: 0x40_0000, pc_gpu: 0, inc: 16, sampler: true, pages: vec![UNMAPPED; 2], visible: true, memory: Memory::Uma });
+                heaps.sort_by_key(|h| h.shadow);
             }
             let vs = slot(view_shadow.as_ptr() as u64).unwrap();
             let ss = slot(samp_shadow.as_ptr() as u64).unwrap();
@@ -1326,7 +1365,10 @@ mod tests {
                 heaps.push(Heap { obj: 0xB1, shadow: v4_shadow.as_ptr() as usize, n: 4, pc_cpu: 0x30_0000, pc_gpu: 0, inc: 32, sampler: false, pages: vec![UNMAPPED], visible: true, memory: Memory::Uma });
                 heaps.push(Heap { obj: 0xB2, shadow: s3_shadow.as_ptr() as usize, n: 3, pc_cpu: 0x40_0000, pc_gpu: 0, inc: 16, sampler: true, pages: vec![UNMAPPED], visible: true, memory: Memory::Uma });
                 heaps.push(Heap { obj: 0xB3, shadow: v260_shadow.as_ptr() as usize, n: 260, pc_cpu: 0x50_0000, pc_gpu: 0, inc: 32, sampler: false, pages: vec![UNMAPPED; 2], visible: true, memory: Memory::Uma });
+                heaps.sort_by_key(|h| h.shadow);
             }
+            let (v4_pair_a, s3_pair_b) = slot_pair(v4_shadow.as_ptr() as u64 + SLOT as u64, s3_shadow.as_ptr() as u64 + SAMPLER_SLOT as u64).unwrap();
+            assert!(!v4_pair_a.sampler && s3_pair_b.sampler && v4_pair_a.k == 1 && s3_pair_b.k == 1);
             let v4_s1 = slot(v4_shadow.as_ptr() as u64 + SLOT as u64).unwrap();
             publish_range(&v4_s1, 0);
             publish_range(&v4_s1, 10);

@@ -3940,13 +3940,13 @@ unsafe fn gpu_va(list: *mut c_void, va: u64, bytes: usize, what: &str, mirror: b
 /// title binds one buffer at many offsets (a ring it fills through the frame: a retail title's
 /// views all end at the buffer's end), so a mirror covers a 64 KiB-aligned range and a view
 /// inside a mirrored range uses that mirror at its offset.
-static MIRRORS: Mutex<Vec<(u64, usize, usize)>> = Mutex::new(Vec::new());
+static MIRRORS: std::sync::RwLock<Vec<(u64, usize, usize)>> = std::sync::RwLock::new(Vec::new());
 /// bytes of mirrors made (never freed)
 static MIRROR_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Where `[va, va + bytes)` is in a mirror, if it is in one.
 fn mirrored(va: u64, bytes: usize) -> Option<usize> {
-    MIRRORS.lock().unwrap().iter().find(|&&(s, l, _)| va >= s && va + bytes as u64 <= s + l as u64).map(|&(s, _, m)| m + (va - s) as usize)
+    MIRRORS.read().unwrap().iter().find(|&&(s, l, _)| va >= s && va + bytes as u64 <= s + l as u64).map(|&(s, _, m)| m + (va - s) as usize)
 }
 
 /// The mirror address of the title's buffer at `va`; its range's mirror is made (and filled
@@ -3955,7 +3955,7 @@ unsafe fn mirror_of(va: u64, bytes: usize, what: &str) -> Option<usize> {
     if let Some(p) = mirrored(va, bytes) {
         return Some(p);
     }
-    let mut g = MIRRORS.lock().unwrap();
+    let mut g = MIRRORS.write().unwrap();
     // again under the lock: two lists binding one new range at once must share a mirror (a
     // second one would never be synced – every later lookup finds the first)
     if let Some(&(s, _, m)) = g.iter().find(|&&(s, l, _)| va >= s && va + bytes as u64 <= s + l as u64) {
@@ -4132,21 +4132,32 @@ pub(super) unsafe fn pc_heaps(n: u32, heaps: *const usize) -> Vec<Option<ID3D12D
     out
 }
 
+unsafe fn ensure_global_sampler_heap_raw() -> Option<usize> {
+    if let Some(s) = super::console_heap::global_sampler_heap_raw() {
+        return Some(s);
+    }
+    let dev_raw = real::device_raw();
+    if let Some(dev) = ID3D12Device::from_raw_borrowed(&dev_raw) {
+        let _ = super::console_heap::shared_sampler_heap(dev);
+    }
+    super::console_heap::global_sampler_heap_raw()
+}
+
 /// Translated shaders with directly-indexed root signatures (`CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED`
 /// / `SAMPLER_HEAP_DIRECTLY_INDEXED`) and heap windows (`pso::heap_windows`) require valid
 /// shader-visible view and sampler heaps to be bound even if the title bound 0 heaps (or only a
-/// view heap with 0 sampler heaps).
-pub(super) unsafe fn ensure_view_heap(this: *mut c_void) {
-    let view = if crate::gpu::recomp::pso::heap_windows() {
-        super::console_heap::global_heap()
+/// view heap with 0 sampler heaps). Returns `true` when all required shared heaps exist and are
+/// bound on `this` so callers may cache the check until `SetDescriptorHeaps` / `Reset`.
+pub(super) unsafe fn ensure_view_heap(this: *mut c_void) -> bool {
+    let need_view = crate::gpu::recomp::pso::heap_windows();
+    let view_raw = if need_view {
+        super::console_heap::global_heap_raw()
     } else {
         None
     };
-    let sampler = ensure_global_sampler_heap();
-    let view_raw = view.as_ref().map(|h| h.as_raw() as usize);
-    let sampler_raw = sampler.as_ref().map(|h| h.as_raw() as usize);
+    let sampler_raw = ensure_global_sampler_heap_raw();
     if view_raw.is_none() && sampler_raw.is_none() {
-        return;
+        return false;
     }
     let mut to_bind: Option<Vec<usize>> = None;
     with_bindings(this, |b| {
@@ -4159,6 +4170,7 @@ pub(super) unsafe fn ensure_view_heap(this: *mut c_void) {
     if let Some(raw) = to_bind {
         pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, 28)(this, raw.len() as u32, raw.as_ptr());
     }
+    (!need_view || view_raw.is_some()) && sampler_raw.is_some()
 }
 
 /// console #32 SetDescriptorHeaps (PC #28)
