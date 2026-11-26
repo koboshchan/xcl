@@ -3366,7 +3366,11 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
         Kind::PipelineState => v.push(("Release", pso_release as usize)),
         Kind::DescriptorHeap => v.push(("Release", heap_release as usize)),
         Kind::Heap => v.push(("Release", mem_heap_release as usize)),
-        Kind::Fence => v.push(("Signal", fence_signal as usize)),
+        Kind::Fence => v.extend_from_slice(&[
+            ("GetCompletedValue", fence_get_completed_value as usize),
+            ("SetEventOnCompletion", fence_set_event_on_completion as usize),
+            ("Signal", fence_signal as usize),
+        ]),
         _ => {}
     }
     v
@@ -8388,6 +8392,7 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
                 if older == 14 {
                     super::fence_x::note_queue_signal(a1, a2 as u64);
                     super::list_x::note_title_queue_signal(this as usize, a1, a2 as u64);
+                    super::sparse::note_queue_signal(this as usize, a1, a2 as u64);
                 } else {
                     super::fence_x::note_queue_wait(a1, a2 as u64);
                     super::list_x::note_title_queue_wait(this as usize, a1, a2 as u64);
@@ -8510,6 +8515,32 @@ unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, valu
     if hr >= 0 {
         super::fence_x::note_queue_signal(fence as usize, value);
         super::list_x::note_title_queue_signal(this as usize, fence as usize, value);
+        super::sparse::note_queue_signal(this as usize, fence as usize, value);
+    }
+    hr
+}
+
+/// Fence::GetCompletedValue (slot 8)
+unsafe extern "system" fn fence_get_completed_value(this: *mut c_void) -> u64 {
+    const PC_GET_COMPLETED_VALUE: usize = 8;
+    let f: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(orig_fn(this, PC_GET_COMPLETED_VALUE));
+    let done = f(this);
+    if super::sparse::has_pending_readbacks() {
+        super::sparse::wait_for_completed_readbacks(this as usize, done);
+    }
+    done
+}
+
+/// Fence::SetEventOnCompletion (slot 9)
+unsafe extern "system" fn fence_set_event_on_completion(this: *mut c_void, value: u64, event: *mut c_void) -> HRESULT {
+    const PC_SET_EVENT_ON_COMPLETION: usize = 9;
+    if super::sparse::has_pending_readbacks() && super::sparse::defer_fence_event(this, value, event as usize) {
+        return S_OK;
+    }
+    let f: unsafe extern "system" fn(*mut c_void, u64, *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, PC_SET_EVENT_ON_COMPLETION));
+    let hr = f(this, value, event);
+    if hr >= 0 && event.is_null() && super::sparse::has_pending_readbacks() {
+        super::sparse::wait_for_completed_readbacks(this as usize, value);
     }
     hr
 }

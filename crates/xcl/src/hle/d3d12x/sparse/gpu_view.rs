@@ -455,6 +455,9 @@ pub fn base_for(va: usize, len: usize) -> Option<usize> {
                 if s.mapped.contains_key(&w) {
                     let (read, holes) = resolved.get(&t).copied().unwrap_or((0, u16::MAX));
                     m.show(w, t, read);
+                    if read != 0 {
+                        super::note_watch_tiles(read, read + TILE);
+                    }
                     if read != 0 && holes != 0xFFFF {
                         m.backed.insert(t);
                     }

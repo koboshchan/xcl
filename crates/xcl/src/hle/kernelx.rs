@@ -3963,12 +3963,21 @@ mod tests {
 
     #[test]
     fn physical_home_without_sparse_windows_uses_coherent_window() {
-        let u = crate::gpu::uma::Uma::with_windows(1, 16 << 20).unwrap();
+        // Coherent-only UMA with room past `COHERENT_KEEP` backs physical homes directly.
+        let u = crate::gpu::uma::Uma::with_windows(1, COHERENT_KEEP + (16 << 20)).unwrap();
         assert!(!u.has_sparse());
         unsafe {
             let home = alloc_physical_home(&u, 2 * PHYS_PAGE).unwrap();
             assert!(u.is_committed(home), "coherent-only UMA should still back physical homes");
             assert!(u.free(home));
+        }
+        // Smaller than `COHERENT_KEEP` preserves XCL's coherent headroom and falls back to plain memory.
+        let small = crate::gpu::uma::Uma::with_windows(1, 16 << 20).unwrap();
+        assert!(!small.has_sparse());
+        unsafe {
+            let home = alloc_physical_home(&small, 2 * PHYS_PAGE).unwrap();
+            assert!(!small.contains(home), "coherent-only UMA below COHERENT_KEEP must not eat XCL headroom");
+            assert_eq!(mem::VirtualFree(home as *mut c_void, 0, mem::MEM_RELEASE), 1);
         }
     }
 

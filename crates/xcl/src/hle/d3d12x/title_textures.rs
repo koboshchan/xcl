@@ -991,7 +991,7 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
             }
         }
     }
-    wanted.extend(super::sparse::mapped_ranges());
+    wanted.extend(super::sparse::mapped_watch_ranges());
     wanted.extend(super::sparse::gpu_view::sources());
     let computed = Arc::new(watch_ranges(&regions, wanted));
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));

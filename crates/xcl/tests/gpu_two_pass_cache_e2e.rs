@@ -186,7 +186,7 @@ fn build_ms_pso(dev: &ID3D12Device, rs: &ID3D12RootSignature, ms: &[u8], ps: &[u
         })
     }
     .expect("CreatePipelineState two-pass MS");
-    let raw = pso_async::resolve_wait(pso.as_raw() as usize);
+    let raw = pso_async::wait_built(pso.as_raw() as usize);
     let tp = real::two_pass_of(raw).expect("two-pass MS entry");
     assert_eq!(tp.kind, "MS");
     pso
@@ -211,7 +211,7 @@ fn build_gs_pso(dev: &ID3D12Device, rs: &ID3D12RootSignature, vs: &[u8], gs: &[u
     desc.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
     let pso: ID3D12PipelineState = unsafe { dev.CreateGraphicsPipelineState(&desc) }.expect("CreateGraphicsPipelineState two-pass GS");
     unsafe { std::mem::ManuallyDrop::drop(&mut desc.pRootSignature) };
-    let raw = pso_async::resolve_wait(pso.as_raw() as usize);
+    let raw = pso_async::wait_built(pso.as_raw() as usize);
     let tp = real::two_pass_of(raw).expect("two-pass GS entry");
     assert_eq!(tp.kind, "GS");
     pso
@@ -267,7 +267,7 @@ fn draw_two_pass_and_read(dev: &ID3D12Device, pso: &ID3D12PipelineState, gs_prim
     const DIM: u32 = 8;
     const RES_SIZE: u64 = 128 << 10;
     let clear = [0.25f32, 0.25, 0.25, 0.25];
-    let raw = pso_async::resolve_wait(pso.as_raw() as usize);
+    let raw = pso_async::wait_built(pso.as_raw() as usize);
     let tp = real::two_pass_of(raw).expect("two-pass pipeline entry");
     let cpso = unsafe { ID3D12PipelineState::from_raw_borrowed(&(tp.compute as *mut std::ffi::c_void)) }.unwrap().clone();
     let crs = unsafe { ID3D12RootSignature::from_raw_borrowed(&(tp.compute_rs as *mut std::ffi::c_void)) }.unwrap().clone();
@@ -431,7 +431,7 @@ fn mesh_ready(dev: &ID3D12Device) -> bool {
 }
 
 fn blob_support(pso: &ID3D12PipelineState) -> (bool, bool) {
-    let raw = pso_async::resolve_wait(pso.as_raw() as usize);
+    let raw = pso_async::wait_built(pso.as_raw() as usize);
     let passes = real::two_pass_of(raw).expect("two-pass pipeline entry");
     let available = |raw: usize| unsafe {
         let raw = raw as *mut std::ffi::c_void;

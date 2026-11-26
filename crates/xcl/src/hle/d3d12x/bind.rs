@@ -4881,8 +4881,12 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
                 super::super::list_x::set_descriptor_heaps_x(this, 0, std::ptr::null());
                 assert!(super::super::list_x::bound_heaps(this, false).is_empty());
                 assert!(bind_two_pass_stage(this, list, 0, &tp, 0, compute_pass).is_err());
-                assert_eq!(super::super::list_x::bound_heaps(this, false), vec![g], "compute pass {compute_pass}: the shared heap is bound");
-                assert_eq!(fake.calls.lock().unwrap().last(), Some(&vec![g]), "compute pass {compute_pass}");
+                let mut expected = vec![g];
+                if let Some(s) = super::super::console_heap::global_sampler_heap_raw() {
+                    expected.push(s);
+                }
+                assert_eq!(super::super::list_x::bound_heaps(this, false), expected, "compute pass {compute_pass}: the shared heap is bound");
+                assert_eq!(fake.calls.lock().unwrap().last(), Some(&expected), "compute pass {compute_pass}");
             }
             super::super::list_x::bound_heaps(this, true);
             forget(this);

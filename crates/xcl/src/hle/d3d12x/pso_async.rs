@@ -1190,7 +1190,8 @@ mod used_tests {
             });
             submit_as(standin, true, job, false, 0, true);
             shared(standin, 0x7E57_C0DF);
-            let built = resolve_wait_for(standin, None);
+            let built = wait_built(standin);
+            assert_eq!(resolve_wait_for(standin, None), built);
             assert_ne!(built, 0x7E57_C0DF);
             release_unused(0);
             assert_eq!(resolve_wait_for(standin, None), built, "just used");
@@ -1243,7 +1244,8 @@ mod used_tests {
             });
             submit_as(standin, false, job, false, 0, true);
             shared(standin, 0x7E57_C0E1);
-            let built = resolve_wait_for(standin, None);
+            let built = wait_built(standin);
+            assert_eq!(resolve_wait_for(standin, None), built);
             assert_ne!(built, 0x7E57_C0E1);
             release_unused_with(0, super::super::shader_code::IDLE_MS);
             assert_eq!(resolve_wait_for(standin, None), built, "recently used graphics pipeline must stay");
@@ -1706,6 +1708,7 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
 /// `resolve_spared` the build is `wanted`: the title binds it now, so it goes before the builds
 /// made ahead and does not wait for free commit (up to `real::big_compile_turn`'s cap).
 fn resolve_unwaited(p: &Arc<Pending>, pso: usize) -> usize {
+    p.build_again();
     match p.real.load(Ordering::Acquire) {
         0 => {
             // (before it is sent: the worker's compiles see it wanted from their start)
@@ -1722,7 +1725,7 @@ fn resolve_unwaited(p: &Arc<Pending>, pso: usize) -> usize {
             }
             p.stand(pso)
         }
-        r => r,
+        _ => p.take(pso),
     }
 }
 

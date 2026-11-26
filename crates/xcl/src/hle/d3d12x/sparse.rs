@@ -504,10 +504,10 @@ fn early_remove(early: &mut BTreeMap<usize, usize>, a: usize, b: usize) {
 }
 /// generation counter incremented whenever the set of mapped tiles changes (for watch_ranges cache)
 static MAPPED_GEN: AtomicU64 = AtomicU64::new(0);
-/// generation counter incremented only when a mapped tile enters a new 16 MiB watch bucket (or
+/// generation counter incremented only when a mapped tile enters a new 4 MiB watch bucket (or
 /// `init` resets windows), preventing `cached_watch_ranges` from rebuilding on every tile churn.
 static MAPPED_WATCH_GEN: AtomicU64 = AtomicU64::new(0);
-const WATCH_BUCKET: usize = 16 << 20;
+const WATCH_BUCKET: usize = 4 << 20;
 static WATCH_BUCKETS: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
 
 /// Generation counter of `mapped_ranges()` (changes only when tiles are mapped or unmapped).
@@ -515,10 +515,19 @@ pub fn mapped_gen() -> u64 {
     MAPPED_GEN.load(Ordering::Acquire)
 }
 
-/// Coarse generation counter for write-watch range caching: bumps only when a newly mapped tile
-/// enters a 16 MiB bucket not yet watched (inside `WATCH_GAP = 64 MiB`).
+/// Coarse generation counter for write-watch range caching: bumps whenever a newly mapped tile
+/// enters a `WATCH_BUCKET` not yet in `mapped_watch_ranges()`.
 pub fn mapped_watch_gen() -> u64 {
     MAPPED_WATCH_GEN.load(Ordering::Acquire)
+}
+
+/// Coarse `WATCH_BUCKET`-aligned ranges covering every sparse tile mapped since `init`:
+/// matches `mapped_watch_gen()` without locking `STATE` and guarantees every tile in a bucket
+/// is watched by `GetWriteWatch` even when later tiles map into the same bucket.
+pub fn mapped_watch_ranges() -> Vec<(usize, usize)> {
+    let g = WATCH_BUCKETS.lock().unwrap();
+    let Some(set) = g.as_ref() else { return Vec::new() };
+    set.iter().map(|&b| (b, b.saturating_add(WATCH_BUCKET))).collect()
 }
 
 fn note_watch_tiles(first: usize, end: usize) {
@@ -1662,6 +1671,7 @@ unsafe fn execute_readback_spans(
 }
 
 struct AsyncReadbackReq {
+    seq: u64,
     dev: ID3D12Device,
     q_fence: ID3D12Fence,
     q_val: u64,
@@ -1673,12 +1683,42 @@ struct AsyncReadbackReq {
 // SAFETY: COM objects in `AsyncReadbackReq` are free-threaded.
 unsafe impl Send for AsyncReadbackReq {}
 
+struct DeferredFenceEvent {
+    fence: ID3D12Fence,
+    val: u64,
+    event: usize,
+    wait_seq: u64,
+}
+
+// SAFETY: `ID3D12Fence` is free-threaded; `event` is a Win32 HANDLE owned by the caller until signalled.
+unsafe impl Send for DeferredFenceEvent {}
+
+#[derive(Default)]
+struct RbSyncState {
+    next_seq: u64,
+    in_flight: std::collections::HashSet<u64>,
+    queue_latest: FxHashMap<usize, u64>,
+    /// `fence_ptr -> [(signalled_val, rb_seq)]` for queues that had pending sparse readbacks when `Signal` ran.
+    fence_deps: FxHashMap<usize, Vec<(u64, u64)>>,
+    deferred_events: Vec<DeferredFenceEvent>,
+}
+
 struct AsyncRbChannel {
     inbox: Mutex<VecDeque<AsyncReadbackReq>>,
+    sync: Mutex<RbSyncState>,
+    done_cv: std::sync::Condvar,
     wake: usize, // Win32 HANDLE (auto-reset event)
 }
 
+/// Number of async sparse readbacks currently in flight (fast-path guard for fence hooks).
+static PENDING_RB_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 static ASYNC_RB: OnceLock<AsyncRbChannel> = OnceLock::new();
+
+#[inline]
+pub fn has_pending_readbacks() -> bool {
+    PENDING_RB_COUNT.load(Ordering::Acquire) != 0
+}
 
 fn async_rb_channel() -> &'static AsyncRbChannel {
     ASYNC_RB.get_or_init(|| {
@@ -1688,8 +1728,110 @@ fn async_rb_channel() -> &'static AsyncRbChannel {
         let _ = std::thread::Builder::new().name("xcl-sparse-rb".into()).spawn(move || unsafe {
             async_rb_worker(HANDLE(wake_raw as *mut c_void));
         });
-        AsyncRbChannel { inbox: Mutex::new(VecDeque::new()), wake: wake_raw }
+        AsyncRbChannel {
+            inbox: Mutex::new(VecDeque::new()),
+            sync: Mutex::new(RbSyncState::default()),
+            done_cv: std::sync::Condvar::new(),
+            wake: wake_raw,
+        }
     })
+}
+
+/// Record that `queue.Signal(fence, val)` was submitted after any in-flight sparse readbacks on `queue`.
+pub fn note_queue_signal(queue: usize, fence: usize, val: u64) {
+    if !has_pending_readbacks() {
+        return;
+    }
+    let Some(ch) = ASYNC_RB.get() else { return };
+    let st = &mut *ch.sync.lock().unwrap();
+    let Some(&seq) = st.queue_latest.get(&queue) else { return };
+    if !st.in_flight.contains(&seq) {
+        return;
+    }
+    let in_flight = &st.in_flight;
+    let deps = st.fence_deps.entry(fence).or_default();
+    deps.retain(|&(_, s)| in_flight.contains(&s));
+    deps.push((val, seq));
+}
+
+/// Wait for any in-flight sparse readbacks that preceded `fence <= completed` so CPU reads after
+/// observing `GetCompletedValue() >= val` see the GPU's sparse writes. Because `dep_val <= completed`,
+/// the title queue has already finished on the GPU, so this never deadlocks a blocked queue.
+pub fn wait_for_completed_readbacks(fence: usize, completed: u64) {
+    if !has_pending_readbacks() {
+        return;
+    }
+    let Some(ch) = ASYNC_RB.get() else { return };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut st = ch.sync.lock().unwrap();
+    loop {
+        let waiting = st
+            .fence_deps
+            .get(&fence)
+            .is_some_and(|deps| deps.iter().any(|&(v, s)| v <= completed && st.in_flight.contains(&s)));
+        if !waiting {
+            break;
+        }
+        let Some(rem) = deadline.checked_duration_since(std::time::Instant::now()) else { break };
+        let (next, res) = ch.done_cv.wait_timeout(st, rem).unwrap();
+        st = next;
+        if res.timed_out() {
+            break;
+        }
+    }
+}
+
+/// If `fence` at `val` depends on an in-flight sparse readback, defer `event` until `xcl-sparse-rb`
+/// finishes copying the GPU's sparse writes into CPU memory (returns `true` if deferred).
+/// For `event == 0` (synchronous `SetEventOnCompletion(val, NULL)`), returns `false`; the caller
+/// runs the PC wait and then calls `wait_for_completed_readbacks(fence, val)`.
+pub unsafe fn defer_fence_event(fence_ptr: *mut c_void, val: u64, event: usize) -> bool {
+    if event == 0 || !has_pending_readbacks() {
+        return false;
+    }
+    let Some(ch) = ASYNC_RB.get() else { return false };
+    let Some(fence) = ID3D12Fence::from_raw_borrowed(&fence_ptr) else { return false };
+    let mut st = ch.sync.lock().unwrap();
+    let max_seq = st
+        .fence_deps
+        .get(&(fence_ptr as usize))
+        .and_then(|deps| deps.iter().filter(|&&(v, s)| v <= val && st.in_flight.contains(&s)).map(|&(_, s)| s).max());
+    let Some(wait_seq) = max_seq else { return false };
+    st.deferred_events.push(DeferredFenceEvent { fence: fence.clone(), val, event, wait_seq });
+    true
+}
+
+unsafe fn finish_rb_seq(ch: &AsyncRbChannel, seq: u64) {
+    let ready: Vec<DeferredFenceEvent> = {
+        let mut st = ch.sync.lock().unwrap();
+        if st.in_flight.remove(&seq) {
+            PENDING_RB_COUNT.fetch_sub(1, Ordering::AcqRel);
+        }
+        if st.in_flight.is_empty() {
+            st.fence_deps.clear();
+            st.queue_latest.clear();
+        }
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < st.deferred_events.len() {
+            let ev = &st.deferred_events[i];
+            let still_blocked = st.in_flight.contains(&ev.wait_seq)
+                || st
+                    .fence_deps
+                    .get(&(ev.fence.as_raw() as usize))
+                    .is_some_and(|deps| deps.iter().any(|&(v, s)| v <= ev.val && st.in_flight.contains(&s)));
+            if !still_blocked {
+                out.push(st.deferred_events.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        ch.done_cv.notify_all();
+        out
+    };
+    for w in ready {
+        let _ = w.fence.SetEventOnCompletion(w.val, HANDLE(w.event as *mut c_void));
+    }
 }
 
 unsafe fn async_rb_worker(wake: HANDLE) {
@@ -1719,6 +1861,7 @@ unsafe fn async_rb_worker(wake: HANDLE) {
             if done {
                 let req = pending.remove(i);
                 execute_readback_spans(&req.dev, &req.spans, None, req.state_gen, "async");
+                finish_rb_seq(ch, req.seq);
                 progressed = true;
             } else if pending[i].enqueued_at.elapsed() > std::time::Duration::from_secs(15) {
                 let req = pending.remove(i);
@@ -1732,6 +1875,7 @@ unsafe fn async_rb_worker(wake: HANDLE) {
                         n
                     );
                 }
+                finish_rb_seq(ch, req.seq);
             } else {
                 i += 1;
             }
@@ -1770,6 +1914,7 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     if ranges.is_empty() {
         return;
     }
+    let ch = async_rb_channel();
     let req = {
         let mut g = lock_state();
         let Some(s) = g.as_mut() else { return };
@@ -1808,7 +1953,17 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
         if queue.Signal(&*q_fence, v).is_err() {
             return;
         }
+        let seq = {
+            let mut st = ch.sync.lock().unwrap();
+            st.next_seq += 1;
+            let seq = st.next_seq;
+            st.in_flight.insert(seq);
+            st.queue_latest.insert(key, seq);
+            PENDING_RB_COUNT.fetch_add(1, Ordering::AcqRel);
+            seq
+        };
         AsyncReadbackReq {
+            seq,
             dev: s.dev.clone(),
             q_fence: q_fence.clone(),
             q_val: v,
@@ -1817,7 +1972,6 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
             enqueued_at: std::time::Instant::now(),
         }
     };
-    let ch = async_rb_channel();
     ch.inbox.lock().unwrap().push_back(req);
     let _ = windows::Win32::System::Threading::SetEvent(HANDLE(ch.wake as *mut c_void));
 }

@@ -117,10 +117,12 @@ pub fn bound(list: usize) {
         return;
     }
     let allocator = match super::alloc_pool::enabled() {
-        true => super::alloc_pool::recording_backing(list).unwrap_or(0),
+        true => super::alloc_pool::recording_backing(list).unwrap_or_else(|| super::list_x::allocator_of(list)),
         false => super::list_x::allocator_of(list),
     };
-    keep(allocator, held);
+    if allocator != 0 {
+        keep(allocator, held);
+    }
 }
 
 /// `bound` for a list recording on the PC allocator `allocator`.
