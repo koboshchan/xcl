@@ -194,9 +194,9 @@ impl Table {
 
     /// Permanently retire active and shadowed entries overlapping `[va, end)` (used when a
     /// GPU-owned render target / depth / UAV overwrites the address range). Returns
-    /// `(pending_delta, retired_count, placed_res_to_unmap)`.
-    fn retire_range(&mut self, va: usize, end: usize) -> (isize, usize, Vec<usize>) {
-        let (mut pending_delta, mut retired, mut to_unmap) = (0isize, 0usize, Vec::new());
+    /// `(pending_delta, retired_res, placed_res_to_unmap)`.
+    fn retire_range(&mut self, va: usize, end: usize) -> (isize, Vec<usize>, Vec<usize>) {
+        let (mut pending_delta, mut retired, mut to_unmap) = (0isize, Vec::new(), Vec::new());
         for (ova, ores, _) in self.active_overlaps(va, end) {
             self.by_va.remove(&(ova, ores));
             if let Some(old) = self.by_res.remove(&ores) {
@@ -206,7 +206,7 @@ impl Table {
                 if old.placed && !old.unmapped {
                     to_unmap.push(ores);
                 }
-                retired += 1;
+                retired.push(ores);
             }
         }
         for (sva, sres, _) in self.shadowed_overlaps(va, end) {
@@ -215,7 +215,7 @@ impl Table {
                 if old.placed && !old.unmapped {
                     to_unmap.push(sres);
                 }
-                retired += 1;
+                retired.push(sres);
             }
         }
         if self.shadowed.is_empty() {
@@ -450,6 +450,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
     let to_unmap = {
         let mut t = TEXTURES.lock().unwrap();
         let (delta, unmap_ptrs) = t.insert(res as usize, e);
+        forget_last_content(&unmap_ptrs);
         adjust_pending(delta);
         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
         clone_resources(&unmap_ptrs)
@@ -616,30 +617,47 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
         .into_iter()
         .filter(|&g| g != va && mirror_source(g) == va)
         .collect();
-    let (retired, to_unmap) = {
+    let (retired_ptrs, to_unmap) = {
         let mut t = TEXTURES.lock().unwrap();
-        let (mut delta, mut retired, mut unmap_ptrs) = t.retire_range(va, va.saturating_add(len));
+        let (mut delta, mut retired_ptrs, mut unmap_ptrs) = t.retire_range(va, va.saturating_add(len));
         if src != va {
             let (d2, r2, u2) = t.retire_range(src, src.saturating_add(len));
             delta += d2;
-            retired += r2;
+            retired_ptrs.extend(r2);
             unmap_ptrs.extend(u2);
         }
         for g in gpu_aliases {
             let (d3, r3, u3) = t.retire_range(g, g.saturating_add(len));
             delta += d3;
-            retired += r3;
+            retired_ptrs.extend(r3);
             unmap_ptrs.extend(u3);
         }
+        forget_last_content(&retired_ptrs);
         adjust_pending(delta);
         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
-        (retired, clone_resources(&unmap_ptrs))
+        (retired_ptrs, clone_resources(&unmap_ptrs))
     };
+    if !retired_ptrs.is_empty() {
+        let mut g = STREAM_RECHECK.lock().unwrap();
+        for &r in &retired_ptrs {
+            g.remove(&r);
+        }
+    }
     for r in &to_unmap {
         super::vram::unmap_superseded(r);
     }
-    if retired > 0 {
+    if !retired_ptrs.is_empty() {
         TEXTURES_GEN.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Drop cached upload hashes for textures whose VRAM tiles were unmapped, remapped, or retired.
+fn forget_last_content(ptrs: &[usize]) {
+    if !ptrs.is_empty() {
+        let mut last = LAST_CONTENT.lock().unwrap();
+        for &res in ptrs {
+            last.remove(&res);
+        }
     }
 }
 
@@ -650,6 +668,7 @@ pub fn forget(res: usize) {
     let (removed, to_remap) = {
         let mut t = TEXTURES.lock().unwrap();
         let (removed, delta, remap_ptrs) = t.remove(res);
+        forget_last_content(&remap_ptrs);
         adjust_pending(delta);
         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
         (removed, unsafe { clone_resources(&remap_ptrs) })
@@ -2856,5 +2875,187 @@ mod tests {
 
         // Different device always starts a new batch.
         assert!(!batch_fits(1, 4096, 1, 2, 4096));
+    }
+
+    /// Regression for #2460: when a placed texture is unmapped by a different-range overlap and
+    /// later uncovered on release, `LAST_CONTENT` must not skip its re-upload when its CPU bytes
+    /// still match its pre-shadow upload — both on plain `vram::Pages` (where shared/recycled
+    /// tiles lost its texels) and under `vram::level_pages` (where `remap_if_unmapped` leaves all
+    /// lazy level groups unmapped until `map_levels_with_texels` runs during `upload_all`).
+    #[test]
+    fn shadowed_placed_texture_reuploads_and_remaps_levels_with_unchanged_cpu_bytes() {
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        use windows::Win32::Graphics::Dxgi::*;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+
+        struct VirtualMem(usize);
+        impl Drop for VirtualMem {
+            fn drop(&mut self) {
+                unsafe { VirtualFree(self.0 as *mut c_void, 0, MEM_RELEASE); }
+            }
+        }
+        struct LevelPagesGuard;
+        impl Drop for LevelPagesGuard {
+            fn drop(&mut self) {
+                super::super::vram::LEVEL_PAGES_FOR_TEST.store(false, Ordering::Relaxed);
+            }
+        }
+
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let Ok(adapter) = factory.EnumAdapters1(0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut opts as *mut _ as *mut c_void, std::mem::size_of_val(&opts) as u32).is_err()
+                || opts.ResourceHeapTier.0 < 2
+                || opts.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_2.0
+            {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            }
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+
+            let place_tex = |va: usize, desc: &[u8; 0x38]| -> ID3D12Resource {
+                let mut p = std::ptr::null_mut();
+                let hr = super::super::device_x::create_placed_resource_x(dev.as_raw(), va as u64, desc.as_ptr(), D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), riid, &mut p);
+                assert!(hr >= 0 && !p.is_null(), "CreatePlacedResourceX failed: {hr:#x}");
+                assert!(super::super::vram::is_placed_texture(p as usize), "expected shared vram::Pages texture at {va:#x}");
+                ID3D12Resource::from_raw(p)
+            };
+            let read_sub = |r: &ID3D12Resource, sub: u32| -> Vec<u8> {
+                let rd = r.GetDesc();
+                let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+                let (mut rows, mut row_bytes, mut total) = (0u32, 0u64, 0u64);
+                dev.GetCopyableFootprints(&rd, sub, 1, 0, Some(&mut fp), Some(&mut rows), Some(&mut row_bytes), Some(&mut total));
+                let mut rb: Option<ID3D12Resource> = None;
+                let buffer = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: total, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() };
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb).unwrap();
+                let rb = rb.unwrap();
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+                let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub } };
+                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                list.Close().unwrap();
+                own_work(|| {
+                    super::super::vram::before_execute(&queue);
+                    queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                    texture::wait(&dev, &queue).unwrap();
+                });
+                let mut p = std::ptr::null_mut();
+                rb.Map(0, None, Some(&mut p)).unwrap();
+                let mut out = Vec::with_capacity(rows as usize * row_bytes as usize);
+                for y in 0..rows as usize {
+                    out.extend_from_slice(std::slice::from_raw_parts((p as *const u8).add(y * fp.Footprint.RowPitch as usize), row_bytes as usize));
+                }
+                rb.Unmap(0, None);
+                out
+            };
+            // Drain `vram::Pages::queue` before dropping a resource whose last operation was an
+            // asynchronous `UpdateTileMappings` (`late_release` does not yet wait on tiled-texture
+            // queues; see #1314).
+            let wait_tiles = || {
+                own_work(|| {
+                    super::super::vram::before_execute(&queue);
+                    texture::wait(&dev, &queue).unwrap();
+                });
+            };
+
+            // 1. Lazy level pages (`XCL_TEXTURE_LEVEL_PAGES=1`): shadow A with different-range B
+            // without touching A's CPU bytes, then release B. A must regain its mapped level pages
+            // and texels on the next refresh instead of being skipped by LAST_CONTENT.
+            let lazy_desc = console_desc(3, 1024, 1024, 1, 11, 28, 0x109);
+            let small_desc = console_desc(3, 256, 256, 1, 1, 28, 0x109);
+            let lazy_tex = xg::Texture::new(&lazy_desc).unwrap();
+            let surface = lazy_tex.texels().unwrap();
+            let (lazy_size, chain) = (lazy_tex.size() as usize, &surface.chain);
+            let alloc_bytes = lazy_size.next_multiple_of(0x1_0000);
+            let at = VirtualAlloc(std::ptr::null(), alloc_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(at, 0);
+            let _mem = VirtualMem(at);
+            let slice = std::slice::from_raw_parts_mut(at as *mut u8, chain.slice_bytes);
+            slice.fill(0);
+            for (m, l) in chain.levels.iter().enumerate() {
+                let pat: Vec<u8> = (0..l.width * l.height * surface.bpe as usize).map(|k| 1 + ((m * 7 + k * 13) % 251) as u8).collect();
+                chain.tile_level(slice, m, 0, &pat);
+            }
+            let want_lazy = subresources(at, &lazy_tex);
+
+            let _lp = LevelPagesGuard;
+            super::super::vram::LEVEL_PAGES_FOR_TEST.store(true, Ordering::Relaxed);
+            let dev_key = dev.as_raw() as usize;
+            let lazy_a = place_tex(at, &lazy_desc);
+            let lazy_key = lazy_a.as_raw() as usize;
+            if super::super::vram::has_lazy_levels(lazy_key) {
+                assert!(super::super::vram::mapped_tiles_for(dev_key, lazy_key).is_none(), "no tiles mapped before first upload");
+                refresh(queue.as_raw());
+                assert!(super::super::vram::mapped_tiles_for(dev_key, lazy_key).is_some(), "all tiles mapped after first upload");
+                assert_eq!(read_sub(&lazy_a, 0), want_lazy[0].data);
+
+                let lazy_b = place_tex(at + 0x10_0000, &small_desc);
+                assert!(super::super::vram::mapped_tiles_for(dev_key, lazy_key).is_none(), "unmapping superseded lazy texture releases its tiles");
+                drop(lazy_b);
+                refresh(queue.as_raw());
+                assert!(super::super::vram::mapped_tiles_for(dev_key, lazy_key).is_some(), "uncovered lazy texture must remap all non-zero levels");
+                for sub in 0..11u32 {
+                    assert_eq!(read_sub(&lazy_a, sub), want_lazy[sub as usize].data, "lazy level {sub} after uncover");
+                }
+            }
+            wait_tiles();
+            drop(lazy_a);
+            super::super::vram::LEVEL_PAGES_FOR_TEST.store(false, Ordering::Relaxed);
+
+            // 2. Plain `vram::Pages`: A uploaded with pattern P, overlapped at +256 KiB by B (which
+            // overwrites those shared tiles on GPU), CPU memory restored to exact pattern P, then B
+            // released. Next refresh must re-upload A instead of skipping on LAST_CONTENT.
+            let old_desc = console_desc(3, 512, 512, 1, 1, 28, 0x109); // 1 MiB
+            let old_tex = xg::Texture::new(&old_desc).unwrap();
+            let small_tex = xg::Texture::new(&small_desc).unwrap();
+            let fill_2d = |va: usize, tex: &xg::Texture, seed: u8| {
+                let s = tex.texels().unwrap();
+                let dst = std::slice::from_raw_parts_mut(va as *mut u8, tex.size() as usize);
+                dst.fill(0);
+                let l = &s.chain.levels[0];
+                let pat: Vec<u8> = (0..l.width * l.height * s.bpe as usize).map(|k| seed.wrapping_add((k * 13) as u8)).collect();
+                s.chain.tile_level(dst, 0, 0, &pat);
+            };
+            let old_a = place_tex(at, &old_desc);
+            fill_2d(at, &old_tex, 0xAA);
+            let want_old = subresources(at, &old_tex).swap_remove(0).data;
+            refresh(queue.as_raw());
+            assert_eq!(read_sub(&old_a, 0), want_old);
+
+            let over_b = place_tex(at + 0x4_0000, &small_desc);
+            fill_2d(at + 0x4_0000, &small_tex, 0x55);
+            refresh(queue.as_raw());
+
+            fill_2d(at, &old_tex, 0xAA);
+            drop(over_b);
+            refresh(queue.as_raw());
+            assert_eq!(read_sub(&old_a, 0), want_old, "uncovered placed texture must re-upload when CPU bytes match pre-shadow upload");
+
+            // 3. `retire_overlapping` also evicts retired entries from LAST_CONTENT.
+            let key_a = old_a.as_raw() as usize;
+            assert!(LAST_CONTENT.lock().unwrap().contains_key(&key_a));
+            retire_overlapping(at, old_tex.size() as usize);
+            assert!(!LAST_CONTENT.lock().unwrap().contains_key(&key_a), "retire_overlapping must evict LAST_CONTENT");
+            wait_tiles();
+            drop(old_a);
+        }
     }
 }
