@@ -3718,7 +3718,7 @@ unsafe fn own_memory_if_larger_on_the_pc(this: *mut c_void, heap: usize, offset:
     if u32::from_le_bytes(x[0..4].try_into().unwrap()) == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32 {
         return None;
     }
-    let console = crate::hle::xg::Texture::new(&x).ok()?.size();
+    let console = super::device_x::console_texture_bytes(&x)?;
     let d = super::device_x::pc_resource_desc(&x);
     let pc = pc_allocation_size(this, &d);
     if console == u64::MAX || pc == u64::MAX || pc <= console {

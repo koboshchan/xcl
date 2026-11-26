@@ -1140,6 +1140,33 @@ fn note_alias(va: usize, x: &[u8; 0x38]) {
     }
 }
 
+/// Console byte size of a placed texture (`xg::Texture::new`).
+///
+/// 3D render targets (e.g. `33x33x33` `R16G16B16A16_FLOAT` color-grading LUTs with
+/// `ALLOW_RENDER_TARGET | ALLOW_UNORDERED_ACCESS`) are rejected by `xg::Texture::volume`
+/// because RT metadata planes are not modelled. Returning `None` made `vram::owned_pages`
+/// claim every PC tile (`18` 64 KiB pages = `1,152 KiB` instead of `8` = `512 KiB`),
+/// overlapping adjacent LUTs and trailing render targets. Retry without `ALLOW_RENDER_TARGET`
+/// to recover the volume's exact console texel footprint.
+pub(super) fn console_texture_bytes(x: &[u8; 0x38]) -> Option<u64> {
+    let query = |d: &[u8; 0x38]| crate::hle::xg::Texture::new(d).ok().map(|t| t.size()).filter(|&s| s != u64::MAX && s != 0);
+    query(x).or_else(|| {
+        let dim = u32::from_le_bytes(x[0..4].try_into().unwrap());
+        let flags = u32::from_le_bytes(x[0x30..0x34].try_into().unwrap());
+        if dim == D3D12_RESOURCE_DIMENSION_TEXTURE3D.0 as u32 && flags & 1 != 0 && flags & 2 == 0 {
+            let layout = u32::from_le_bytes(x[0x2C..0x30].try_into().unwrap());
+            let mut no_rt = *x;
+            // Clear RT (and UAV when layout == 0 so xg::Texture::volume uses 4KB_S instead of
+            // 2D-slice 64KB_R_X); explicit swizzle modes (0x100..=0x11F) use layout directly.
+            let adjusted_flags = if layout == 0 { flags & !5 } else { flags & !1 };
+            no_rt[0x30..0x34].copy_from_slice(&adjusted_flags.to_le_bytes());
+            query(&no_rt)
+        } else {
+            None
+        }
+    })
+}
+
 /// device #44 CreatePlacedResourceX(address, desc, initial state, clear value, riid, resource):
 /// a resource in title memory. A buffer at a 64 KiB-aligned address in unified memory is that
 /// memory (placed in its UMA heap); a texture gets a PC texture kept in step with the memory
@@ -1185,7 +1212,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     if !buffer {
         let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
         pc_tex_desc = Some(pc);
-        let console_bytes = crate::hle::xg::Texture::new(&x).ok().map(|t| t.size()).filter(|&s| s != u64::MAX && s != 0);
+        let console_bytes = console_texture_bytes(&x);
         if super::vram::gpu_owned(flags) {
             if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, console_bytes, riid, ppv) {
                 if hr >= 0 && !(*ppv).is_null() {
@@ -1883,5 +1910,25 @@ mod tests {
         assert_eq!(record_alias_in(&mut seen, &logged, 0x5000, d1, MAX_ALIAS_TRACKED), None);
         assert!(seen.is_none(), "residual map must be freed once cap is reached");
         assert_eq!(logged.load(Ordering::Relaxed), MAX_ALIAS_LOGS);
+    }
+
+    #[test]
+    fn volume_render_target_console_bytes_prevents_page_overlap() {
+        // 33x33x33 R16G16B16A16_FLOAT (format 10), TEXTURE3D (dim 4), RT | UAV (flags 0x5).
+        for layout in [0u32, 0x105, 0x115] {
+            let mut x = [0u8; 0x38];
+            x[0..4].copy_from_slice(&4u32.to_le_bytes());
+            x[0x10..0x18].copy_from_slice(&33u64.to_le_bytes());
+            x[0x18..0x1C].copy_from_slice(&33u32.to_le_bytes());
+            x[0x1C..0x1E].copy_from_slice(&33u16.to_le_bytes());
+            x[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
+            x[0x20..0x24].copy_from_slice(&10u32.to_le_bytes());
+            x[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+            x[0x2C..0x30].copy_from_slice(&layout.to_le_bytes());
+            x[0x30..0x34].copy_from_slice(&0x5u32.to_le_bytes());
+            assert!(crate::hle::xg::Texture::new(&x).is_err(), "xg::Texture::volume rejects RT volumes (layout={layout:#x})");
+            let bytes = console_texture_bytes(&x).expect("3D RT fallback recovers exact volume footprint");
+            assert_eq!(bytes, 512_000, "33x33x33 R16G16B16A16_FLOAT is 8x64 KiB pages (512000 B), layout={layout:#x}");
+        }
     }
 }
