@@ -2280,6 +2280,7 @@ pub(super) unsafe fn execute_with_waits(lists: &[*mut c_void], submit: impl FnMu
 
 /// command list #60 CopyMemoryToMemoryX(destination, source, size, flags)
 pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, src: u64, size: u64, _flags: u32) {
+    super::bind::note_gpu_write(this);
     static N: AtomicU64 = AtomicU64::new(0);
     const W: &str = "CopyMemoryToMemoryX";
     if size == 0 || !size.is_multiple_of(4) {
@@ -2622,6 +2623,7 @@ pub(super) unsafe extern "system" fn fill128_x(this: *mut c_void, va: u64, size:
 /// Values written by the GPU at `va` (WriteBufferImmediate: MARKER_IN = when the command is
 /// reached, MARKER_OUT = when the work before it is done).
 unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFFERIMMEDIATE_MODE, what: &str) {
+    super::bind::note_gpu_write(list);
     static N: AtomicU64 = AtomicU64::new(0);
     let n = 4 * words.len() as u64;
     if !va.is_multiple_of(n) {
@@ -3141,6 +3143,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
         }
         super::bind::inherit_for_split(list, seg, alloc);
         super::bind::pass_arena(list, next_pc);
+        super::bind::unblock_prelude(next_pc);
     }
     super::title_list::activate_segment(wrapper, list, next_pc);
     Some(next_pc)
@@ -3224,11 +3227,14 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
         }
         if s.write64_signals.is_empty() {
             s.push_wait(PendingWait { va, width, comparison, value, mask, after_write64: false });
+            drop(g);
+            super::bind::note_gpu_write(list);
             return;
         }
         true
     };
     let target = if need_split { try_split_for_wait(list).unwrap_or(list) } else { list };
+    super::bind::note_gpu_write(target);
     let mut g = LISTS.lock().unwrap();
     let s = g.get_or_insert_with(HashMap::new).entry(target as usize).or_default();
     let after_write64 = !s.write64_signals.is_empty();
@@ -3288,6 +3294,7 @@ pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u3
 /// writes become visible, parses any readable `D3D12_BARRIER_GROUP` texture barriers targeting
 /// tracked depth+UAV resources, and notifies `depth_uav` / `format_alias` of global UAV barriers.
 pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, n: u32, barriers: *const c_void) {
+    super::bind::note_gpu_write(this);
     let b = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -4487,6 +4494,9 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
         super::title_textures::note_transitions(this as usize, &t);
     }
     if !out.is_empty() {
+        if any_uav || uav_transition {
+            super::bind::note_gpu_write(this);
+        }
         pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(this, PC_RESOURCE_BARRIER)(this, out.len() as u32, out.as_ptr());
     }
     if !depth_syncs.is_empty() {
@@ -4556,6 +4566,7 @@ fn note_gpu_write(what: &str, va: usize, n: u64) {
 }
 
 pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
+    super::bind::note_gpu_write(this);
     if super::present::trace_frame() {
         if let Some(a) = real::title_address(dst) {
             note_gpu_write("CopyBufferRegion", a + dst_off as usize, n);

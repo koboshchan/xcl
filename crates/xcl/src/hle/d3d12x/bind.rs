@@ -100,6 +100,29 @@ impl Drop for IoBlock {
 type PreludeEntry = (ID3D12CommandAllocator, ID3D12GraphicsCommandList, usize, i32);
 
 #[derive(Default)]
+struct PreludeScratchSlot {
+    buf: Option<(ID3D12Resource, u64, usize)>,
+    used: u64,
+    buf_idx: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PreludeScaleJob {
+    buf_idx: usize,
+    dst_off: u32,
+    count: u32,
+    stride: u32,
+    mesh_offset: u32,
+    split: u32,
+    cap: u32,
+    src_win: u32,
+    src_off: u32,
+    has_cnt: u32,
+    cnt_win: u32,
+    cnt_off: u32,
+}
+
+#[derive(Default)]
 struct State {
     layout: Option<Arc<Layout>>,
     args: Vec<u8>,
@@ -126,6 +149,11 @@ struct State {
     scratch: Option<(ID3D12Resource, u64, usize)>,
     scratch_used: u64,
     scratch_taken: u64,
+    /// hoisted two-pass indirect argument scaling recorded into `xcl prelude`
+    prelude_blocked: bool,
+    prelude_scratch: PreludeScratchSlot,
+    prelude_bufs: Vec<ID3D12Resource>,
+    prelude_scales: Vec<PreludeScaleJob>,
     /// the next dispatch's thread limits (`IO_THREAD_LIMIT`; a `DispatchX` with thread
     /// dimensions), taken by its `bind_abi`
     limits: [u32; 3],
@@ -335,12 +363,13 @@ unsafe fn alloc_vram_io_in(io_blocks: &mut Vec<IoBlock>, allocator: usize, prelu
     Some(va)
 }
 
-/// Build (once per recording) and return the closed PC prelude command list that copies all
-/// L1 VRAM `io` (`u0`) slabs for `seg` before `seg` executes on the queue.
+/// Build (once per recording) and return the closed PC prelude command list that uploads all
+/// L1 VRAM `io` (`u0`) slabs and runs any hoisted batched two-pass indirect argument scaling
+/// for `seg` before `seg` executes on the queue.
 pub(super) unsafe fn prelude_list_for(seg: *mut c_void) -> Option<*mut c_void> {
-    let (already, io_copies) = with(seg, |s| {
+    let (already, io_copies, bufs, scales) = with(seg, |s| {
         if let Some(ref built) = s.prelude_built {
-            return (Some(built.as_raw()), Vec::new());
+            return (Some(built.as_raw()), Vec::new(), Vec::new(), Vec::new());
         }
         let copies: Vec<(ID3D12Resource, ID3D12Resource, u64)> = s
             .io_blocks
@@ -348,12 +377,15 @@ pub(super) unsafe fn prelude_list_for(seg: *mut c_void) -> Option<*mut c_void> {
             .filter(|b| b.used > 0)
             .map(|b| (b.vram.clone(), b.upload.clone(), b.used))
             .collect();
-        (None, copies)
+        if copies.is_empty() && s.prelude_scales.is_empty() {
+            return (None, Vec::new(), Vec::new(), Vec::new());
+        }
+        (None, copies, s.prelude_bufs.clone(), s.prelude_scales.clone())
     });
     if let Some(p) = already {
         return Some(p);
     }
-    if io_copies.is_empty() {
+    if io_copies.is_empty() && scales.is_empty() {
         return None;
     }
     let run = (|| -> Result<ID3D12GraphicsCommandList, String> {
@@ -381,41 +413,137 @@ pub(super) unsafe fn prelude_list_for(seg: *mut c_void) -> Option<*mut c_void> {
                 (a, l)
             }
         };
-        let mut to_copy: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(io_copies.len());
-        let mut to_uav: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(io_copies.len());
-        for (vram, _, _) in &io_copies {
-            to_copy.push(D3D12_RESOURCE_BARRIER {
-                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        if !io_copies.is_empty() {
+            let mut to_copy: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(io_copies.len());
+            let mut to_uav: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(io_copies.len());
+            for (vram, _, _) in &io_copies {
+                to_copy.push(D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                            pResource: std::mem::ManuallyDrop::new(Some(vram.clone())),
+                            Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            StateAfter: D3D12_RESOURCE_STATE_COPY_DEST,
+                        }),
+                    },
+                });
+                to_uav.push(D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                            pResource: std::mem::ManuallyDrop::new(Some(vram.clone())),
+                            Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            StateBefore: D3D12_RESOURCE_STATE_COPY_DEST,
+                            StateAfter: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        }),
+                    },
+                });
+            }
+            list.ResourceBarrier(&to_copy);
+            for (vram, upload, used) in &io_copies {
+                list.CopyBufferRegion(vram, 0, upload, 0, *used);
+            }
+            list.ResourceBarrier(&to_uav);
+            for b in to_copy.iter_mut().chain(to_uav.iter_mut()) {
+                std::mem::ManuallyDrop::drop(&mut (*b.Anonymous.Transition).pResource);
+            }
+        }
+        if !scales.is_empty() {
+            let u = crate::gpu::uma::get().ok_or("no unified memory for prelude scale")?;
+            let windows = super::real::uma_window_vas();
+            let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
+            let shared_heap = if super::console_heap::window_views_ready() {
+                super::console_heap::global_heap()
+            } else {
+                None
+            };
+            let mut pre_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(bufs.len() + 1);
+            pre_barriers.push(D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
                 Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
                 Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                    Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
-                        pResource: std::mem::ManuallyDrop::new(Some(vram.clone())),
-                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                        StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                        StateAfter: D3D12_RESOURCE_STATE_COPY_DEST,
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(None),
                     }),
                 },
             });
-            to_uav.push(D3D12_RESOURCE_BARRIER {
-                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                    Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
-                        pResource: std::mem::ManuallyDrop::new(Some(vram.clone())),
-                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                        StateBefore: D3D12_RESOURCE_STATE_COPY_DEST,
-                        StateAfter: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                    }),
-                },
-            });
-        }
-        list.ResourceBarrier(&to_copy);
-        for (vram, upload, used) in &io_copies {
-            list.CopyBufferRegion(vram, 0, upload, 0, *used);
-        }
-        list.ResourceBarrier(&to_uav);
-        for b in to_copy.iter_mut().chain(to_uav.iter_mut()) {
-            std::mem::ManuallyDrop::drop(&mut (*b.Anonymous.Transition).pResource);
+            for b in &bufs {
+                pre_barriers.push(D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                            pResource: std::mem::ManuallyDrop::new(Some(b.clone())),
+                            Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            StateBefore: D3D12_RESOURCE_STATE_COMMON,
+                            StateAfter: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        }),
+                    },
+                });
+            }
+            list.ResourceBarrier(&pre_barriers);
+            for b in &mut pre_barriers[1..] {
+                std::mem::ManuallyDrop::drop(&mut (*b.Anonymous.Transition).pResource);
+            }
+            if let Some(ref heap) = shared_heap {
+                list.SetDescriptorHeaps(&[Some(heap.clone())]);
+            }
+            let (rs, pso) = if shared_heap.is_some() {
+                prelude_scale_heap_pipeline(&dev)?
+            } else {
+                prelude_scale_pipeline(&dev)?
+            };
+            list.SetComputeRootSignature(&rs);
+            if shared_heap.is_none() {
+                for k in 0..4usize {
+                    let va = windows.get(k).copied().filter(|&v| v != 0).unwrap_or(first);
+                    list.SetComputeRootUnorderedAccessView(2 + k as u32, va);
+                }
+            }
+            list.SetPipelineState(&pso);
+            for (buf_idx, buf) in bufs.iter().enumerate() {
+                let batch: Vec<&PreludeScaleJob> = scales.iter().filter(|j| j.buf_idx == buf_idx).collect();
+                if batch.is_empty() {
+                    continue;
+                }
+                list.SetComputeRootUnorderedAccessView(1, buf.GetGPUVirtualAddress());
+                for chunk in batch.chunks(65_535) {
+                    let mut words = Vec::with_capacity(chunk.len() * 12);
+                    for j in chunk {
+                        words.extend_from_slice(&[
+                            j.count, j.stride, j.mesh_offset, j.split, j.cap, j.src_win, j.src_off, j.dst_off, j.has_cnt, j.cnt_win, j.cnt_off, 0,
+                        ]);
+                    }
+                    let bytes = std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), words.len() * 4);
+                    let p = arena_take(seg, u, bytes.len().max(16), 256).ok_or("unified memory is full for prelude scale jobs")?;
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
+                    let jobs_va = uma_va_in(u, &windows, p as usize).unwrap_or(first);
+                    list.SetComputeRootUnorderedAccessView(0, jobs_va);
+                    list.Dispatch(chunk.len() as u32, 1, 1);
+                }
+            }
+            let mut post_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(bufs.len());
+            for b in &bufs {
+                post_barriers.push(D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                            pResource: std::mem::ManuallyDrop::new(Some(b.clone())),
+                            Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            StateAfter: D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                        }),
+                    },
+                });
+            }
+            list.ResourceBarrier(&post_barriers);
+            for b in &mut post_barriers {
+                std::mem::ManuallyDrop::drop(&mut (*b.Anonymous.Transition).pResource);
+            }
         }
         list.Close().map_err(|e| format!("prelude list close: {e}"))?;
         let ret = list.clone();
@@ -430,7 +558,7 @@ pub(super) unsafe fn prelude_list_for(seg: *mut c_void) -> Option<*mut c_void> {
         Err(e) => {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 8 {
-                crate::xlog_warn!("D3D12.X: VRAM io prelude list failed: {e}");
+                crate::xlog_warn!("D3D12.X: prelude list failed: {e}");
             }
             None
         }
@@ -456,6 +584,21 @@ pub(super) fn invalidate_pc_abi(list: *mut c_void, gfx: bool, cs: bool) {
         if cs {
             s.pc_abi_cs = AbiBound::default();
         }
+    });
+}
+
+/// Note that `list` issued a GPU buffer write, UAV barrier, or wait: subsequent two-pass indirect
+/// argument scaling must execute inline instead of hoisting into the prelude.
+pub(super) fn note_gpu_write(list: *mut c_void) {
+    with(list, |s| {
+        s.prelude_blocked = true;
+    });
+}
+
+/// Allow prelude hoisting on a freshly split continuation segment with no head fence wait.
+pub(super) fn unblock_prelude(list: *mut c_void) {
+    with(list, |s| {
+        s.prelude_blocked = false;
     });
 }
 
@@ -517,6 +660,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.rs_gfx = 0;
         s.rs_cs = 0;
         s.heaps = [0; 2];
+        s.uma_windows = None;
         s.dummy_table_p = 0;
         s.dummy_res_va = 0;
         s.args_gen_gfx = s.args_gen_gfx.wrapping_add(1);
@@ -528,6 +672,10 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.pc_abi_gfx = AbiBound::default();
         s.pc_abi_cs = AbiBound::default();
         s.vram_io_dev = None;
+        s.prelude_blocked = false;
+        s.prelude_scratch = Default::default();
+        s.prelude_bufs.clear();
+        s.prelude_scales.clear();
         s.prelude_built = None;
         let prelude = s.prelude_owned.take();
         // (the scratch blocks are in `res_retired` already)
@@ -553,6 +701,7 @@ pub(super) fn rebind_allocator(list: *mut c_void, allocator: usize) {
     let (old, blocks, res_bufs, io_blocks, prelude) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, backing);
         s.arena = Default::default();
+        s.uma_windows = None;
         s.dummy_table_p = 0;
         s.dummy_res_va = 0;
         s.io_cache_gfx = None;
@@ -562,6 +711,10 @@ pub(super) fn rebind_allocator(list: *mut c_void, allocator: usize) {
         s.pc_abi_gfx = AbiBound::default();
         s.pc_abi_cs = AbiBound::default();
         s.vram_io_dev = None;
+        s.prelude_blocked = false;
+        s.prelude_scratch = Default::default();
+        s.prelude_bufs.clear();
+        s.prelude_scales.clear();
         s.prelude_built = None;
         let prelude = s.prelude_owned.take();
         (s.scratch, s.scratch_used, s.scratch_taken) = (None, 0, 0);
@@ -620,6 +773,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         s.rs_cs = rs_cs;
         s.pso = pso;
         s.heaps = heaps;
+        s.uma_windows = None;
         s.dummy_table_p = 0;
         s.dummy_res_va = 0;
         s.args_gen_gfx = s.args_gen_gfx.wrapping_add(1);
@@ -631,6 +785,10 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         s.pc_abi_gfx = AbiBound::default();
         s.pc_abi_cs = AbiBound::default();
         s.vram_io_dev = None;
+        s.prelude_blocked = true;
+        s.prelude_scratch = Default::default();
+        s.prelude_bufs.clear();
+        s.prelude_scales.clear();
         s.prelude_built = None;
         let prelude = s.prelude_owned.take();
         (s.scratch, s.scratch_used, s.scratch_taken) = (None, 0, 0);
@@ -1380,8 +1538,151 @@ void main() {
 }
 "#;
 
+/// Batched prelude form of `SCALE_ARGS_HLSL` using 4 raw root UAV windows (`u2..u5`).
+pub(super) const PRELUDE_SCALE_HLSL: &str = r#"RWByteAddressBuffer jobs : register(u0);
+RWByteAddressBuffer dst  : register(u1);
+RWByteAddressBuffer w0   : register(u2);
+RWByteAddressBuffer w1   : register(u3);
+RWByteAddressBuffer w2   : register(u4);
+RWByteAddressBuffer w3   : register(u5);
+uint load_u32(uint win, uint off) {
+    if (win == 0u) return w0.Load(off);
+    if (win == 1u) return w1.Load(off);
+    if (win == 2u) return w2.Load(off);
+    return w3.Load(off);
+}
+uint3 load_u32x3(uint win, uint off) {
+    if (win == 0u) return w0.Load3(off);
+    if (win == 1u) return w1.Load3(off);
+    if (win == 2u) return w2.Load3(off);
+    return w3.Load3(off);
+}
+[numthreads(64, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+    uint b = gid.x * 48u;
+    uint count   = jobs.Load(b);
+    uint stride  = jobs.Load(b + 4u);
+    uint offset  = jobs.Load(b + 8u);
+    uint split   = jobs.Load(b + 12u);
+    uint cap     = jobs.Load(b + 16u);
+    uint src_win = jobs.Load(b + 20u);
+    uint src_off = jobs.Load(b + 24u);
+    uint dst_off = jobs.Load(b + 28u);
+    uint has_cnt = jobs.Load(b + 32u);
+    uint cnt_win = jobs.Load(b + 36u);
+    uint cnt_off = jobs.Load(b + 40u);
+    uint live = count;
+    if (has_cnt != 0u) {
+        live = min(count, load_u32(cnt_win, cnt_off));
+    }
+    for (uint tid = gtid.x; tid < count; tid += 64u) {
+        uint s = src_off + tid * stride;
+        uint d = dst_off + tid * stride;
+        uint m = d + count * stride;
+        for (uint i = 0u; i < stride; i += 4u) {
+            uint w = load_u32(src_win, s + i);
+            dst.Store(d + i, w);
+            dst.Store(m + i, w);
+        }
+        uint3 g = load_u32x3(src_win, s + offset);
+        uint n = 0u;
+        if (tid < live && g.x != 0u && g.y != 0u && g.z != 0u) {
+            n = min(g.x, cap);
+            n = g.y > cap / n ? cap : n * g.y;
+            n = g.z > cap / n ? cap : n * g.z;
+        }
+        dst.Store3(d + offset, uint3(n, 1u, 1u));
+        dst.Store3(m + offset, uint3(n * split, 1u, 1u));
+    }
+}
+"#;
+
+/// Descriptor-heap form of `PRELUDE_SCALE_HLSL` (`ResourceDescriptorHeap[MEM_HEAP_BASE + win]`).
+pub(super) const PRELUDE_SCALE_HEAP_HLSL: &str = r#"RWByteAddressBuffer jobs : register(u0);
+RWByteAddressBuffer dst  : register(u1);
+[numthreads(64, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+    uint b = gid.x * 48u;
+    uint count   = jobs.Load(b);
+    uint stride  = jobs.Load(b + 4u);
+    uint offset  = jobs.Load(b + 8u);
+    uint split   = jobs.Load(b + 12u);
+    uint cap     = jobs.Load(b + 16u);
+    uint src_win = jobs.Load(b + 20u);
+    uint src_off = jobs.Load(b + 24u);
+    uint dst_off = jobs.Load(b + 28u);
+    uint has_cnt = jobs.Load(b + 32u);
+    uint cnt_win = jobs.Load(b + 36u);
+    uint cnt_off = jobs.Load(b + 40u);
+    RWByteAddressBuffer src = ResourceDescriptorHeap[NonUniformResourceIndex(4u + src_win)];
+    uint live = count;
+    if (has_cnt != 0u) {
+        RWByteAddressBuffer cnt = ResourceDescriptorHeap[NonUniformResourceIndex(4u + cnt_win)];
+        live = min(count, cnt.Load(cnt_off));
+    }
+    for (uint tid = gtid.x; tid < count; tid += 64u) {
+        uint s = src_off + tid * stride;
+        uint d = dst_off + tid * stride;
+        uint m = d + count * stride;
+        for (uint i = 0u; i < stride; i += 4u) {
+            uint w = src.Load(s + i);
+            dst.Store(d + i, w);
+            dst.Store(m + i, w);
+        }
+        uint3 g = src.Load3(s + offset);
+        uint n = 0u;
+        if (tid < live && g.x != 0u && g.y != 0u && g.z != 0u) {
+            n = min(g.x, cap);
+            n = g.y > cap / n ? cap : n * g.y;
+            n = g.z > cap / n ? cap : n * g.z;
+        }
+        dst.Store3(d + offset, uint3(n, 1u, 1u));
+        dst.Store3(m + offset, uint3(n * split, 1u, 1u));
+    }
+}
+"#;
+
+/// `XCL_INDIRECT_PRELUDE=0`: run two-pass argument scaling inline instead of hoisting into the
+/// batched `xcl prelude` command list.
+fn indirect_prelude_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_INDIRECT_PRELUDE").map_or(true, |v| v.trim() != "0"))
+}
+
 /// Top byte bound of a raw window UAV created by `runner::raw_window_uav`.
 const RAW_WINDOW_UAV_MAX: usize = (1usize << 32) - 32;
+
+/// Map a 4-byte-aligned UMA host address + byte span to `(window_index, byte_offset)` for
+/// prelude jobs (up to `MAX_HEAP_WINDOWS` when shared heap window views are active, else 4).
+fn uma_win_off(u: &crate::gpu::uma::Uma, p: usize, span: usize) -> Option<(u32, u32)> {
+    if p % 4 != 0 || span == 0 {
+        return None;
+    }
+    let k = u.window_of(p)?;
+    let heap_mode = super::console_heap::window_views_ready();
+    let max_wins = if heap_mode { crate::gpu::uma::MAX_HEAP_WINDOWS } else { 4 };
+    if k >= max_wins {
+        return None;
+    }
+    let (base, size) = u.window(k);
+    let off = p.checked_sub(base)?;
+    let end = off.checked_add(span)?;
+    let limit = if heap_mode { size.min(RAW_WINDOW_UAV_MAX) } else { size.min(u32::MAX as usize) };
+    if end > limit {
+        return None;
+    }
+    Some((k as u32, off as u32))
+}
+
+fn can_hoist_prelude(this: *mut c_void) -> bool {
+    indirect_prelude_on()
+        && super::title_list::wrapper_of(this).is_some()
+        && matches!(
+            super::list_x::tracked_list_type(this),
+            Some(D3D12_COMMAND_LIST_TYPE_DIRECT | D3D12_COMMAND_LIST_TYPE_COMPUTE)
+        )
+        && with(this, |s| !s.prelude_blocked && s.allocator != 0 && s.prelude_built.is_none())
+}
 
 /// Map a 4-byte-aligned UMA host address + byte span to `(heap_slot, byte_offset)` within the
 /// shared descriptor heap's window UAVs (`MEM_HEAP_BASE + win`), respecting `raw_window_uav`'s
@@ -1495,6 +1796,120 @@ unsafe fn guard_indirect_heap_pipeline(dev: &ID3D12Device) -> Result<(ID3D12Root
 unsafe fn scale_indirect_heap_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
     static CACHE: ArgsPipelines = Mutex::new(None);
     heap_args_pipeline(dev, SCALE_ARGS_HEAP_HLSL, "xcl make_scaled_args_buffer", 10, &[0], &CACHE)
+}
+
+unsafe fn prelude_root_signature(dev: &ID3D12Device, num_uavs: usize, heap_indexed: bool) -> Result<ID3D12RootSignature, String> {
+    let params: Vec<D3D12_ROOT_PARAMETER1> = (0..num_uavs)
+        .map(|reg| D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: reg as u32,
+                    RegisterSpace: 0,
+                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        })
+        .collect();
+    let flags = if heap_indexed {
+        D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+    } else {
+        D3D12_ROOT_SIGNATURE_FLAG_NONE
+    };
+    let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+        Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+        Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+            Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                NumParameters: params.len() as u32,
+                pParameters: params.as_ptr(),
+                NumStaticSamplers: 0,
+                pStaticSamplers: std::ptr::null(),
+                Flags: flags,
+            },
+        },
+    };
+    let mut blob: Option<windows::Win32::Graphics::Direct3D::ID3DBlob> = None;
+    D3D12SerializeVersionedRootSignature(&desc, &mut blob, None).map_err(|e| format!("prelude root signature serialize: {e}"))?;
+    let blob = blob.ok_or("prelude root signature blob")?;
+    dev.CreateRootSignature(0, std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()))
+        .map_err(|e| format!("prelude root signature create: {e}"))
+}
+
+unsafe fn prelude_scale_pipeline_in(
+    dev: &ID3D12Device,
+    hlsl: &str,
+    num_uavs: usize,
+    heap_indexed: bool,
+    cache: &'static ArgsPipelines,
+) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+    let key = dev.as_raw() as usize;
+    if let Some(pair) = cache.lock().unwrap().as_ref().and_then(|m| m.get(&key).cloned()) {
+        return Ok(pair);
+    }
+    let dxil = crate::gpu::recomp::dxc::compile_cached(hlsl, "main", "cs_6_6")?.0;
+    let rs = prelude_root_signature(dev, num_uavs, heap_indexed)?;
+    let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+        CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const c_void, BytecodeLength: dxil.len() },
+        ..Default::default()
+    };
+    let res_pso: Result<ID3D12PipelineState, _> = dev.CreateComputePipelineState(&cdesc);
+    std::mem::ManuallyDrop::drop(&mut cdesc.pRootSignature);
+    let pso = res_pso.map_err(|e| format!("prelude scale pso create: {e}"))?;
+    let _ = pso.SetName(windows::core::w!("xcl prelude_scale_mesh_args"));
+    cache.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, (rs.clone(), pso.clone()));
+    Ok((rs, pso))
+}
+
+unsafe fn prelude_scale_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+    static CACHE: ArgsPipelines = Mutex::new(None);
+    prelude_scale_pipeline_in(dev, PRELUDE_SCALE_HLSL, 6, false, &CACHE)
+}
+
+unsafe fn prelude_scale_heap_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+    static CACHE: ArgsPipelines = Mutex::new(None);
+    prelude_scale_pipeline_in(dev, PRELUDE_SCALE_HEAP_HLSL, 2, true, &CACHE)
+}
+
+/// Allocate `bytes` in `State::prelude_scratch` (disjoint from inline `scratch` so the prelude
+/// leaves these buffers in `INDIRECT_ARGUMENT` for the entire main segment).
+unsafe fn alloc_prelude_scratch(this: *mut c_void, dev: &ID3D12Device, bytes: u64) -> Result<(ID3D12Resource, u64, usize), String> {
+    let bytes = bytes.next_multiple_of(256);
+    if let Some(r) = with(this, |s| {
+        let sl = &mut s.prelude_scratch;
+        let (b, cap, _) = sl.buf.as_ref()?;
+        (sl.used + bytes <= *cap).then(|| {
+            sl.used += bytes;
+            (b.clone(), sl.used - bytes, sl.buf_idx)
+        })
+    }) {
+        return Ok(r);
+    }
+    let size = bytes.max(SCRATCH_BLOCK);
+    let remaining = SCRATCH_CAP.saturating_sub(with(this, |s| s.scratch_taken));
+    if size > remaining {
+        return Err(format!("its rewritten arguments are past {} MiB this recording", SCRATCH_CAP >> 20));
+    }
+    let dev_key = dev.as_raw() as usize;
+    let picked = {
+        let mut free = FREE_RES.lock().unwrap();
+        free.iter().position(|(_, cap, d)| *d == dev_key && *cap >= size && *cap <= remaining).map(|i| free.swap_remove(i))
+    };
+    let block = match picked {
+        Some(e) => e,
+        None => (default_uav_buffer(dev, size, "prelude two-pass argument scratch")?, size, dev_key),
+    };
+    let b = block.0.clone();
+    let buf_idx = with(this, |s| {
+        let idx = s.prelude_bufs.len();
+        s.scratch_taken += block.1;
+        s.prelude_bufs.push(block.0.clone());
+        s.prelude_scratch = PreludeScratchSlot { buf: Some(block.clone()), used: bytes, buf_idx: idx };
+        s.res_retired.push(block);
+        idx
+    });
+    Ok((b, 0, buf_idx))
 }
 
 unsafe fn guard_indirect_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
@@ -1654,11 +2069,49 @@ fn scale_views(consts: u64, src: u64, dst: u64, count: Option<u64>) -> [(u32, u6
 /// through the title's buffer: its state on the PC is the title's and not known here. So is the
 /// count (`count`: its UMA address, when the title gave a count buffer).
 #[allow(clippy::too_many_arguments)]
-unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsCommandList, src: usize, count: Option<usize>, max: u32, stride: u32, mesh_offset: u32, split: u32, cap: u32) -> Result<(ID3D12Resource, u64), String> {
+unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsCommandList, src: usize, count: Option<usize>, max: u32, stride: u32, mesh_offset: u32, split: u32, cap: u32) -> Result<(ID3D12Resource, u64, bool), String> {
+    if super::list_x::tracked_list_type(this) == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE) {
+        return Err("command bundles cannot record indirect argument barriers".into());
+    }
     let dev = super::real::list_device(this).ok_or("no device")?;
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let commands = (max as u64).saturating_mul(stride as u64);
     super::real::uma_window_buffer(src, commands as usize).ok_or("the indirect arguments are not in one memory window")?;
+    if let Some(p) = count {
+        super::real::uma_window_buffer(p, 4).ok_or("the indirect count is not in a memory window")?;
+    }
+    if can_hoist_prelude(this) {
+        if let Some((src_win, src_off)) = uma_win_off(u, src, commands as usize) {
+            let cnt_loc = match count {
+                Some(p) => uma_win_off(u, p, 4).map(|(w, o)| (1u32, w, o)),
+                None => Some((0u32, 0u32, 0u32)),
+            };
+            if let Some((has_cnt, cnt_win, cnt_off)) = cnt_loc {
+                let (dst, dst_off, buf_idx) = alloc_prelude_scratch(this, &dev, commands.saturating_mul(2))?;
+                if let Ok(dst_off32) = u32::try_from(dst_off) {
+                    if dst_off32.checked_add((commands * 2) as u32).is_some() {
+                        with(this, |s| {
+                            s.prelude_scales.push(PreludeScaleJob {
+                                buf_idx,
+                                dst_off: dst_off32,
+                                count: max,
+                                stride,
+                                mesh_offset,
+                                split,
+                                cap,
+                                src_win,
+                                src_off,
+                                has_cnt,
+                                cnt_win,
+                                cnt_off,
+                            });
+                        });
+                        return Ok((dst, dst_off, true));
+                    }
+                }
+            }
+        }
+    }
     let (dst, dst_off) = scratch_args(this, &dev, commands.saturating_mul(2))?;
     let dst_va = dst.GetGPUVirtualAddress() + dst_off;
     if super::console_heap::window_views_ready() {
@@ -1680,17 +2133,14 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
                 list.Dispatch(max.div_ceil(64), 1, 1);
                 emit_transition(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
                 with(this, |s| s.pc_abi_cs = AbiBound::default());
-                return Ok((dst, dst_off));
+                return Ok((dst, dst_off, false));
             }
         }
     }
     let (rs, pso) = scale_indirect_pipeline(&dev)?;
     let src_va = super::real::uma_va_of(src).ok_or("unified memory is not open on the GPU")?;
     let count_va = match count {
-        Some(p) => {
-            super::real::uma_window_buffer(p, 4).ok_or("the indirect count is not in a memory window")?;
-            Some(super::real::uma_va_of(p).ok_or("unified memory is not open on the GPU")?)
-        }
+        Some(p) => Some(super::real::uma_va_of(p).ok_or("unified memory is not open on the GPU")?),
         None => None,
     };
     let consts = [max, stride, mesh_offset, split, cap, 0, 0, count_va.is_some() as u32, 0];
@@ -1708,7 +2158,7 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
     list.Dispatch(max.div_ceil(64), 1, 1);
     emit_transition(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     with(this, |s| s.pc_abi_cs = AbiBound::default());
-    Ok((dst, dst_off))
+    Ok((dst, dst_off, false))
 }
 
 pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y: u32, z: u32) {
@@ -1837,8 +2287,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     _ => return Err("its count is not in a console buffer in unified memory".into()),
                 };
                 // the groups past the record buffer, and the commands past the count, are dropped
-                // on the GPU (`SCALE_ARGS_HLSL`)
-                let (scaled, at) = make_scaled_args_buffer(this, list, src, count, max, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record, cap)?;
+                // on the GPU (`SCALE_ARGS_HLSL`, or hoisted into `xcl prelude`)
+                let (scaled, at, hoisted) = make_scaled_args_buffer(this, list, src, count, max, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record, cap)?;
                 let passes = (|| -> Result<(), String> {
                     for (k, compute) in two_pass_steps(max) {
                         bind_two_pass_stage(this, list, pso, &tp, res_va, compute)?;
@@ -1848,7 +2298,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     }
                     Ok(())
                 })();
-                emit_transition(list, &scaled, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
+                if !hoisted {
+                    emit_transition(list, &scaled, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
+                }
                 passes
             })();
             match run {
@@ -1947,6 +2399,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     let (layout, args, view_heap) = with(this, |s| (s.layout.clone(), s.args.clone(), s.heaps[0]));
                     super::ambient::after_compute_dispatch(this, pso, [0, 0, 0], layout.as_deref(), &args, view_heap);
                 }
+                note_gpu_write(this);
                 return count(DISPATCHES);
             }
             Ok(false) => {
@@ -2023,9 +2476,12 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             if let Some((b, _)) = guarded {
                 emit_transition(list, &b, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
             }
-            if compute && super::ambient::has_compute_psos() {
-                let (layout, args, view_heap) = with(this, |s| (s.layout.clone(), s.args.clone(), s.heaps[0]));
-                super::ambient::after_compute_dispatch(this, pso, [0, 0, 0], layout.as_deref(), &args, view_heap);
+            if compute {
+                if super::ambient::has_compute_psos() {
+                    let (layout, args, view_heap) = with(this, |s| (s.layout.clone(), s.args.clone(), s.heaps[0]));
+                    super::ambient::after_compute_dispatch(this, pso, [0, 0, 0], layout.as_deref(), &args, view_heap);
+                }
+                note_gpu_write(this);
             }
         }
         Err(e) => {
@@ -2821,6 +3277,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     let r = super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z]);
     super::gpu_profile::end(this, t);
     invalidate_pc_abi(this, false, true);
+    note_gpu_write(this);
     if super::ambient::has_compute_psos() {
         let (layout, args, view_heap) = with(this, |s| (s.layout.clone(), s.args.clone(), s.heaps[0]));
         super::ambient::after_compute_dispatch(this, pso, [x, y, z], layout.as_deref(), &args, view_heap);
@@ -4420,6 +4877,115 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
             let got = std::slice::from_raw_parts(p as *const u32, words.len()).to_vec();
             rb.Unmap(0, None);
             assert_eq!(got, words);
+        }
+    }
+
+    #[test]
+    fn prelude_hoist_blocks_on_gpu_write_and_clears_uma_windows_on_reset() {
+        let a = 0x7710_1001usize as *mut c_void;
+        let b = 0x7710_1002usize as *mut c_void;
+        reset(a, 0x7710_A001, 0);
+        with(a, |s| {
+            s.uma_windows = Some(vec![0x1000]);
+            assert!(!s.prelude_blocked);
+        });
+        note_gpu_write(a);
+        with(a, |s| {
+            assert!(s.prelude_blocked);
+        });
+        inherit_for_split(a, b, 0x7710_A001);
+        with(b, |s| {
+            assert!(s.prelude_blocked);
+            assert!(s.uma_windows.is_none());
+        });
+        unblock_prelude(b);
+        with(b, |s| assert!(!s.prelude_blocked));
+        reset(a, 0x7710_A002, 0);
+        with(a, |s| {
+            assert!(!s.prelude_blocked);
+            assert!(s.uma_windows.is_none());
+            assert!(s.prelude_scales.is_empty());
+        });
+        forget(a);
+        forget(b);
+    }
+
+    #[test]
+    fn gpu_prelude_scale_shader_transforms_batch() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        if crate::gpu::recomp::dxc::location().is_err() {
+            crate::gpu::recomp::runner::skip_test("no DXC");
+            return;
+        }
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_12_0) else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            let (rs, pso) = prelude_scale_pipeline(&dev).expect("prelude_scale_pipeline");
+            let mk_buf = |bytes: u64, heap: D3D12_HEAP_TYPE, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES| -> ID3D12Resource {
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: bytes,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: flags,
+                    ..Default::default()
+                };
+                let mut res: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut res).unwrap();
+                res.unwrap()
+            };
+            let up = mk_buf(4096, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+            let w0 = mk_buf(4096, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+            let jobs_buf = mk_buf(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+            let dst = mk_buf(4096, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+            let rb = mk_buf(256, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+
+            // Upload two 12-byte DispatchMesh commands at w0+0: (3, 2, 1) and (5, 1, 1); job at up+1024 (split=4, cap=100).
+            let mut p = std::ptr::null_mut();
+            up.Map(0, None, Some(&mut p)).unwrap();
+            let u32s = std::slice::from_raw_parts_mut(p as *mut u32, 1024);
+            u32s[0..6].copy_from_slice(&[3, 2, 1, 5, 1, 1]);
+            // Job record (12 u32s at byte offset 1024 = u32 index 256): count=2, stride=12, offset=0, split=4, cap=100, src_win=0, src_off=0, dst_off=0, has_cnt=0
+            u32s[256..268].copy_from_slice(&[2, 12, 0, 4, 100, 0, 0, 0, 0, 0, 0, 0]);
+            up.Unmap(0, None);
+
+            let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
+            let f: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let a: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let l: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &a, None).unwrap();
+            emit_transition(&l, &w0, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+            emit_transition(&l, &jobs_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+            l.CopyBufferRegion(&w0, 0, &up, 0, 24);
+            l.CopyBufferRegion(&jobs_buf, 0, &up, 1024, 48);
+            emit_transition(&l, &w0, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            emit_transition(&l, &jobs_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            emit_transition(&l, &dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            l.SetComputeRootSignature(&rs);
+            l.SetPipelineState(&pso);
+            l.SetComputeRootUnorderedAccessView(0, jobs_buf.GetGPUVirtualAddress());
+            l.SetComputeRootUnorderedAccessView(1, dst.GetGPUVirtualAddress());
+            for k in 0..4u32 {
+                l.SetComputeRootUnorderedAccessView(2 + k, w0.GetGPUVirtualAddress());
+            }
+            l.Dispatch(1, 1, 1);
+            emit_transition(&l, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            l.CopyBufferRegion(&rb, 0, &dst, 0, 48);
+            l.Close().unwrap();
+            q.ExecuteCommandLists(&[Some(l.cast().unwrap())]);
+            q.Signal(&f, 1).unwrap();
+            crate::gpu::fence::wait(&f, 1, &dev, None, 10_000).unwrap();
+
+            let mut out = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut out)).unwrap();
+            let got = std::slice::from_raw_parts(out as *const u32, 12).to_vec();
+            rb.Unmap(0, None);
+            // Compute pass commands (at 0..24): (6,1,1), (5,1,1); mesh pass commands (at 24..48): (24,1,1), (20,1,1)
+            assert_eq!(got, vec![6, 1, 1, 5, 1, 1, 24, 1, 1, 20, 1, 1]);
         }
     }
 
