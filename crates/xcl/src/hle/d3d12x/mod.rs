@@ -22,6 +22,7 @@ pub mod dred;
 mod fence_x;
 mod format_alias;
 pub mod frame;
+mod gpu_profile;
 pub mod guard;
 mod late_release;
 pub mod layout;

@@ -4821,6 +4821,11 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
             }
             super::ambient::note_compute_pso(*ppv as usize, cs);
             note_translated_compute(0, ppv);
+            if super::gpu_profile::on() {
+                let hash = crate::gpu::shader::fnv64(cs);
+                PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (hash, 0));
+                super::gpu_profile::note_compute(hash, cs, dxil.len(), wave32_only(this));
+            }
             TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
             return Some(Ok(0));
         }
@@ -4859,6 +4864,11 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     }
     super::ambient::note_compute_pso(*ppv as usize, cs);
     note_translated_compute(hr, ppv);
+    if super::gpu_profile::on() {
+        let hash = crate::gpu::shader::fnv64(cs);
+        PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (hash, 0));
+        super::gpu_profile::note_compute(hash, cs, dxil.len(), wave32_only(this));
+    }
     crate::xlog_info!(
         "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
         dxil.len(),
@@ -5780,6 +5790,10 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     super::ambient::note_graphics_pso(*ppv as usize, shader_bytes(&d.PS));
     TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
+    if super::gpu_profile::on() && !super::present::trace_frame() {
+        let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
+        PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps));
+    }
     if super::present::trace_frame() {
         let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
         PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps));
@@ -7684,6 +7698,10 @@ unsafe fn translated_graphics_stream_once(this: *mut c_void, desc: *const c_void
         super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("ps", console_ps)]);
         super::ambient::note_graphics_pso(*ppv as usize, console_ps);
         TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+        if super::gpu_profile::on() && !super::present::trace_frame() {
+            let ps = console_ps.map_or(0, crate::gpu::shader::fnv64);
+            PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps));
+        }
         if used_rect_gs { RECT_LIST_GS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize); }
     }
     if n < 5 || n % 1000 == 0 { crate::xlog_info!("D3D12.X: graphics stream PSO from translated console shaders (#{})", n + 1); }
@@ -8254,6 +8272,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         }
     }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
+    super::gpu_profile::note_queue(this);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         let _ = super::alloc_pool::note_resubmits(this, chunk);
         f(this, chunk.len() as u32, chunk.as_ptr());

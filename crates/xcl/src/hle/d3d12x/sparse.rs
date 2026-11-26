@@ -1534,6 +1534,7 @@ unsafe fn execute_readback_spans(
     let mut sub_off = 0usize;
     let mut pending_upload_wait = wait_upload;
     let mut pending: Vec<(usize, usize, usize)> = Vec::new();
+    let mut job_idle = true;
     while idx < spans.len() {
         pending.clear();
         if job.alloc.Reset().is_err() || job.list.Reset(&job.alloc, None).is_err() {
@@ -1581,6 +1582,7 @@ unsafe fn execute_readback_spans(
                     "sparse: {label} readback queue has not reached fence value {target} after 5 s (at {})",
                     fence.GetCompletedValue()
                 );
+                job_idle = false;
                 break;
             }
         }
@@ -1610,7 +1612,9 @@ unsafe fn execute_readback_spans(
         }
         s.reclaim_ring();
     }
-    return_readback_job(job);
+    if job_idle {
+        return_readback_job(job);
+    }
 }
 
 struct AsyncReadbackReq {
