@@ -2659,7 +2659,12 @@ mod tests {
                 list_x::pc_resource_barriers(list.as_raw(), &[st_to_read]);
 
                 let close_orig: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(real::orig_fn(list.as_raw(), 9));
-                let hr_close = close_orig(list.as_raw());
+                let hr_close = {
+                    let ext = *(list.as_raw() as *const usize);
+                    let hr = close_orig(list.as_raw());
+                    real::preserve_vtable(list.as_raw(), ext);
+                    hr
+                };
                 if hr_close != 0 {
                     if let Ok(iq) = dev.cast::<ID3D12InfoQueue>() {
                         let n = iq.GetNumStoredMessages();
@@ -2748,7 +2753,11 @@ mod tests {
                 list_x::transition(list.as_raw(), rt.as_raw() as usize, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
                 list_x::pc_copy_texture_region(list.as_raw(), &dst_rt.0, 0, 0, 0, &src_rt.0, std::ptr::null());
                 list_x::transition(list.as_raw(), rt.as_raw() as usize, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-                assert_eq!(close_orig(list.as_raw()), 0);
+                {
+                    let ext = *(list.as_raw() as *const usize);
+                    assert_eq!(close_orig(list.as_raw()), 0);
+                    real::preserve_vtable(list.as_raw(), ext);
+                }
                 q.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
                 wait_gpu(&q, &fence, &mut fence_val);
 
