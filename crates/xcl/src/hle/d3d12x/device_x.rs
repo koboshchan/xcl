@@ -1065,19 +1065,78 @@ pub(super) unsafe extern "system" fn get_custom_heap_properties_x(a: *mut c_void
     ret
 }
 
+const MAX_ALIAS_LOGS: u64 = 16;
+const MAX_ALIAS_TRACKED: usize = 16_384;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlacedDescSummary {
+    dim: u32,
+    width: u64,
+    height: u32,
+    format: u32,
+    flags: u32,
+}
+
+impl PlacedDescSummary {
+    fn from_desc(x: &[u8; 0x38]) -> Self {
+        let u = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
+        Self {
+            dim: u(0),
+            width: u64::from_le_bytes(x[0x10..0x18].try_into().unwrap()),
+            height: u(0x18),
+            format: u(0x20),
+            flags: u(0x30),
+        }
+    }
+}
+
+impl std::fmt::Display for PlacedDescSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "dimension {} {}x{} format {} flags {:#x}", self.dim, self.width, self.height, self.format, self.flags)
+    }
+}
+
+fn record_alias_in(
+    seen: &mut Option<std::collections::HashMap<usize, PlacedDescSummary>>,
+    logged: &AtomicU64,
+    va: usize,
+    cur: PlacedDescSummary,
+    max_tracked: usize,
+) -> Option<PlacedDescSummary> {
+    if logged.load(Ordering::Relaxed) >= MAX_ALIAS_LOGS {
+        *seen = None;
+        return None;
+    }
+    let m = seen.get_or_insert_with(std::collections::HashMap::new);
+    if let Some(slot) = m.get_mut(&va) {
+        let prev = std::mem::replace(slot, cur);
+        let prev_count = logged.fetch_add(1, Ordering::Relaxed);
+        if prev_count + 1 >= MAX_ALIAS_LOGS {
+            *seen = None;
+        }
+        return (prev_count < MAX_ALIAS_LOGS).then_some(prev);
+    }
+    if m.len() < max_tracked {
+        m.insert(va, cur);
+    }
+    None
+}
+
 /// Resources the title placed at an address an earlier one was placed at: on the console they
 /// share that memory (aliasing – transient render targets reuse it). Logged (first 16).
 fn note_alias(va: usize, x: &[u8; 0x38]) {
-    static SEEN: std::sync::Mutex<Option<std::collections::HashMap<usize, String>>> = std::sync::Mutex::new(None);
+    static SEEN: std::sync::Mutex<Option<std::collections::HashMap<usize, PlacedDescSummary>>> = std::sync::Mutex::new(None);
     static N: AtomicU64 = AtomicU64::new(0);
-    let u = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
-    let what = format!("dimension {} {}x{} format {} flags {:#x}", u(0), u64::from_le_bytes(x[0x10..0x18].try_into().unwrap()), u(0x18), u(0x20), u(0x30));
-    let mut g = SEEN.lock().unwrap();
-    let m = g.get_or_insert_with(std::collections::HashMap::new);
-    if let Some(prev) = m.insert(va, what.clone()) {
-        if N.fetch_add(1, Ordering::Relaxed) < 16 {
-            crate::xlog_info!("D3D12.X: CreatePlacedResourceX at {va:#x} ({what}) – aliases an earlier resource there ({prev})");
-        }
+    if N.load(Ordering::Relaxed) >= MAX_ALIAS_LOGS {
+        return;
+    }
+    let cur = PlacedDescSummary::from_desc(x);
+    let prev = {
+        let mut g = SEEN.lock().unwrap();
+        record_alias_in(&mut g, &N, va, cur, MAX_ALIAS_TRACKED)
+    };
+    if let Some(prev) = prev {
+        crate::xlog_info!("D3D12.X: CreatePlacedResourceX at {va:#x} ({cur}) – aliases an earlier resource there ({prev})");
     }
 }
 
@@ -1764,5 +1823,65 @@ mod tests {
         if let Some(m) = UAV_FORMAT_SUPPORT.lock().unwrap().as_mut() {
             m.remove(&((luid.LowPart, luid.HighPart), 24));
         }
+    }
+
+    fn placed_desc(dim: u32, width: u64, height: u32, format: u32, flags: u32) -> [u8; 0x38] {
+        let mut x = [0u8; 0x38];
+        x[0..4].copy_from_slice(&dim.to_le_bytes());
+        x[0x10..0x18].copy_from_slice(&width.to_le_bytes());
+        x[0x18..0x1C].copy_from_slice(&height.to_le_bytes());
+        x[0x20..0x24].copy_from_slice(&format.to_le_bytes());
+        x[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
+        x
+    }
+
+    #[test]
+    fn note_alias_logs_first_16_and_drops_table_after_cap() {
+        let first = PlacedDescSummary::from_desc(&placed_desc(3, 1920, 1080, 28, 0x5));
+        assert_eq!(first.to_string(), "dimension 3 1920x1080 format 28 flags 0x5");
+
+        let mut seen = None;
+        let logged = AtomicU64::new(0);
+        assert_eq!(record_alias_in(&mut seen, &logged, 0x1000, first, MAX_ALIAS_TRACKED), None);
+        let mut expected_prev = first;
+        for i in 1..=MAX_ALIAS_LOGS {
+            let next = PlacedDescSummary::from_desc(&placed_desc(3, 1920 + i, 1080, 28, i as u32));
+            assert_eq!(record_alias_in(&mut seen, &logged, 0x1000, next, MAX_ALIAS_TRACKED), Some(expected_prev), "alias #{i}");
+            expected_prev = next;
+            if i < MAX_ALIAS_LOGS {
+                assert!(seen.is_some(), "table stays active before cap (alias #{i})");
+            }
+        }
+        assert!(seen.is_none(), "16th alias must drop the tracking table");
+        let after = PlacedDescSummary::from_desc(&placed_desc(1, 4096, 1, 0, 0));
+        assert_eq!(record_alias_in(&mut seen, &logged, 0x1000, after, MAX_ALIAS_TRACKED), None);
+        assert_eq!(record_alias_in(&mut seen, &logged, 0x2000, after, MAX_ALIAS_TRACKED), None);
+        assert!(seen.is_none(), "calls after cap must not reallocate the tracking table");
+    }
+
+    #[test]
+    fn note_alias_bounds_tracked_entries_without_aliases() {
+        let mut seen = None;
+        let logged = AtomicU64::new(0);
+        let max_tracked = 8;
+        let d0 = PlacedDescSummary::from_desc(&placed_desc(3, 64, 64, 28, 1));
+        for i in 0..(max_tracked + 5) {
+            assert_eq!(record_alias_in(&mut seen, &logged, 0x10000 + i * 0x1000, d0, max_tracked), None);
+        }
+        assert_eq!(seen.as_ref().unwrap().len(), max_tracked, "tracked VA count must stay bounded");
+        let d1 = PlacedDescSummary::from_desc(&placed_desc(3, 128, 128, 28, 2));
+        assert_eq!(record_alias_in(&mut seen, &logged, 0x10000, d1, max_tracked), Some(d0), "aliasing a tracked entry still fires");
+        assert_eq!(logged.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn note_alias_short_circuits_when_cap_already_reached() {
+        let d0 = PlacedDescSummary::from_desc(&placed_desc(3, 32, 32, 28, 0));
+        let mut seen = Some(std::collections::HashMap::from([(0x5000usize, d0)]));
+        let logged = AtomicU64::new(MAX_ALIAS_LOGS);
+        let d1 = PlacedDescSummary::from_desc(&placed_desc(3, 64, 64, 28, 4));
+        assert_eq!(record_alias_in(&mut seen, &logged, 0x5000, d1, MAX_ALIAS_TRACKED), None);
+        assert!(seen.is_none(), "residual map must be freed once cap is reached");
+        assert_eq!(logged.load(Ordering::Relaxed), MAX_ALIAS_LOGS);
     }
 }
