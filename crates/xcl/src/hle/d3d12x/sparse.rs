@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use windows::core::Interface;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -215,9 +215,6 @@ struct State {
     value: u64,
     /// reusable auto-reset Win32 event for fence waits (no per-wait CreateEventW/CloseHandle)
     event: HANDLE,
-    /// fence signalled on title queues so `queue` waits before copying GPU writes back to CPU
-    rb_fence: ID3D12Fence,
-    rb_value: u64,
     /// (window start, reserved buffer) of each sparse window
     windows: Vec<(usize, ID3D12Resource)>,
     /// video-memory pool heaps (None: given back, its index free for the next one)
@@ -258,10 +255,14 @@ struct State {
     /// ring of async upload command allocators + lists
     slots: Vec<UploadSlot>,
     next_slot: usize,
-    /// dedicated readback staging buffer + command allocator / list
+    /// dedicated readback staging buffer + command allocator / list (used by legacy hole unit test)
+    #[cfg(test)]
     readback: Option<(ID3D12Resource, *mut u8)>,
+    #[cfg(test)]
     rb_alloc: ID3D12CommandAllocator,
+    #[cfg(test)]
     rb_list: ID3D12GraphicsCommandList,
+    #[cfg(test)]
     rb_last_fence: u64,
     /// the fence value each title queue last waited for
     waited: FxHashMap<usize, u64>,
@@ -549,7 +550,6 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
     let made = (|| -> windows::core::Result<State> {
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-        let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None)?;
         let mut slots = Vec::with_capacity(UPLOAD_SLOTS);
         for _ in 0..UPLOAD_SLOTS {
@@ -560,11 +560,13 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             let _ = alloc.SetName(windows::core::w!("xcl sparse upload allocator"));
             slots.push(UploadSlot { alloc, list, fence_val: 0 });
         }
-        let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-        let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None)?;
-        rb_list.Close()?;
-        let _ = rb_list.SetName(windows::core::w!("xcl sparse readback list"));
-        let _ = rb_alloc.SetName(windows::core::w!("xcl sparse readback allocator"));
+        #[cfg(test)]
+        let (rb_alloc, rb_list) = {
+            let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+            let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None)?;
+            rb_list.Close()?;
+            (rb_alloc, rb_list)
+        };
         let _ = queue.SetName(windows::core::w!("xcl sparse queue"));
         Ok(State {
             dev: dev.clone(),
@@ -572,8 +574,6 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             fence,
             value: 0,
             event,
-            rb_fence,
-            rb_value: 0,
             windows,
             pools: Vec::new(),
             free: Vec::new(),
@@ -593,9 +593,13 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             zero_buf: None,
             slots,
             next_slot: 0,
+            #[cfg(test)]
             readback: None,
+            #[cfg(test)]
             rb_alloc,
+            #[cfg(test)]
             rb_list,
+            #[cfg(test)]
             rb_last_fence: 0,
             waited: FxHashMap::default(),
             runs: None,
@@ -981,6 +985,7 @@ impl State {
         true
     }
 
+    #[cfg(test)]
     unsafe fn readback_buf(&mut self) -> Option<(ID3D12Resource, *mut u8)> {
         if self.readback.is_none() {
             let mut r: Option<ID3D12Resource> = None;
@@ -1055,6 +1060,7 @@ impl State {
 
     /// Copy `ranges` (address, bytes) from sparse VRAM back into the CPU view and refresh
     /// `sent` hashes. Caller has already ordered `self.queue` after any GPU writes if needed.
+    #[cfg(test)]
     unsafe fn readback_ranges(&mut self, ranges: &[(usize, usize)]) {
         let Some((rb, p)) = self.readback_buf() else { return };
         let mut pending: Vec<(usize, usize, usize)> = Vec::new(); // (va, rb_off, chunk)
@@ -1321,81 +1327,433 @@ pub fn queue() -> Option<ID3D12CommandQueue> {
     QUEUE.lock().unwrap().clone()
 }
 
+/// Dedicated per-device readback queue (`DIRECT`, completely independent of `State::queue`) so
+/// sparse readbacks never create GPU ordering cycles with `before_execute` uploads/tile mappings.
+struct RbQueueInner {
+    queue: ID3D12CommandQueue,
+    fence: ID3D12Fence,
+    value: u64,
+}
+
+// SAFETY: D3D12 command queues and fences are free-threaded COM objects; serialized by `Mutex`.
+unsafe impl Send for RbQueueInner {}
+
+static RB_QUEUES: LazyLock<Mutex<HashMap<usize, Arc<Mutex<RbQueueInner>>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+unsafe fn get_or_create_rb_queue(dev: &ID3D12Device) -> Option<Arc<Mutex<RbQueueInner>>> {
+    let key = dev.as_raw() as usize;
+    {
+        let g = RB_QUEUES.lock().unwrap();
+        if let Some(q) = g.get(&key) {
+            return Some(q.clone());
+        }
+    }
+    let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).ok()?;
+    let _ = queue.SetName(windows::core::w!("xcl sparse readback queue"));
+    let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+    let entry = Arc::new(Mutex::new(RbQueueInner { queue, fence, value: 0 }));
+    let mut g = RB_QUEUES.lock().unwrap();
+    Some(g.entry(key).or_insert_with(|| entry.clone()).clone())
+}
+
+/// Pooled per-readback resources so concurrent `readback_now` and async `readback_after_execute`
+/// jobs record, submit, and GPU-wait OUTSIDE the global `STATE` lock.
+struct ReadbackJob {
+    alloc: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    buf: ID3D12Resource,
+    event: HANDLE,
+    mapped: usize,
+    cap: usize,
+    dev_key: usize,
+}
+
+// SAFETY: COM objects are free-threaded; `mapped` stays valid while `buf` lives; `event` is owned.
+unsafe impl Send for ReadbackJob {}
+
+impl Drop for ReadbackJob {
+    fn drop(&mut self) {
+        if !self.event.is_invalid() {
+            unsafe {
+                let _ = CloseHandle(self.event);
+            }
+        }
+    }
+}
+
+const MAX_RB_JOBS: usize = 16;
+const MIN_RB_JOB_BYTES: usize = 256 << 10;
+static FREE_RB_JOBS: Mutex<Vec<ReadbackJob>> = Mutex::new(Vec::new());
+
+unsafe fn take_readback_job(dev: &ID3D12Device, need: usize) -> Option<ReadbackJob> {
+    let dev_key = dev.as_raw() as usize;
+    let want = need.max(MIN_RB_JOB_BYTES).min(READBACK_STAGING);
+    {
+        let mut free = FREE_RB_JOBS.lock().unwrap();
+        if let Some(i) = free.iter().position(|j| j.dev_key == dev_key && j.cap >= want) {
+            return Some(free.swap_remove(i));
+        }
+    }
+    // DIRECT matches `rb_queue` (`D3D12_COMMAND_LIST_TYPE_DIRECT`).
+    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
+    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).ok()?;
+    let _ = list.Close();
+    let mut d = buffer_desc(want as u64);
+    d.Flags = D3D12_RESOURCE_FLAG_NONE;
+    let mut r: Option<ID3D12Resource> = None;
+    dev.CreateCommittedResource(
+        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+        D3D12_HEAP_FLAG_NONE,
+        &d,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        None,
+        &mut r,
+    )
+    .ok()?;
+    let buf = r?;
+    let mut p = std::ptr::null_mut();
+    buf.Map(0, None, Some(&mut p)).ok()?;
+    if p.is_null() {
+        return None;
+    }
+    let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).ok()?;
+    Some(ReadbackJob { alloc, list, buf, event, mapped: p as usize, cap: want, dev_key })
+}
+
+fn return_readback_job(job: ReadbackJob) {
+    let mut free = FREE_RB_JOBS.lock().unwrap();
+    if free.len() < MAX_RB_JOBS {
+        free.push(job);
+    }
+}
+
+/// Snapshot mapped tile spans `(dst_va, win_buf, src_off, chunk)` for `ranges` under `STATE`.
+fn snapshot_mapped_spans(s: &State, ranges: &[(usize, usize)]) -> Vec<(usize, ID3D12Resource, u64, usize)> {
+    let mut spans = Vec::new();
+    for &(a, n) in ranges {
+        if n == 0 {
+            continue;
+        }
+        let mut done = 0usize;
+        while done < n {
+            let cur = a + done;
+            let tile = cur & !(TILE - 1);
+            let Some(wi) = s.window_index(cur) else { break };
+            let b = s.windows[wi].0;
+            let to_tile_end = (tile + TILE) - cur;
+            let to_win_end = (b + crate::gpu::uma::WINDOW) - cur;
+            let step = (n - done).min(to_tile_end).min(to_win_end);
+            if s.mapped.contains_key(&tile) {
+                spans.push((cur, s.windows[wi].1.clone(), (cur - b) as u64, step));
+            }
+            done += step;
+        }
+    }
+    spans
+}
+
+/// Execute GPU→CPU readbacks for `spans` on the device's dedicated `rb_queue` using a pooled
+/// `ReadbackJob`. Never holds `STATE` during GPU fence waits and never submits onto `State::queue`.
+unsafe fn execute_readback_spans(
+    dev: &ID3D12Device,
+    spans: &[(usize, ID3D12Resource, u64, usize)],
+    wait_upload: Option<(ID3D12Fence, u64)>,
+    state_gen: u64,
+    label: &str,
+) {
+    if spans.is_empty() {
+        return;
+    }
+    let total: usize = spans.iter().map(|x| x.3).sum();
+    let Some(rb_q) = get_or_create_rb_queue(dev) else { return };
+    let Some(job) = take_readback_job(dev, total) else { return };
+    let mut idx = 0usize;
+    let mut sub_off = 0usize;
+    let mut pending_upload_wait = wait_upload;
+    let mut pending: Vec<(usize, usize, usize)> = Vec::new();
+    while idx < spans.len() {
+        pending.clear();
+        if job.alloc.Reset().is_err() || job.list.Reset(&job.alloc, None).is_err() {
+            break;
+        }
+        let mut used = 0usize;
+        while idx < spans.len() && used < job.cap {
+            let (dst, ref win_buf, src_base, span_len) = spans[idx];
+            let rem = span_len - sub_off;
+            let take = rem.min(job.cap - used);
+            job.list.CopyBufferRegion(&job.buf, used as u64, win_buf, src_base + sub_off as u64, take as u64);
+            pending.push((dst + sub_off, used, take));
+            used += take;
+            sub_off += take;
+            if sub_off >= span_len {
+                idx += 1;
+                sub_off = 0;
+            }
+        }
+        if pending.is_empty() || job.list.Close().is_err() {
+            break;
+        }
+        let Ok(cmd_list) = job.list.cast::<ID3D12CommandList>() else { break };
+        // Submit & signal briefly under `rb_q`, then drop the lock before waiting on the fence.
+        let (fence, target) = {
+            let mut rq = rb_q.lock().unwrap();
+            if let Some((uf, uv)) = pending_upload_wait.take() {
+                if uv > 0 && uf.GetCompletedValue() < uv {
+                    let _ = rq.queue.Wait(&uf, uv);
+                }
+            }
+            super::title_textures::own_work(|| {
+                rq.queue.ExecuteCommandLists(&[Some(cmd_list)]);
+            });
+            rq.value += 1;
+            let v = rq.value;
+            let _ = rq.queue.Signal(&rq.fence, v);
+            (rq.fence.clone(), v)
+        };
+        if target > 0 && fence.GetCompletedValue() < target {
+            let _ = fence.SetEventOnCompletion(target, job.event);
+            windows::Win32::System::Threading::WaitForSingleObject(job.event, 5000);
+            if fence.GetCompletedValue() < target {
+                crate::xlog_warn!(
+                    "sparse: {label} readback queue has not reached fence value {target} after 5 s (at {})",
+                    fence.GetCompletedValue()
+                );
+                break;
+            }
+        }
+        // Copy only still-committed non-hole bytes into host memory and sync `sent` hashes.
+        let mut g = lock_state();
+        let Some(s) = g.as_mut() else { break };
+        if s.state_gen != state_gen {
+            break;
+        }
+        let p = job.mapped as *const u8;
+        for &(dst, off, chunk) in &pending {
+            let mut at = dst;
+            let mut src_off = off;
+            let end = dst + chunk;
+            while at < end {
+                let pg = at & !(PAGE - 1);
+                let t = pg & !(TILE - 1);
+                let page_idx = (pg - t) / PAGE;
+                let step = (pg + PAGE).min(end) - at;
+                if s.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << page_idx) == 0) {
+                    std::ptr::copy_nonoverlapping(p.add(src_off), at as *mut u8, step);
+                }
+                at += step;
+                src_off += step;
+            }
+            s.sync_sent_range(dst, chunk);
+        }
+        s.reclaim_ring();
+    }
+    return_readback_job(job);
+}
+
+struct AsyncReadbackReq {
+    dev: ID3D12Device,
+    q_fence: ID3D12Fence,
+    q_val: u64,
+    spans: Vec<(usize, ID3D12Resource, u64, usize)>,
+    state_gen: u64,
+    enqueued_at: std::time::Instant,
+}
+
+// SAFETY: COM objects in `AsyncReadbackReq` are free-threaded.
+unsafe impl Send for AsyncReadbackReq {}
+
+struct AsyncRbChannel {
+    inbox: Mutex<VecDeque<AsyncReadbackReq>>,
+    wake: usize, // Win32 HANDLE (auto-reset event)
+}
+
+static ASYNC_RB: OnceLock<AsyncRbChannel> = OnceLock::new();
+
+fn async_rb_channel() -> &'static AsyncRbChannel {
+    ASYNC_RB.get_or_init(|| {
+        let wake = unsafe { windows::Win32::System::Threading::CreateEventW(None, false, false, None) }
+            .expect("xcl sparse async readback wake event");
+        let wake_raw = wake.0 as usize;
+        let _ = std::thread::Builder::new().name("xcl-sparse-rb".into()).spawn(move || unsafe {
+            async_rb_worker(HANDLE(wake_raw as *mut c_void));
+        });
+        AsyncRbChannel { inbox: Mutex::new(VecDeque::new()), wake: wake_raw }
+    })
+}
+
+unsafe fn async_rb_worker(wake: HANDLE) {
+    // Up to 63 concurrent per-queue waits alongside `wake` (MAXIMUM_WAIT_OBJECTS = 64).
+    const MAX_SLOTS: usize = 63;
+    let mut events: Vec<HANDLE> = Vec::with_capacity(MAX_SLOTS);
+    for _ in 0..MAX_SLOTS {
+        if let Ok(ev) = windows::Win32::System::Threading::CreateEventW(None, false, false, None) {
+            events.push(ev);
+        }
+    }
+    let mut pending: Vec<AsyncReadbackReq> = Vec::new();
+    let ch = ASYNC_RB.wait();
+    loop {
+        {
+            let mut inbox = ch.inbox.lock().unwrap();
+            while let Some(req) = inbox.pop_front() {
+                pending.push(req);
+            }
+        }
+        // Drain every request whose title queue has already completed (no head-of-line blocking
+        // across independent queues).
+        let mut progressed = false;
+        let mut i = 0usize;
+        while i < pending.len() {
+            let done = pending[i].q_fence.GetCompletedValue() >= pending[i].q_val;
+            if done {
+                let req = pending.remove(i);
+                execute_readback_spans(&req.dev, &req.spans, None, req.state_gen, "async");
+                progressed = true;
+            } else if pending[i].enqueued_at.elapsed() > std::time::Duration::from_secs(15) {
+                let req = pending.remove(i);
+                static STALE: AtomicU64 = AtomicU64::new(0);
+                let n = STALE.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 4 || n.is_power_of_two() {
+                    crate::xlog_warn!(
+                        "sparse: async readback dropped after 15 s waiting on title queue fence {} (at {}; {} total)",
+                        req.q_val,
+                        req.q_fence.GetCompletedValue(),
+                        n
+                    );
+                }
+            } else {
+                i += 1;
+            }
+        }
+        if progressed {
+            continue;
+        }
+        if pending.is_empty() {
+            windows::Win32::System::Threading::WaitForSingleObject(wake, windows::Win32::System::Threading::INFINITE);
+            continue;
+        }
+        // Wait for either a new request (`wake`) or ANY pending title queue fence to complete.
+        let mut handles: Vec<HANDLE> = Vec::with_capacity(1 + pending.len().min(events.len()));
+        handles.push(wake);
+        let mut already_ready = false;
+        for (req, &ev) in pending.iter().zip(events.iter()) {
+            if req.q_fence.GetCompletedValue() >= req.q_val {
+                already_ready = true;
+                break;
+            }
+            if req.q_fence.SetEventOnCompletion(req.q_val, ev).is_ok() {
+                handles.push(ev);
+            }
+        }
+        if !already_ready {
+            windows::Win32::System::Threading::WaitForMultipleObjects(&handles, false, 2000);
+        }
+    }
+}
+
+/// After `queue.ExecuteCommandLists`: asynchronously copy GPU-written sparse ranges (e.g.
+/// `Write32/64`, `FillMemoryWith32BitValueX`, `CopyMemoryToMemoryX`) back to their CPU view
+/// once `queue` completes, without blocking `ExecuteCommandLists`, holding `STATE`, or stalling
+/// `State::queue` behind title queues.
 pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)]) {
     if ranges.is_empty() {
         return;
     }
-    let mut g = lock_state();
-    let Some(s) = g.as_mut() else { return };
-    s.note_queue(queue);
-    let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| n > 0 && s.window_index(a).is_some()).collect();
-    if filtered.is_empty() {
-        return;
-    }
-    filtered.sort_unstable();
-    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(filtered.len());
-    for (a, n) in filtered {
-        match merged.last_mut() {
-            Some(last) if a <= last.0.saturating_add(last.1) => {
-                let end = (last.0 + last.1).max(a + n);
-                last.1 = end - last.0;
-            }
-            _ => merged.push((a, n)),
+    let req = {
+        let mut g = lock_state();
+        let Some(s) = g.as_mut() else { return };
+        s.note_queue(queue);
+        let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| n > 0 && s.window_index(a).is_some()).collect();
+        if filtered.is_empty() {
+            return;
         }
-    }
-    s.rb_value += 1;
-    let v = s.rb_value;
-    if queue.Signal(&s.rb_fence, v).is_ok() {
-        let _ = s.queue.Wait(&s.rb_fence, v);
-        super::list_x::note_internal_wait(s.queue.as_raw() as usize, "sparse readback behind a title queue", &s.rb_fence, v);
-    }
-    s.readback_ranges(&merged);
+        filtered.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(filtered.len());
+        for (a, n) in filtered {
+            match merged.last_mut() {
+                Some(last) if a <= last.0.saturating_add(last.1) => {
+                    let end = (last.0 + last.1).max(a + n);
+                    last.1 = end - last.0;
+                }
+                _ => merged.push((a, n)),
+            }
+        }
+        let spans = snapshot_mapped_spans(s, &merged);
+        if spans.is_empty() {
+            return;
+        }
+        let key = queue.as_raw() as usize;
+        let Some((_, q_fence, q_val)) = s.queue_fences.get_mut(&key) else { return };
+        *q_val += 1;
+        let v = *q_val;
+        if queue.Signal(&*q_fence, v).is_err() {
+            return;
+        }
+        AsyncReadbackReq {
+            dev: s.dev.clone(),
+            q_fence: q_fence.clone(),
+            q_val: v,
+            spans,
+            state_gen: s.state_gen,
+            enqueued_at: std::time::Instant::now(),
+        }
+    };
+    let ch = async_rb_channel();
+    ch.inbox.lock().unwrap().push_back(req);
+    let _ = windows::Win32::System::Threading::SetEvent(HANDLE(ch.wake as *mut c_void));
 }
 
 /// Synchronize `[va, va + len)` in a sparse window for a CPU read (`ID3D12Resource::Map` with
 /// a non-empty read range, or `Map(0, NULL)` on a sparse readback resource): flushes pending
 /// tile clears and unsubmitted CPU-changed chunks first so CPU writes are preserved, then
-/// copies the range back from VRAM into CPU memory.
+/// copies the range back from VRAM into CPU memory OUTSIDE the global `STATE` lock.
 pub unsafe fn readback_now(va: usize, len: usize) {
     if len == 0 {
         return;
     }
-    let mut g = lock_state();
-    let Some(s) = g.as_mut() else { return };
-    if s.window_index(va).is_none() {
-        return;
-    }
-    let zeroed = std::mem::take(&mut s.to_zero);
-    if !zeroed.is_empty() {
-        for &(a, n) in &zeroed {
-            s.clear_sent_range(a, n);
+    let prepared = {
+        let mut g = lock_state();
+        let Some(s) = g.as_mut() else { return };
+        if s.window_index(va).is_none() {
+            return;
         }
-        s.upload_zeros(&zeroed);
-    }
-    // Preserve any unsubmitted CPU writes on pages overlapping `[va, va + len)`
-    let mut dirty_runs: Vec<(usize, usize)> = Vec::new();
-    let mut pg = va & !(PAGE - 1);
-    let end = va + len;
-    while pg < end {
-        let t = pg & !(TILE - 1);
-        let tile_end = (t + TILE).min(end);
-        if let Some(entry) = s.mapped.get_mut(&t) {
-            let mut p = pg;
-            while p < tile_end {
-                let idx = (p - t) / PAGE;
-                if entry.holes & (1u16 << idx) == 0 {
-                    let bytes = std::slice::from_raw_parts(p as *const u8, PAGE);
-                    scan_page(bytes, p, &mut entry.sent[idx], &mut dirty_runs);
-                }
-                p += PAGE;
+        let zeroed = std::mem::take(&mut s.to_zero);
+        if !zeroed.is_empty() {
+            for &(a, n) in &zeroed {
+                s.clear_sent_range(a, n);
             }
+            s.upload_zeros(&zeroed);
         }
-        pg = tile_end;
-    }
-    if !dirty_runs.is_empty() {
-        s.upload_dirty(&dirty_runs);
-    }
-    s.readback_ranges(&[(va, len)]);
+        // Preserve any unsubmitted CPU writes on pages overlapping `[va, va + len)`
+        let mut dirty_runs: Vec<(usize, usize)> = Vec::new();
+        let mut pg = va & !(PAGE - 1);
+        let end = va + len;
+        while pg < end {
+            let t = pg & !(TILE - 1);
+            let tile_end = (t + TILE).min(end);
+            if let Some(entry) = s.mapped.get_mut(&t) {
+                let mut p = pg;
+                while p < tile_end {
+                    let idx = (p - t) / PAGE;
+                    if entry.holes & (1u16 << idx) == 0 {
+                        let bytes = std::slice::from_raw_parts(p as *const u8, PAGE);
+                        scan_page(bytes, p, &mut entry.sent[idx], &mut dirty_runs);
+                    }
+                    p += PAGE;
+                }
+            }
+            pg = tile_end;
+        }
+        if !dirty_runs.is_empty() {
+            s.upload_dirty(&dirty_runs);
+        }
+        let spans = snapshot_mapped_spans(s, &[(va, len)]);
+        if spans.is_empty() {
+            return;
+        }
+        (s.dev.clone(), spans, s.fence.clone(), s.value, s.state_gen)
+    };
+    execute_readback_spans(&prepared.0, &prepared.1, Some((prepared.2, prepared.3)), prepared.4, "readback_now");
 }
 
 /// The title committed `[a, a + n)` in a sparse window. The pages of tiles mapped for it that
@@ -1984,7 +2342,6 @@ mod tests {
             let dev = dev.expect("D3D12 device");
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
-            let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_fence");
             let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
             let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("rb_alloc");
             let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("rb_list");
@@ -1995,8 +2352,6 @@ mod tests {
                 fence,
                 value: 0,
                 event,
-                rb_fence,
-                rb_value: 0,
                 windows: Vec::new(),
                 pools: Vec::new(),
                 free: Vec::new(),
@@ -2223,7 +2578,6 @@ mod tests {
             let reserved = reserved.expect("reserved buffer");
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
-            let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_fence");
             let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
             let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("rb_alloc");
             let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("rb_list");
@@ -2235,8 +2589,6 @@ mod tests {
                 fence,
                 value: 0,
                 event,
-                rb_fence,
-                rb_value: 0,
                 windows: vec![(base, reserved)],
                 pools: Vec::new(),
                 free: Vec::new(),
@@ -2320,7 +2672,6 @@ mod tests {
             let reserved = reserved.expect("reserved buffer");
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
-            let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_fence");
             let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
             let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("rb_alloc");
             let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("rb_list");
@@ -2332,8 +2683,6 @@ mod tests {
                 fence,
                 value: 0,
                 event,
-                rb_fence,
-                rb_value: 0,
                 windows: vec![(base, reserved)],
                 pools: Vec::new(),
                 free: Vec::new(),
@@ -2445,7 +2794,6 @@ mod tests {
         let reserved = reserved.expect("reserved buffer");
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
-        let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_fence");
         let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
         let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("rb_alloc");
         let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("rb_list");
@@ -2457,8 +2805,6 @@ mod tests {
             fence,
             value: 0,
             event,
-            rb_fence,
-            rb_value: 0,
             windows: vec![(base, reserved)],
             pools: Vec::new(),
             free: Vec::new(),
@@ -2720,6 +3066,80 @@ mod tests {
         early_add(&mut early, a, a + 4 * TILE);
         early_remove(&mut early, a + TILE, a + 2 * TILE);
         assert_eq!(early.into_iter().collect::<Vec<_>>(), vec![(a, a + TILE), (a + 2 * TILE, a + 4 * TILE)]);
+    }
+
+    /// Test that `readback_after_execute` returns immediately without holding `STATE` or stalling
+    /// `State::queue` even when a title queue is blocked on an unsignalled GPU fence, and still
+    /// delivers the GPU-written value to CPU memory once a second queue unblocks the first.
+    #[test]
+    fn readback_after_execute_does_not_deadlock_blocked_queue_or_state() {
+        use std::sync::atomic::AtomicU64;
+        use std::time::{Duration, Instant};
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(2);
+            assert!(!VirtualAlloc(base as *const c_void, TILE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            s.commit_range(base, TILE);
+            s.wait_for(s.value);
+            let dev = s.dev.clone();
+            let win_buf = s.windows[0].1.clone();
+
+            // Install this state temporarily into global `STATE` (serializing against other tests).
+            let prev = {
+                let mut g = STATE.lock().unwrap();
+                s.state_gen = g.as_ref().map_or(1, |old| old.state_gen.wrapping_add(1));
+                g.replace(s)
+            };
+
+            let q_a: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let q_b: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+
+            // Queue A waits on `gate == 1` (unsignalled!), then writes 0xDEAD_BEEF_CAFE_BABE into sparse VRAM.
+            q_a.Wait(&gate, 1).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList2 = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let gpu_va = win_buf.GetGPUVirtualAddress();
+            let params = [
+                D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: gpu_va, Value: 0xCAFE_BABE },
+                D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: gpu_va + 4, Value: 0xDEAD_BEEF },
+            ];
+            let modes = [D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT; 2];
+            list.WriteBufferImmediate(params.len() as u32, params.as_ptr(), Some(modes.as_ptr()));
+            list.Close().unwrap();
+            let cl: ID3D12CommandList = list.cast().unwrap();
+            q_a.ExecuteCommandLists(&[Some(cl)]);
+
+            // Previously this blocked for 5 s holding `STATE` and stalled `State::queue` behind `q_a`.
+            let t0 = Instant::now();
+            readback_after_execute(&q_a, &[(base, 8)]);
+            assert!(
+                t0.elapsed() < Duration::from_millis(500),
+                "readback_after_execute must not block on an in-flight queue ({:?})",
+                t0.elapsed()
+            );
+
+            // While `q_a` is still blocked, `STATE` must be unlocked so `q_b` can proceed and unblock `q_a`.
+            assert!(STATE.try_lock().is_ok(), "STATE must not be held during async readback");
+            q_b.Signal(&gate, 1).unwrap();
+
+            // Wait for the background worker to copy the GPU-written value back into CPU memory.
+            let cell = &*(base as *const AtomicU64);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while cell.load(Ordering::Acquire) != 0xDEAD_BEEF_CAFE_BABE && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(cell.load(Ordering::Acquire), 0xDEAD_BEEF_CAFE_BABE, "async readback must deliver GPU write to CPU memory");
+
+            // Restore prior global state and clean up test memory.
+            let ours = STATE.lock().unwrap().take();
+            if let Some(p) = prev {
+                *STATE.lock().unwrap() = Some(p);
+            }
+            drop(ours);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
     }
 
     /// Time for n 64 KiB pages committed one at a time and decommitted one at a time in
