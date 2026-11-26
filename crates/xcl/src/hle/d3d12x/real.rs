@@ -2257,7 +2257,8 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     }
     // a depth buffer's view in the formats the PC has for it (a D24S8 format itself, R16_UNORM of
     // a D16S8 buffer …: an invalid call, the device removed)
-    if let Some(v) = ID3D12Resource::from_raw_borrowed(&res).and_then(|r| pc_srv(&r.GetDesc(), copy.as_ref())) {
+    let rdesc_opt = ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc());
+    if let Some(v) = rdesc_opt.as_ref().and_then(|rd| pc_srv(rd, copy.as_ref())) {
         copy = Some(v);
     }
     // a texture without video memory for its top mips (`vram::top_mip_tiles`): its views sample
@@ -2314,15 +2315,14 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     if super::present::trace_frame() && super::title_textures::address(res as usize).is_some() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 24 {
-            let rd = ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc());
             let v = desc.as_ref().map(|v| (v.Format.0, v.ViewDimension.0, v.Shader4ComponentMapping, v.Anonymous.Texture2D.MostDetailedMip, v.Anonymous.Texture2D.MipLevels, v.Anonymous.Texture2D.ResourceMinLODClamp));
             crate::xlog_info!(
                 "frame trace: SRV of title texture {res:p} {:?}: view (format, dimension, mapping, mip, mips, clamp) {v:x?}",
-                rd.map(|d| (d.Width, d.Height, d.Format.0, d.MipLevels, d.Flags.0))
+                rdesc_opt.map(|d| (d.Width, d.Height, d.Format.0, d.MipLevels, d.Flags.0))
             );
         }
     }
-    let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
+    let Some(rdesc) = rdesc_opt else {
         // A null image SRV was already created and published at `slot.index`. Writing `[0; 8]`
         // would point shaders at `ResourceDescriptorHeap[0]` (memory window 0 / uninitialized),
         // so write a valid T# referencing `slot.index` with the view's format class and type.
@@ -2340,7 +2340,6 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
         return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw));
     }
-    let rdesc = r.GetDesc();
     match srv_tsharp_from_desc(slot.index, &rdesc, desc.as_ref()) {
         Some(t) => super::console_heap::write(&slot, &t),
         None => {
@@ -2401,7 +2400,10 @@ unsafe extern "system" fn dev_create_srv_at_x(this: *mut c_void, rdesc: *const u
         let words = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw, true);
         return super::console_heap::write(&slot, &words);
     }
-    dev_create_srv_x(this, super::format_alias::placed_srv_resource(this, rdesc, va, v.Format.0 as u32), &v, cpu);
+    let placed = super::format_alias::placed_srv_resource(this, rdesc, va, v.Format.0 as u32);
+    let res = placed.as_ref().map_or(std::ptr::null_mut(), Interface::as_raw);
+    dev_create_srv_x(this, res, &v, cpu);
+    drop(placed);
 }
 
 /// device #71: the same for an unordered access view ({ the PC's UAV desc; GPU address @0x28;
@@ -2419,7 +2421,10 @@ unsafe extern "system" fn dev_create_uav_at_x(this: *mut c_void, rdesc: *const u
         let words = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw, false);
         return super::console_heap::write(&slot, &words);
     }
-    dev_create_uav_x(this, super::format_alias::placed_uav_resource(this, rdesc, va, v.Format.0 as u32), std::ptr::null_mut(), &v, cpu);
+    let placed = super::format_alias::placed_uav_resource(this, rdesc, va, v.Format.0 as u32);
+    let res = placed.as_ref().map_or(std::ptr::null_mut(), Interface::as_raw);
+    dev_create_uav_x(this, res, std::ptr::null_mut(), &v, cpu);
+    drop(placed);
 }
 
 /// V# of `n` elements from element `first` of the buffer at `va`.

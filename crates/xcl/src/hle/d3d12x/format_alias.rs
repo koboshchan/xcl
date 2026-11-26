@@ -445,6 +445,14 @@ impl AliasTable {
         self.pairs.push(pair);
     }
 
+    fn clone_internal(&self, res: usize) -> Option<ID3D12Resource> {
+        self.placed_uavs
+            .values()
+            .chain(self.placed_srvs.values())
+            .find(|r| r.as_raw() as usize == res)
+            .cloned()
+    }
+
     fn remove(&mut self, res: usize) -> Option<usize> {
         if let Some(old) = self.by_res.remove(&res) {
             if old.owner == Owner::TitlePlaced {
@@ -474,11 +482,31 @@ static TRACKED_TITLE_TEX: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE_PAIRS: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE_PLACED_UAV_PAIRS: AtomicUsize = AtomicUsize::new(0);
 
-/// Defer releasing internal resources evicted from `placed_uavs` / `placed_srvs` until in-flight
-/// GPU work has completed.
+/// Insert `value` at `key` or keep the existing entry, always returning a cloned handle to the
+/// winning map entry plus `Some(loser)` if another thread won the race so the caller can drop the
+/// loser outside the table lock.
+fn cache_insert_or_clone<K: Eq + std::hash::Hash, V: Clone>(
+    map: &mut HashMap<K, V>,
+    key: K,
+    value: V,
+) -> (V, Option<V>) {
+    match map.entry(key) {
+        std::collections::hash_map::Entry::Occupied(e) => (e.get().clone(), Some(value)),
+        std::collections::hash_map::Entry::Vacant(e) => (e.insert(value).clone(), None),
+    }
+}
+
+/// Release internal resources evicted from `placed_uavs` / `placed_srvs` outside `TABLE`.
+/// Adopted resources route through `real::res_release`, which cleans up `title_textures` /
+/// `vram` / `format_alias` tracking on the final ref and defers the PC `Release` via
+/// `late_release::hold` once no in-flight caller still holds a cloned reference.
 unsafe fn defer_drop_resources(evicted: Vec<ID3D12Resource>) {
     for r in evicted {
-        super::late_release::hold(r.into_raw() as usize);
+        if super::real::is_adopted(r.as_raw()) || !super::late_release::enabled() {
+            drop(r);
+        } else {
+            super::late_release::hold(r.into_raw() as usize);
+        }
     }
 }
 
@@ -553,10 +581,11 @@ unsafe fn create_internal_texture(dev: *mut c_void, pc_desc: &[u8; 0x38], initia
     Some(ID3D12Resource::from_raw(out))
 }
 
-/// Obtain or create the host UAV texture backing `CreateUnorderedAccessViewAtX` at `va`.
-pub(super) unsafe fn placed_uav_resource(dev: *mut c_void, rdesc: *const u8, va: u64, view_fmt: u32) -> *mut c_void {
+/// Obtain or create the host UAV texture backing `CreateUnorderedAccessViewAtX` at `va`,
+/// returning an owned reference so concurrent eviction cannot free it mid-call.
+pub(super) unsafe fn placed_uav_resource(dev: *mut c_void, rdesc: *const u8, va: u64, view_fmt: u32) -> Option<ID3D12Resource> {
     if rdesc.is_null() || va == 0 || !crate::gpu::shader::readable(rdesc as usize, 0x38) {
-        return std::ptr::null_mut();
+        return None;
     }
     let raw_x: [u8; 0x38] = (rdesc as *const [u8; 0x38]).read_unaligned();
     let prepared = prepare_placed_uav_desc(&raw_x, view_fmt);
@@ -566,7 +595,7 @@ pub(super) unsafe fn placed_uav_resource(dev: *mut c_void, rdesc: *const u8, va:
         let mut g = TABLE.lock().unwrap();
         let t = g.get_or_insert_with(AliasTable::new);
         if let Some(res) = t.placed_uavs.get(&key) {
-            return res.as_raw();
+            return Some(res.clone());
         }
     }
 
@@ -583,7 +612,7 @@ pub(super) unsafe fn placed_uav_resource(dev: *mut c_void, rdesc: *const u8, va:
         if N.fetch_add(1, Ordering::Relaxed) < 8 {
             crate::xlog_warn!("D3D12.X: placed UAV texture at {va:#x} (view fmt {view_fmt}) could not be created");
         }
-        return std::ptr::null_mut();
+        return None;
     };
     let raw = res.as_raw();
     if is_depth_uav {
@@ -591,47 +620,52 @@ pub(super) unsafe fn placed_uav_resource(dev: *mut c_void, rdesc: *const u8, va:
     }
     let pc_desc = res.GetDesc();
     let shape = TexShape::from_pc_desc(&pc_desc);
-    let mark = {
+    let (winner, lost_race, mark) = {
         let mut g = TABLE.lock().unwrap();
         let t = g.get_or_insert_with(AliasTable::new);
-        let entry = t.placed_uavs.entry(key).or_insert(res);
-        let raw_in = entry.as_raw();
-        if raw_in == raw && !is_depth_uav && enabled() {
+        let (winner, loser) = cache_insert_or_clone(&mut t.placed_uavs, key, res);
+        let mark = if loser.is_none() && !is_depth_uav && enabled() {
             t.insert(
                 raw as usize,
                 TrackedTex::new(dev as usize, va as usize, shape, Owner::PlacedUav, STATE_UAV, true),
             )
         } else {
             Vec::new()
-        }
+        };
+        (winner, loser, mark)
     };
+    if let Some(loser) = lost_race {
+        defer_drop_resources(vec![loser]);
+    } else {
+        static LOGGED: AtomicU64 = AtomicU64::new(0);
+        let n = LOGGED.fetch_add(1, Ordering::Relaxed);
+        if n < 8 || n.is_power_of_two() {
+            crate::xlog_info!(
+                "D3D12.X: placed UAV texture at {va:#x} ({}x{}x{}, {} mips, pc fmt {}, view fmt {view_fmt}) -> {raw:p} ({} created)",
+                pc_desc.Width,
+                pc_desc.Height,
+                pc_desc.DepthOrArraySize,
+                pc_desc.MipLevels,
+                pc_desc.Format.0,
+                n + 1
+            );
+        }
+    }
     for reader in mark {
         super::title_textures::note_gpu_write(reader);
     }
-    static LOGGED: AtomicU64 = AtomicU64::new(0);
-    let n = LOGGED.fetch_add(1, Ordering::Relaxed);
-    if n < 8 || n.is_power_of_two() {
-        crate::xlog_info!(
-            "D3D12.X: placed UAV texture at {va:#x} ({}x{}x{}, {} mips, pc fmt {}, view fmt {view_fmt}) -> {raw:p} ({} created)",
-            pc_desc.Width,
-            pc_desc.Height,
-            pc_desc.DepthOrArraySize,
-            pc_desc.MipLevels,
-            pc_desc.Format.0,
-            n + 1
-        );
-    }
-    raw
+    Some(winner)
 }
 
-/// Obtain or create the host SRV texture backing `CreateShaderResourceViewAtX` at `va`.
+/// Obtain or create the host SRV texture backing `CreateShaderResourceViewAtX` at `va`,
+/// returning an owned reference so concurrent eviction cannot free it mid-call.
 /// If a GPU writer already occupies `va` with a compatible shape, creates a dedicated GPU-synced
 /// SRV texture (skipping `title_textures` so CPU zeros never overwrite GPU writes); otherwise
 /// delegates to `create_placed_resource_x` and registers it as a reader in case a placed UAV
 /// appears at `va` later.
-pub(super) unsafe fn placed_srv_resource(dev: *mut c_void, rdesc: *const u8, va: u64, view_fmt: u32) -> *mut c_void {
+pub(super) unsafe fn placed_srv_resource(dev: *mut c_void, rdesc: *const u8, va: u64, view_fmt: u32) -> Option<ID3D12Resource> {
     if rdesc.is_null() || va == 0 || !crate::gpu::shader::readable(rdesc as usize, 0x38) {
-        return std::ptr::null_mut();
+        return None;
     }
     let raw_x: [u8; 0x38] = (rdesc as *const [u8; 0x38]).read_unaligned();
     let prepared = prepare_placed_srv_desc(&raw_x, view_fmt);
@@ -644,17 +678,14 @@ pub(super) unsafe fn placed_srv_resource(dev: *mut c_void, rdesc: *const u8, va:
         let mut g = TABLE.lock().unwrap();
         let t = g.get_or_insert_with(AliasTable::new);
         if let Some(res) = t.placed_srvs.get(&key) {
-            return res.as_raw();
+            return Some(res.clone());
         }
         enabled() && t.has_writer_at(va as usize, &shape)
     };
 
     let res = if has_writer {
         // Dedicated GPU-synced SRV texture in COMMON state (not registered in title_textures).
-        match create_internal_texture(dev, &pc, STATE_COMMON) {
-            Some(r) => r,
-            None => return std::ptr::null_mut(),
-        }
+        create_internal_texture(dev, &pc, STATE_COMMON)?
     } else {
         let mut r = std::ptr::null_mut();
         let hr = super::device_x::create_placed_resource_x(
@@ -671,31 +702,34 @@ pub(super) unsafe fn placed_srv_resource(dev: *mut c_void, rdesc: *const u8, va:
             if N.fetch_add(1, Ordering::Relaxed) < 8 {
                 crate::xlog_warn!("D3D12.X: placed SRV texture at {va:#x}: resource creation failed ({hr:#x})");
             }
-            return std::ptr::null_mut();
+            return None;
         }
         ID3D12Resource::from_raw(r)
     };
 
     let raw = res.as_raw();
     let owner = if has_writer { Owner::PlacedSrv } else { Owner::TitlePlaced };
-    let mark = {
+    let (winner, lost_race, mark) = {
         let mut g = TABLE.lock().unwrap();
         let t = g.get_or_insert_with(AliasTable::new);
-        let entry = t.placed_srvs.entry(key).or_insert(res);
-        let raw_in = entry.as_raw();
-        if raw_in == raw && enabled() {
+        let (winner, loser) = cache_insert_or_clone(&mut t.placed_srvs, key, res);
+        let mark = if loser.is_none() && enabled() {
             t.insert(
                 raw as usize,
                 TrackedTex::new(dev as usize, va as usize, shape, owner, STATE_COMMON, false),
             )
         } else {
             Vec::new()
-        }
+        };
+        (winner, loser, mark)
     };
+    if let Some(loser) = lost_race {
+        defer_drop_resources(vec![loser]);
+    }
     for reader in mark {
         super::title_textures::note_gpu_write(reader);
     }
-    raw
+    Some(winner)
 }
 
 /// Register a title-created placed texture from `device_x::create_placed_resource_x`.
@@ -1164,7 +1198,7 @@ pub(super) unsafe fn on_uav_barrier(list: *mut c_void, specific_targets: Option<
     };
     let dev_raw = dev.as_raw() as usize;
     let mut skipped = 0usize;
-    let pairs: Vec<AliasPair> = {
+    let pairs: Vec<(AliasPair, Option<ID3D12Resource>, Option<ID3D12Resource>)> = {
         let g = TABLE.lock().unwrap();
         match g.as_ref() {
             Some(t) => t
@@ -1188,6 +1222,7 @@ pub(super) unsafe fn on_uav_barrier(list: *mut c_void, specific_targets: Option<
                     }
                     true
                 })
+                .map(|p| (p, t.clone_internal(p.writer), t.clone_internal(p.reader)))
                 .collect(),
             None => return,
         }
@@ -1196,7 +1231,7 @@ pub(super) unsafe fn on_uav_barrier(list: *mut c_void, specific_targets: Option<
         note_skipped_sync();
     }
     let mut writer_ok: HashMap<usize, bool> = HashMap::new();
-    for pair in pairs {
+    for (pair, _writer_pin, _reader_pin) in pairs {
         let ok = sync_pair(list, &dev, ty, pair, STATE_UAV);
         let entry = writer_ok.entry(pair.writer).or_insert(true);
         *entry &= ok;
@@ -1237,10 +1272,16 @@ pub(super) unsafe fn sync_title_writers(list: *mut c_void, writers: &[(usize, u3
         if !seen.insert(writer) {
             continue;
         }
-        let pairs: Vec<AliasPair> = {
+        let pairs: Vec<(AliasPair, Option<ID3D12Resource>, Option<ID3D12Resource>)> = {
             let g = TABLE.lock().unwrap();
             match g.as_ref() {
-                Some(t) => t.pairs.iter().copied().filter(|p| p.writer == writer && p.device == dev_raw).collect(),
+                Some(t) => t
+                    .pairs
+                    .iter()
+                    .copied()
+                    .filter(|p| p.writer == writer && p.device == dev_raw)
+                    .map(|p| (p, t.clone_internal(p.writer), t.clone_internal(p.reader)))
+                    .collect(),
                 None => continue,
             }
         };
@@ -1248,7 +1289,7 @@ pub(super) unsafe fn sync_title_writers(list: *mut c_void, writers: &[(usize, u3
             continue;
         }
         let mut all_ok = true;
-        for pair in pairs {
+        for (pair, _writer_pin, _reader_pin) in pairs {
             all_ok &= sync_pair(list, &dev, ty, pair, state);
         }
         if all_ok {
@@ -1587,5 +1628,42 @@ mod tests {
         forget(reader2);
         forget(reader);
         forget(writer);
+    }
+
+    #[test]
+    fn cache_insert_or_clone_returns_winner_and_keeps_handle_alive_across_eviction() {
+        use std::sync::Arc;
+
+        let mut cache: HashMap<u64, Arc<u32>> = HashMap::new();
+        let first = Arc::new(111u32);
+        let second = Arc::new(222u32);
+
+        // Initial insert: map and caller both hold a reference to `first`.
+        let (h1, loser1) = cache_insert_or_clone(&mut cache, 0x1000, Arc::clone(&first));
+        assert!(loser1.is_none());
+        assert_eq!(*h1, 111);
+        assert_eq!(Arc::strong_count(&first), 3); // local `first` + cache + `h1`
+
+        // Concurrent miss race: returns a handle to the winning `first` and hands `second`
+        // back to the caller so it can be dropped outside the lock without UAF or deadlock.
+        let (h2, loser2) = cache_insert_or_clone(&mut cache, 0x1000, Arc::clone(&second));
+        assert_eq!(*h2, 111, "concurrent race must return the cached winner, not the loser");
+        assert!(Arc::ptr_eq(&h2, &first));
+        let loser = loser2.expect("duplicate loser must be returned for outside-lock drop");
+        assert!(Arc::ptr_eq(&loser, &second));
+        assert_eq!(Arc::strong_count(&second), 2);
+        drop(loser);
+        assert_eq!(Arc::strong_count(&second), 1);
+
+        // Concurrent eviction while `h1` / `h2` are in use keeps the resource alive until dropped.
+        drop(first);
+        let evicted = cache.remove(&0x1000).unwrap();
+        drop(evicted);
+        assert_eq!(*h1, 111);
+        assert_eq!(*h2, 111);
+        assert_eq!(Arc::strong_count(&h1), 2);
+        drop(h1);
+        assert_eq!(Arc::strong_count(&h2), 1);
+        drop(h2);
     }
 }
