@@ -24,7 +24,7 @@ const MOST: usize = 64 << 20;
 /// ensuring tiles referenced in the current frame or in-flight submissions are never evicted.
 const EVICT_GRACE_SUBMITS: u64 = 16;
 /// Rotating title tiles inspected per submit for unmapped/decommitted reclamation.
-const SWEEP_PER_SUBMIT: usize = 64;
+const SWEEP_PER_SUBMIT: usize = 16;
 /// Extra cold tiles reclaimed alongside a budget eviction to amortize tile-mapping updates.
 const EVICT_BATCH_EXTRA: usize = 32;
 
@@ -47,6 +47,10 @@ pub(super) struct Mirrors {
     title_of: FxHashMap<usize, usize>,
     /// where the bytes of a title tile are read from (its own address, or the CPU view's)
     read: FxHashMap<usize, usize>,
+    /// dense list of keys in `read` for O(SWEEP_PER_SUBMIT) rotating checks without cloning all keys
+    read_keys: Vec<usize>,
+    /// title tile → index in `read_keys`
+    read_idx: FxHashMap<usize, usize>,
     /// read tile → window tiles whose bytes are there
     by_read: FxHashMap<usize, Vec<usize>>,
     /// window tiles none of whose bytes have gone up yet (or whose pages changed place)
@@ -68,9 +72,27 @@ pub(super) struct Mirrors {
 static MIRRORS: Mutex<Option<Mirrors>> = Mutex::new(None);
 
 impl Mirrors {
+    fn track_read_key(&mut self, title: usize) {
+        if !self.read_idx.contains_key(&title) {
+            let idx = self.read_keys.len();
+            self.read_keys.push(title);
+            self.read_idx.insert(title, idx);
+        }
+    }
+
+    fn untrack_read_key(&mut self, title: usize) {
+        if let Some(idx) = self.read_idx.remove(&title) {
+            self.read_keys.swap_remove(idx);
+            if let Some(&moved) = self.read_keys.get(idx) {
+                self.read_idx.insert(moved, idx);
+            }
+        }
+    }
+
     /// Title tile `title` is shown at window tile `win`, its bytes read from `read`.
     pub(super) fn show(&mut self, win: usize, title: usize, read: usize) {
         self.title_of.insert(win, title);
+        self.track_read_key(title);
         self.read.insert(title, read);
         self.by_read.entry(read).or_default().push(win);
         self.fresh.push(win);
@@ -84,6 +106,7 @@ impl Mirrors {
     }
 
     fn set_read(&mut self, title: usize, read: usize) {
+        self.track_read_key(title);
         let old = self.read.insert(title, read);
         if old == Some(read) {
             return;
@@ -136,19 +159,41 @@ impl Mirrors {
         }
         for title in affected_titles {
             self.read.remove(&title);
+            self.untrack_read_key(title);
             self.backed.remove(&title);
         }
         evicted
     }
 
-    /// Evict every window tile showing `title` if none were touched in the current submit epoch.
-    fn evict_title_if_idle(&mut self, title: usize) -> Vec<usize> {
-        let wins: Vec<usize> = self.title_of.iter().filter(|&(_, &t)| t == title).map(|(&w, _)| w).collect();
-        if wins.is_empty() || wins.iter().any(|w| self.last_used.get(w).copied().unwrap_or(0) >= self.epoch) {
+    /// Evict every window tile showing any title in `titles` whose tiles were not touched in the
+    /// current submit epoch, in a single pass over `title_of` and one `evict_windows` call.
+    fn evict_titles_if_idle(&mut self, titles: &[usize]) -> Vec<usize> {
+        if titles.is_empty() {
             return Vec::new();
         }
-        self.evict_windows(&wins);
+        let wanted: HashSet<usize> = titles.iter().copied().collect();
+        let mut by_title: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+        for (&w, &t) in &self.title_of {
+            if wanted.contains(&t) {
+                by_title.entry(t).or_default().push(w);
+            }
+        }
+        let mut wins = Vec::new();
+        for (_, ws) in by_title {
+            if !ws.iter().any(|w| self.last_used.get(w).copied().unwrap_or(0) >= self.epoch) {
+                wins.extend(ws);
+            }
+        }
+        if !wins.is_empty() {
+            self.evict_windows(&wins);
+        }
         wins
+    }
+
+    /// Evict every window tile showing `title` if none were touched in the current submit epoch.
+    #[cfg(test)]
+    fn evict_title_if_idle(&mut self, title: usize) -> Vec<usize> {
+        self.evict_titles_if_idle(&[title])
     }
 
     /// Select up to `want` least-recently-used window tiles at least `min_age` submits old and
@@ -259,7 +304,7 @@ impl State {
         pages.sort_unstable();
         pages.dedup();
         let mut runs: Vec<(usize, usize)> = Vec::new();
-        let mut from: FxHashMap<usize, usize> = FxHashMap::default();
+        let mut cached_pages: FxHashMap<usize, [u8; PAGE]> = FxHashMap::default();
         let mut bytes = [0u8; PAGE];
         for (win, read) in pages {
             let tile = win & !(TILE - 1);
@@ -272,8 +317,12 @@ impl State {
             }
             let i = (win - tile) / PAGE;
             entry.holes &= !(1u16 << i);
+            let before = runs.len();
+            let last_len = runs.last().map_or(0, |r| r.1);
             scan_page(&bytes, win, &mut entry.sent[i], &mut runs);
-            from.insert(win, read);
+            if runs.len() != before || runs.last().is_some_and(|r| r.1 != last_len) {
+                cached_pages.insert(win, bytes);
+            }
         }
         let n = runs.iter().map(|r| r.1).sum();
         // (the title tile a run lies in never changes within it: a run is at most a page here, but
@@ -290,7 +339,13 @@ impl State {
         }).collect();
         self.upload_runs(&split, &|dst, p, len| {
             let page = dst & !(PAGE - 1);
-            from.get(&page).is_some_and(|r| read_title(r + (dst - page), p, len))
+            if let Some(buf) = cached_pages.get(&page) {
+                let off = dst - page;
+                std::ptr::copy_nonoverlapping(buf.as_ptr().add(off), p, len);
+                true
+            } else {
+                false
+            }
         });
         n
     }
@@ -427,16 +482,53 @@ pub fn sources() -> Vec<(usize, usize)> {
 /// Refresh tile backing addresses and detect unmapped/decommitted tiles outside `sparse::STATE`
 /// (called before `lock_state()` in `before_execute` so `kernelx::AWAY` is never taken under `STATE`).
 pub(super) fn refresh_sources() {
+    let changed = crate::hle::kernelx::mirrors::take_changed_buffers();
+    let gen = crate::hle::kernelx::gpu_view_map_gen();
     let look: Vec<(usize, bool)> = {
         let mut g = MIRRORS.lock().unwrap();
         let Some(m) = g.as_mut().filter(|m| m.tiles() != 0) else { return };
-        let gen = crate::hle::kernelx::gpu_view_map_gen().wrapping_add(crate::hle::kernelx::mirrors::changed_gen());
-        let titles: Vec<usize> = m.read.keys().copied().collect();
-        let selected: Vec<usize> = if std::mem::replace(&mut m.gen, gen) != gen {
-            titles
+        let full = std::mem::replace(&mut m.gen, gen) != gen;
+        let selected: Vec<usize> = if full {
+            m.read_keys.clone()
         } else {
-            let n = titles.len().max(1);
-            (0..SWEEP_PER_SUBMIT.min(titles.len())).map(|i| titles[(m.turn + i) % n]).collect()
+            let n = m.read_keys.len();
+            let sweep = SWEEP_PER_SUBMIT.min(n);
+            let mut out = Vec::with_capacity(sweep + changed.len());
+            if !changed.is_empty() {
+                let mut seen: HashSet<usize> = HashSet::new();
+                for &(a, b) in &changed {
+                    let lo = a & !(TILE - 1);
+                    let hi = b.saturating_add(TILE - 1) & !(TILE - 1);
+                    if lo >= hi {
+                        continue;
+                    }
+                    let tiles = (hi - lo) / TILE;
+                    if tiles <= m.read.len() {
+                        for t in (lo..hi).step_by(TILE) {
+                            if m.read.contains_key(&t) && seen.insert(t) {
+                                out.push(t);
+                            }
+                        }
+                    } else {
+                        for &t in &m.read_keys {
+                            if t >= lo && t < hi && seen.insert(t) {
+                                out.push(t);
+                            }
+                        }
+                    }
+                }
+                for i in 0..sweep {
+                    let t = m.read_keys[(m.turn + i) % n];
+                    if seen.insert(t) {
+                        out.push(t);
+                    }
+                }
+            } else {
+                for i in 0..sweep {
+                    out.push(m.read_keys[(m.turn + i) % n]);
+                }
+            }
+            out
         };
         m.turn = m.turn.wrapping_add(SWEEP_PER_SUBMIT);
         selected.into_iter().map(|t| (t, m.backed.contains(&t))).collect()
@@ -476,10 +568,7 @@ pub(super) unsafe fn sync(s: &mut State, dirty: &[usize]) {
     let Some(m) = g.as_mut().filter(|m| m.tiles() != 0) else { return };
     m.epoch = m.epoch.wrapping_add(1);
     let pending_dead = std::mem::take(&mut m.pending_dead);
-    let mut dead_wins: Vec<usize> = Vec::new();
-    for t in pending_dead {
-        dead_wins.extend(m.evict_title_if_idle(t));
-    }
+    let mut dead_wins = m.evict_titles_if_idle(&pending_dead);
     if !dead_wins.is_empty() {
         let evicted = dead_wins.len();
         decommit_window_tiles(s, &mut dead_wins);

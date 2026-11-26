@@ -322,34 +322,76 @@ unsafe fn plan_batch(dev: &ID3D12Device, items: &[(ID3D12Resource, Vec<Subresour
     (failed, planned, total)
 }
 
-/// GPU-side upload resources kept alive until `queue`'s fence passes the submitted batch.
+/// GPU-side upload resources kept alive until `queue`'s fence passes the submitted batch,
+/// then recyclable via `submit_batch_reusing` to avoid per-batch allocator/list/upload-buffer
+/// creation under the WDDM video memory manager.
 pub struct InFlight {
-    _alloc: ID3D12CommandAllocator,
-    _list: ID3D12GraphicsCommandList,
-    _staging: ID3D12Resource,
+    alloc: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    staging: ID3D12Resource,
+    mapped: *mut u8,
+    cap: u64,
     pub bytes: u64,
+}
+
+unsafe impl Send for InFlight {}
+
+impl InFlight {
+    pub fn cap(&self) -> u64 {
+        self.cap
+    }
+}
+
+/// Record and execute a batch of texture uploads directly on `queue` without waiting on the CPU,
+/// reusing a completed `InFlight` slot (allocator, command list, persistently mapped upload buffer)
+/// when supplied. The returned `InFlight` must stay alive until `queue` completes this submission.
+pub unsafe fn submit_batch_reusing(
+    dev: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)],
+    reuse: &mut Option<InFlight>,
+) -> Result<(Vec<(usize, String)>, Option<InFlight>), String> {
+    let (failed, planned, bytes) = plan_batch(dev, items);
+    if planned.is_empty() {
+        return Ok((failed, None));
+    }
+    let slot = if let Some(mut s) = reuse.take() {
+        if s.cap < bytes {
+            let cap = staging_capacity(bytes).ok_or("texture upload buffer size overflow")?;
+            let staging = buffer(dev, cap)?;
+            let mut mapped = std::ptr::null_mut();
+            staging.Map(0, None, Some(&mut mapped)).map_err(err)?;
+            s.staging = staging;
+            s.mapped = mapped as *mut u8;
+            s.cap = cap;
+        }
+        s.alloc.Reset().map_err(err)?;
+        s.list.Reset(&s.alloc, None).map_err(err)?;
+        s.bytes = bytes;
+        s
+    } else {
+        let cap = staging_capacity(bytes).ok_or("texture upload buffer size overflow")?;
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
+        let staging = buffer(dev, cap)?;
+        let mut mapped = std::ptr::null_mut();
+        staging.Map(0, None, Some(&mut mapped)).map_err(err)?;
+        InFlight { alloc, list, staging, mapped: mapped as *mut u8, cap, bytes }
+    };
+    for (k, layout, base) in &planned {
+        let (res, subs, states) = &items[*k];
+        record_into(&slot.list, res, subs, layout, states, states, &slot.staging, slot.mapped, *base);
+    }
+    slot.list.Close().map_err(err)?;
+    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&slot.list).map_err(err)?)]);
+    Ok((failed, Some(slot)))
 }
 
 /// Record and execute a batch of texture uploads directly on `queue` without waiting on the CPU.
 /// The returned `InFlight` must stay alive until `queue` completes this submission.
 pub unsafe fn submit_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<(Vec<(usize, String)>, Option<InFlight>), String> {
-    let (failed, planned, bytes) = plan_batch(dev, items);
-    if planned.is_empty() {
-        return Ok((failed, None));
-    }
-    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?;
-    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
-    let staging = buffer(dev, bytes)?;
-    let mut mapped = std::ptr::null_mut();
-    staging.Map(0, None, Some(&mut mapped)).map_err(err)?;
-    for (k, layout, base) in &planned {
-        let (res, subs, states) = &items[*k];
-        record_into(&list, res, subs, layout, states, states, &staging, mapped as *mut u8, *base);
-    }
-    staging.Unmap(0, None);
-    list.Close().map_err(err)?;
-    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(err)?)]);
-    Ok((failed, Some(InFlight { _alloc: alloc, _list: list, _staging: staging, bytes })))
+    let mut none = None;
+    submit_batch_reusing(dev, queue, items, &mut none)
 }
 
 fn put_back(key: usize, up: Uploader) {

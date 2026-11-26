@@ -781,7 +781,7 @@ impl PoolHeaps {
 /// Reusable 4-slot command ring + 1 MiB pre-zeroed upload buffer for asynchronous GPU zero-fills
 /// of recycled VRAM pool tiles on `Pages::queue`.
 const ZERO_BUF_BYTES: u64 = 1 << 20;
-const ZERO_SLOTS: usize = 4;
+const ZERO_SLOTS: usize = 32;
 
 struct ZeroSlot {
     alloc: ID3D12CommandAllocator,
@@ -906,9 +906,12 @@ impl Pages {
             crate::xlog_info!("D3D12.X: tiled resources tier {}: GPU-owned textures in arenas", o.TiledResourcesTier.0);
             return None;
         }
-        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).ok()?;
-        let _ = queue.SetName(windows::core::w!("xcl vram tile-mapping queue"));
-        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+        let (queue, fence) = super::title_textures::own_work(|| -> Option<(ID3D12CommandQueue, ID3D12Fence)> {
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).ok()?;
+            let _ = queue.SetName(windows::core::w!("xcl vram tile-mapping queue"));
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+            Some((queue, fence))
+        })?;
         crate::xlog_info!("D3D12.X: textures in title memory: tiled resources on 64 KiB pages of video memory, one per page of the title's");
         Some(Pages {
             queue,
@@ -1842,7 +1845,7 @@ unsafe fn retire_heaps_and_sweep(dev: &ID3D12Device, dev_key: usize, newly_recla
         if newly_reclaimed.is_empty() && !map.contains_key(&dev_key) { return; }
         let rq = map.entry(dev_key).or_insert_with(RetireQueue::new);
         let before = rq.batches.len();
-        let immediate = rq.retire_with(newly_reclaimed, unmap_mark, &queues, || dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok(), |q, f, v| q.Signal(f, v).is_ok());
+        let immediate = rq.retire_with(newly_reclaimed, unmap_mark, &queues, || super::title_textures::own_work(|| dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()), |q, f, v| q.Signal(f, v).is_ok());
         let (done, pruned) = rq.sweep_with(&live_keys, |f| f.GetCompletedValue());
         RETIRING_BATCHES.fetch_add(rq.batches.len().wrapping_sub(before), std::sync::atomic::Ordering::AcqRel);
         (immediate, done, pruned)
@@ -1871,8 +1874,12 @@ fn cap_for_fill(fill: f64) -> Option<u64> {
         None
     } else if fill < 0.80 {
         Some(1024)
-    } else {
+    } else if fill < 0.88 {
         Some(512)
+    } else if fill < 0.96 {
+        Some(256)
+    } else {
+        Some(128)
     }
 }
 
@@ -3151,7 +3158,9 @@ mod tests {
         assert_eq!(cap_for_fill(0.719), None);
         assert_eq!(cap_for_fill(0.72), Some(1024));
         assert_eq!(cap_for_fill(0.80), Some(512));
-        assert_eq!(cap_for_fill(1.3), Some(512));
+        assert_eq!(cap_for_fill(0.88), Some(256));
+        assert_eq!(cap_for_fill(0.96), Some(128));
+        assert_eq!(cap_for_fill(1.3), Some(128));
     }
 
     #[test]

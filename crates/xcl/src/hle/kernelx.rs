@@ -264,6 +264,7 @@ pub mod mirrors {
                 pages.at.remove(&k);
             }
             pages.changed.retain(|&(a, _)| a < g || a >= g + n);
+            pages.push_changed_buf(g, g.saturating_add(n));
         }
     }
 
@@ -291,8 +292,10 @@ pub mod mirrors {
         /// GPU-view ranges whose bytes are elsewhere since the last `take_changed`: mapped or
         /// unmapped, or their physical page was moved
         changed: Vec<(usize, usize)>,
+        /// GPU-view ranges changed since the last `take_changed_buffers` (consumed by `sparse::gpu_view`)
+        changed_buf: Vec<(usize, usize)>,
     }
-    static PAGES: Mutex<Pages> = Mutex::new(Pages { at: BTreeMap::new(), by_page: BTreeMap::new(), changed: Vec::new() });
+    static PAGES: Mutex<Pages> = Mutex::new(Pages { at: BTreeMap::new(), by_page: BTreeMap::new(), changed: Vec::new(), changed_buf: Vec::new() });
     static CHANGED_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     /// Monotonic generation bumped whenever `CopyPageMappingsBatchX` or physical-page moves change a GPU-view mapping.
@@ -318,13 +321,36 @@ pub mod mirrors {
             self.note(va);
         }
 
+        fn push_range(list: &mut Vec<(usize, usize)>, start: usize, end: usize) {
+            if start >= end {
+                return;
+            }
+            match list.last_mut() {
+                Some((s, e)) if start <= *e && end >= *s => {
+                    *s = (*s).min(start);
+                    *e = (*e).max(end);
+                }
+                _ => list.push((start, end)),
+            }
+        }
+
+        fn push_changed_buf(&mut self, start: usize, end: usize) {
+            Self::push_range(&mut self.changed_buf, start, end);
+        }
+
+        /// The range `[start, end)` changed (runs of pages kept together).
+        fn note_range(&mut self, start: usize, end: usize) {
+            if start >= end {
+                return;
+            }
+            CHANGED_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+            Self::push_range(&mut self.changed, start, end);
+            Self::push_range(&mut self.changed_buf, start, end);
+        }
+
         /// The page at `va` changed (runs of pages kept together).
         fn note(&mut self, va: usize) {
-            CHANGED_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
-            match self.changed.last_mut() {
-                Some((_, end)) if *end == va => *end += PAGE,
-                _ => self.changed.push((va, va + PAGE)),
-            }
+            self.note_range(va, va.saturating_add(PAGE));
         }
     }
 
@@ -335,6 +361,58 @@ pub mod mirrors {
         let off = va & (PAGE - 1);
         let shown = *PAGES.lock().unwrap().at.get(&(va - off))?;
         Some(shown.map(|s| s.page.and_then(super::page_now).unwrap_or(s.pool) + off))
+    }
+
+    /// All 64 KiB pages overlapping `[va, va + len)` that have explicit `CopyPageMappingsBatchX`
+    /// entries, returned as sorted `(page_va, Option<resolved_page_base>)` with a single lock
+    /// acquisition on `PAGES` (and at most one on `AWAY`). Empty means no page in the span was
+    /// mapped by `CopyPageMappingsBatchX`.
+    pub fn mapped_sources_in(va: usize, len: usize) -> Vec<(usize, Option<usize>)> {
+        if len == 0 {
+            return Vec::new();
+        }
+        let start = va & !(PAGE - 1);
+        let end = va.saturating_add(len);
+        let raw: Vec<(usize, Option<Shown>)> = {
+            let g = PAGES.lock().unwrap();
+            if g.at.is_empty() {
+                return Vec::new();
+            }
+            g.at.range(start..end).map(|(&k, &v)| (k, v)).collect()
+        };
+        if raw.is_empty() {
+            return Vec::new();
+        }
+        let need_away = raw.iter().any(|(_, v)| v.is_some_and(|s| s.page.is_some()));
+        if !need_away {
+            return raw.into_iter().map(|(k, v)| (k, v.map(|s| s.pool))).collect();
+        }
+        let away = super::AWAY.lock().unwrap();
+        let blocks = super::PHYS_BLOCKS.lock().ok();
+        let resolve = |s: Shown| -> usize {
+            let Some(page) = s.page else { return s.pool };
+            if let Some(a) = away.as_ref() {
+                if a.freed.contains(&page) {
+                    return s.pool;
+                }
+                if let Some(&at) = a.page.get(&page) {
+                    return at;
+                }
+            }
+            if let Some(idx) = super::page_index(page) {
+                if let Some(ref b) = blocks {
+                    if let Some((&first, &(count, live, home))) = b.range(..=idx).next_back() {
+                        if live > 0 && idx < first.saturating_add(count) {
+                            if let Some(at) = home.checked_add((idx - first).saturating_mul(super::PHYS_PAGE)) {
+                                return at;
+                            }
+                        }
+                    }
+                }
+            }
+            s.pool
+        };
+        raw.into_iter().map(|(k, v)| (k, v.map(resolve))).collect()
     }
 
     /// Physical page `page` was mapped, unmapped, moved or freed: the GPU-view pages that show
@@ -348,10 +426,50 @@ pub mod mirrors {
         }
     }
 
+    /// Record that physical-page mappings changed across `[start, start + len)`, notifying both
+    /// texture and buffer GPU-view consumers incrementally for any intersected GPU views.
+    pub(super) fn note_mapping_range(start: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let end = start.saturating_add(len);
+        let hits: Vec<(usize, usize)> = {
+            let s = STATE.lock().unwrap();
+            if s.gpu.is_empty() {
+                return;
+            }
+            let mut out = Vec::new();
+            for (&gpu, &(size, _)) in &s.gpu {
+                let g_end = gpu.saturating_add(size);
+                let lo = start.max(gpu);
+                let hi = end.min(g_end);
+                if lo < hi {
+                    let a = lo & !(PAGE - 1);
+                    let b = hi.saturating_add(PAGE - 1) & !(PAGE - 1);
+                    out.push((a, b.min(g_end)));
+                }
+            }
+            out
+        };
+        if hits.is_empty() {
+            return;
+        }
+        let mut pages = PAGES.lock().unwrap();
+        for (a, b) in hits {
+            pages.note_range(a, b);
+        }
+    }
+
     /// The GPU-view ranges whose bytes are elsewhere since the last call (`d3d12x::title_textures`
     /// reads the textures there again).
     pub fn take_changed() -> Vec<(usize, usize)> {
         std::mem::take(&mut PAGES.lock().unwrap().changed)
+    }
+
+    /// The GPU-view ranges whose bytes are elsewhere since the last call (`d3d12x::sparse::gpu_view`
+    /// rechecks only the mirrored tiles inside these ranges).
+    pub fn take_changed_buffers() -> Vec<(usize, usize)> {
+        std::mem::take(&mut PAGES.lock().unwrap().changed_buf)
     }
 
     /// One call of the queue's page-mapping method, `CopyPageMappingsBatchX(count, batches,
@@ -1246,11 +1364,9 @@ pub fn gpu_view_map_gen() -> u64 {
     GPU_VIEW_MAP_GEN.load(Ordering::Acquire)
 }
 
-/// Pages are mapped or unmapped at `va`: a GPU view's mappings changed if it lies in one.
-fn note_mapping_at(va: usize) {
-    if mirrors::source(va).is_some() {
-        GPU_VIEW_MAP_GEN.fetch_add(1, Ordering::Release);
-    }
+/// Pages are mapped or unmapped across `[va, va + len)`: notify GPU-view consumers incrementally.
+fn note_mapping_at(va: usize, len: usize) {
+    mirrors::note_mapping_range(va, len);
 }
 
 /// Page numbers count 4 KiB frames, as on the console: a 64 KiB page's is a multiple of 16 (a retail game
@@ -1538,7 +1654,7 @@ unsafe fn unmap_away_in(away: &mut Away, start: usize, len: usize) {
     for at in addrs {
         away.title.remove(&at);
         unmap_away(away, at, &(0..0));
-        note_mapping_at(at);
+        note_mapping_at(at, PHYS_PAGE);
     }
 }
 
@@ -1701,7 +1817,7 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
             mirrors::page_moved(page);
             if let Some(at) = away.page.remove(&page) {
                 away.at.remove(&at);
-                note_mapping_at(at);
+                note_mapping_at(at, PHYS_PAGE);
             }
             if page_index(page).is_some() {
                 away.freed.insert(page);
@@ -1758,7 +1874,9 @@ pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _
 /// `MapTitlePhysicalPages` with `AWAY` held; the homes it moves away are given back by the
 /// caller (`give_back_homes`).
 unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize) -> *mut c_void {
-    note_mapping_at(va as usize);
+    if !va.is_null() && n > 0 {
+        note_mapping_at(va as usize, n.saturating_mul(PHYS_PAGE));
+    }
     if crate::gpu::uma::get().is_none() || n == 0 || (va.is_null() && arr.is_null()) {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();

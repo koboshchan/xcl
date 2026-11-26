@@ -43,11 +43,11 @@ const POOL_TILES: u32 = 64;
 /// they are unmapped together: 256 MB of video memory
 const PARKED_MAX: usize = 4096;
 /// bytes of the ring-buffered upload staging buffer
-const STAGING: usize = 64 << 20;
+const STAGING: usize = 128 << 20;
 /// alignment of sub-allocations inside the upload staging ring (write-combined cacheline)
 const RING_ALIGN: usize = 64;
 /// number of in-flight upload command allocators / lists
-const UPLOAD_SLOTS: usize = 16;
+const UPLOAD_SLOTS: usize = 64;
 /// bytes of the dedicated pre-zeroed buffer for tile/hole clears (1 MiB)
 const ZERO_BUF: usize = 1 << 20;
 /// bytes of the GPU→CPU readback staging buffer
@@ -504,10 +504,42 @@ fn early_remove(early: &mut BTreeMap<usize, usize>, a: usize, b: usize) {
 }
 /// generation counter incremented whenever the set of mapped tiles changes (for watch_ranges cache)
 static MAPPED_GEN: AtomicU64 = AtomicU64::new(0);
+/// generation counter incremented only when a mapped tile enters a new 16 MiB watch bucket (or
+/// `init` resets windows), preventing `cached_watch_ranges` from rebuilding on every tile churn.
+static MAPPED_WATCH_GEN: AtomicU64 = AtomicU64::new(0);
+const WATCH_BUCKET: usize = 16 << 20;
+static WATCH_BUCKETS: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
 
 /// Generation counter of `mapped_ranges()` (changes only when tiles are mapped or unmapped).
 pub fn mapped_gen() -> u64 {
     MAPPED_GEN.load(Ordering::Acquire)
+}
+
+/// Coarse generation counter for write-watch range caching: bumps only when a newly mapped tile
+/// enters a 16 MiB bucket not yet watched (inside `WATCH_GAP = 64 MiB`).
+pub fn mapped_watch_gen() -> u64 {
+    MAPPED_WATCH_GEN.load(Ordering::Acquire)
+}
+
+fn note_watch_tiles(first: usize, end: usize) {
+    let lo = first & !(WATCH_BUCKET - 1);
+    let hi = end.saturating_add(WATCH_BUCKET - 1) & !(WATCH_BUCKET - 1);
+    let mut g = WATCH_BUCKETS.lock().unwrap();
+    let set = g.get_or_insert_with(std::collections::HashSet::new);
+    let mut added = false;
+    let mut b = lo;
+    while b < hi {
+        if set.insert(b) {
+            added = true;
+        }
+        match b.checked_add(WATCH_BUCKET) {
+            Some(next) => b = next,
+            None => break,
+        }
+    }
+    if added {
+        MAPPED_WATCH_GEN.fetch_add(1, Ordering::Release);
+    }
 }
 
 fn buffer_desc(bytes: u64) -> D3D12_RESOURCE_DESC {
@@ -547,7 +579,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
     if out.is_empty() {
         return out;
     }
-    let made = (|| -> windows::core::Result<State> {
+    let made = super::title_textures::own_work(|| -> windows::core::Result<State> {
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None)?;
@@ -605,7 +637,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             runs: None,
             scratch_runs: Vec::new(),
         })
-    })();
+    });
     match made {
         Ok(mut s) => {
             crate::xlog_info!("D3D12.X: {} sparse window(s) for the title's own memory (tiled buffers on video memory)", out.len());
@@ -620,6 +652,10 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
                 p.buffers = None;
                 p.pending_unpins.clear();
                 s.state_gen = p.state_gen;
+                if let Some(wb) = WATCH_BUCKETS.lock().unwrap().as_mut() {
+                    wb.clear();
+                }
+                MAPPED_WATCH_GEN.fetch_add(1, Ordering::Release);
                 g.replace(s)
             };
             drop(old);
@@ -844,10 +880,12 @@ impl State {
         if new.is_empty() {
             if unparked {
                 MAPPED_GEN.fetch_add(1, Ordering::Release);
+                note_watch_tiles(first, end);
             }
             return;
         }
         MAPPED_GEN.fetch_add(1, Ordering::Release);
+        note_watch_tiles(first, end);
         // per window
         let mut by_window: FxHashMap<usize, Vec<(usize, (u32, u32))>> = FxHashMap::default();
         for x in new {
@@ -1411,9 +1449,12 @@ unsafe fn get_or_create_rb_queue(dev: &ID3D12Device) -> Option<Arc<Mutex<RbQueue
             return Some(q.clone());
         }
     }
-    let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).ok()?;
-    let _ = queue.SetName(windows::core::w!("xcl sparse readback queue"));
-    let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+    let (queue, fence) = super::title_textures::own_work(|| -> Option<(ID3D12CommandQueue, ID3D12Fence)> {
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).ok()?;
+        let _ = queue.SetName(windows::core::w!("xcl sparse readback queue"));
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+        Some((queue, fence))
+    })?;
     let entry = Arc::new(Mutex::new(RbQueueInner { queue, fence, value: 0 }));
     let mut g = RB_QUEUES.lock().unwrap();
     Some(g.entry(key).or_insert_with(|| entry.clone()).clone())
@@ -1458,9 +1499,12 @@ unsafe fn take_readback_job(dev: &ID3D12Device, need: usize) -> Option<ReadbackJ
         }
     }
     // DIRECT matches `rb_queue` (`D3D12_COMMAND_LIST_TYPE_DIRECT`).
-    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
-    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).ok()?;
-    let _ = list.Close();
+    let (alloc, list) = super::title_textures::own_work(|| -> Option<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).ok()?;
+        let _ = list.Close();
+        Some((alloc, list))
+    })?;
     let mut d = buffer_desc(want as u64);
     d.Flags = D3D12_RESOURCE_FLAG_NONE;
     let mut r: Option<ID3D12Resource> = None;
@@ -1755,7 +1799,7 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
             if queue.GetDevice(&mut qdev).is_err() || qdev.as_ref().is_none_or(|d| d.as_raw() != s.dev.as_raw()) {
                 return;
             }
-            let Ok(fence) = s.dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return };
+            let Ok(fence) = super::title_textures::own_work(|| s.dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE)) else { return };
             s.queue_fences.insert(key, (fence, 0));
         }
         let Some((q_fence, q_val)) = s.queue_fences.get_mut(&key) else { return };
@@ -2012,7 +2056,7 @@ impl State {
         for (key, q) in active {
             let entry = match self.queue_fences.entry(key) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::hash_map::Entry::Vacant(e) => match self.dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) {
+                std::collections::hash_map::Entry::Vacant(e) => match super::title_textures::own_work(|| self.dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE)) {
                     Ok(fence) => e.insert((fence, 0)),
                     Err(_) => {
                         ok = false;
