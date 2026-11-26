@@ -17,6 +17,8 @@ pub struct Effects {
     pub memory: bool,
     /// image stores and image atomics
     pub images: bool,
+    /// ray-tracing BVH intersection instructions (`IMAGE_BVH_INTERSECT_RAY` / `IMAGE_BVH64_INTERSECT_RAY`)
+    pub bvh_intersect: bool,
     /// instructions in the program
     pub instructions: usize,
 }
@@ -63,7 +65,10 @@ pub fn of(code: &[u8]) -> Option<Effects> {
         let n = d.inst.name;
         let writes = n.contains("_STORE") || n.contains("_ATOMIC");
         match d.enc.name {
-            "ENC_MIMG" => e.images |= writes,
+            "ENC_MIMG" => {
+                e.images |= writes;
+                e.bvh_intersect |= n == "IMAGE_BVH_INTERSECT_RAY" || n == "IMAGE_BVH64_INTERSECT_RAY";
+            }
             "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL" | "ENC_FLAT_SCRATCH" | "ENC_SMEM" => e.memory |= writes,
             // LDS is the group's own and gone after it; the global data share is not
             "ENC_DS" => {
@@ -104,6 +109,38 @@ pub fn big_and_image_only(blob: &[u8]) -> bool {
     code.len() >= BIG_CODE && of(&code).is_some_and(|e| !e.memory)
 }
 
+/// Whether the compute shader `blob` issues `IMAGE_BVH_INTERSECT_RAY` or `IMAGE_BVH64_INTERSECT_RAY`.
+/// Scans decoded RDNA2 instructions directly so shaders with unresolved indirect branches
+/// (`s_setpc_b64`/`s_swappc_b64`, where `of()` fails closed) are still recognized.
+pub fn uses_bvh_intersect(blob: &[u8]) -> bool {
+    let Some(code) = compute_code(blob) else { return false };
+    let mut off = 0usize;
+    let mut ended = false;
+    while off + 4 <= code.len() {
+        let Ok(d) = rdna2::decode(&code[off..], off as u64) else {
+            if ended {
+                break;
+            }
+            off += 4;
+            continue;
+        };
+        if ended && d.inst.name == "S_CODE_END" {
+            break;
+        }
+        if d.enc.name == "ENC_MIMG" && (d.inst.name == "IMAGE_BVH_INTERSECT_RAY" || d.inst.name == "IMAGE_BVH64_INTERSECT_RAY") {
+            return true;
+        }
+        off += d.len;
+        ended |= d.inst.flags & rdna2::F_TERMINATOR != 0;
+    }
+    false
+}
+
+/// Whether raw shader container `blob` contains any of the ASCII byte slices in `needles`.
+pub fn container_contains_ascii_any(blob: &[u8], needles: &[&[u8]]) -> bool {
+    needles.iter().any(|n| !n.is_empty() && blob.windows(n.len()).any(|w| w == *n))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,8 +158,14 @@ mod tests {
     fn images_and_memory_are_told_apart() {
         // loads of either kind write nothing
         let load: (&str, &str, &[(&str, u64)]) = ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("SRSRC", 2)]);
-        assert_eq!(of(&asm(&[MOV, IMAGE_LOAD, load, END])), Some(Effects { memory: false, images: false, instructions: 4 }));
-        assert_eq!(of(&asm(&[MOV, IMAGE_STORE, END])), Some(Effects { memory: false, images: true, instructions: 3 }));
+        assert_eq!(of(&asm(&[MOV, IMAGE_LOAD, load, END])), Some(Effects { memory: false, images: false, bvh_intersect: false, instructions: 4 }));
+        assert_eq!(of(&asm(&[MOV, IMAGE_STORE, END])), Some(Effects { memory: false, images: true, bvh_intersect: false, instructions: 3 }));
+        let bvh: (&str, &str, &[(&str, u64)]) = ("IMAGE_BVH64_INTERSECT_RAY", "ENC_MIMG", &[("DMASK", 15), ("VADDR", 0), ("VDATA", 4), ("SRSRC", 2)]);
+        assert_eq!(of(&asm(&[bvh, END])).map(|e| (e.memory, e.images, e.bvh_intersect)), Some((false, false, true)));
+        let bvh_blob = xbox::tests::sample(5, &[xbox::tests::fssm(&asm(&[bvh, END]), &[(6, 0)])]);
+        assert!(uses_bvh_intersect(&bvh_blob));
+        let non_bvh_blob = xbox::tests::sample(5, &[xbox::tests::fssm(&asm(&[IMAGE_STORE, END]), &[(6, 0)])]);
+        assert!(!uses_bvh_intersect(&non_bvh_blob));
         let image_atomic: (&str, &str, &[(&str, u64)]) = ("IMAGE_ATOMIC_ADD", "ENC_MIMG", &[("DMASK", 1), ("VADDR", 0), ("VDATA", 4), ("SRSRC", 2)]);
         assert_eq!(of(&asm(&[image_atomic, END])).map(|e| (e.memory, e.images)), Some((false, true)));
         // every way into memory another pass or an indirect call reads
@@ -148,12 +191,12 @@ mod tests {
         // a branch can jump past an early s_endpgm: a store after it is the program's (were it
         // constant data instead, taking it for a store only makes binds wait, as before)
         let store: (&str, &str, &[(&str, u64)]) = ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("SRSRC", 2)]);
-        assert_eq!(of(&asm(&[IMAGE_STORE, END, store, END])), Some(Effects { memory: true, images: true, instructions: 4 }));
+        assert_eq!(of(&asm(&[IMAGE_STORE, END, store, END])), Some(Effects { memory: true, images: true, bvh_intersect: false, instructions: 4 }));
         // what does not decode after the end is trailing data
         let mut code = asm(&[IMAGE_STORE, END]);
         code.extend_from_slice(&[0xff; 8]);
         if rdna2::decode(&[0xff; 8], 0).is_err() {
-            assert_eq!(of(&code), Some(Effects { memory: false, images: true, instructions: 2 }));
+            assert_eq!(of(&code), Some(Effects { memory: false, images: true, bvh_intersect: false, instructions: 2 }));
         }
     }
 
@@ -198,7 +241,7 @@ mod tests {
         assert_eq!(of(&asm(&[IMAGE_STORE])), None);
         let mut saved = asm(&[IMAGE_STORE, ("S_ENDPGM_SAVED", "ENC_SOPP", &[])]);
         saved.extend_from_slice(&[0xff; 8]);
-        assert_eq!(of(&saved), Some(Effects { memory: false, images: true, instructions: 2 }));
+        assert_eq!(of(&saved), Some(Effects { memory: false, images: true, bvh_intersect: false, instructions: 2 }));
     }
 
     #[test]
@@ -222,7 +265,7 @@ mod tests {
             END,
             ("S_CODE_END", "ENC_SOPP", &[]),
         ]);
-        assert_eq!(of(&far_ok), Some(Effects { memory: false, images: true, instructions: 7 }));
+        assert_eq!(of(&far_ok), Some(Effects { memory: false, images: true, bvh_intersect: false, instructions: 7 }));
 
         // resolved far jump whose target lands past the decoded slice still fails closed
         let far_oob = asm(&[

@@ -409,6 +409,35 @@ pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
     submit_as(standin, compute, job, false, key, super::shader_code::limit() != 0);
 }
 
+/// Register a permanently gated stand-in pipeline (e.g. RT compute held back under
+/// `XCL_RT_GATE=hold`) with `done = true`, `job = None`, `sent = true`, and `real = 0`.
+/// Never enqueues a worker job, never translates or compiles, maps `standin -> driver` cleanly
+/// for `SetPipelineState`/`resolve`/`resolve_wait`, reports `is_pending(standin) == false`,
+/// and releases cleanly via `released()`.
+pub fn submit_gated(standin: usize, driver: usize) {
+    let p = Arc::new(Pending {
+        again: Mutex::new(None),
+        releasable: false,
+        gone: Default::default(),
+        code: AtomicUsize::new(0),
+        last: Default::default(),
+        job: Mutex::new(None),
+        sent: std::sync::atomic::AtomicBool::new(true),
+        real: AtomicUsize::new(0),
+        driver: AtomicUsize::new(driver),
+        done: Mutex::new(true),
+        cv: Condvar::new(),
+        compute: true,
+        key: 0,
+        used: Default::default(),
+        orphan: Default::default(),
+        late: std::sync::atomic::AtomicBool::new(true),
+        spared: std::sync::atomic::AtomicBool::new(false),
+        demand: Default::default(),
+    });
+    PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p);
+}
+
 fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, releasable: bool) {
     let p = Arc::new(Pending {
         again: Mutex::new(None),
@@ -1839,4 +1868,21 @@ pub fn bound_unbuilt(standin: usize, bound: usize) -> bool {
 pub fn counts() -> (usize, usize, usize) {
     let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
     (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
+}
+
+#[cfg(test)]
+mod gated_tests {
+    use super::*;
+
+    #[test]
+    fn submit_gated_maps_driver_without_pending_or_enqueue() {
+        let standin = 0x7E57_9A7Eusize;
+        let driver = 0x7E57_9A7Fusize;
+        submit_gated(standin, driver);
+        assert!(!is_pending(standin));
+        assert_eq!(resolve(standin), driver);
+        assert_eq!(resolve_wait(standin), driver);
+        assert!(!bound_unbuilt(standin, driver));
+        assert_eq!(released(standin), 0);
+    }
 }

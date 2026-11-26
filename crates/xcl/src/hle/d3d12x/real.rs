@@ -2029,6 +2029,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         super::title_textures::forget(this as usize);
         super::depth_uav::forget(this as usize);
         super::format_alias::forget(this as usize);
+        super::ambient::forget_resource(this as usize);
         forget_outside_resource(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
@@ -2654,7 +2655,9 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
             );
         }
     }
+    let amb_idx = if slot.shared_srv != 0 { slot.index } else { 0 };
     let Some(rdesc) = rdesc_opt else {
+        super::ambient::note_descriptor(slot.at, amb_idx, 0, 0, 0, false);
         // A null image SRV was already created and published at `slot.index`. Writing `[0; 8]`
         // would point shaders at `ResourceDescriptorHeap[0]` (memory window 0 / uninitialized),
         // so write a valid T# referencing `slot.index` with the view's format class and type.
@@ -2668,10 +2671,13 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         return super::console_heap::write(&slot, &[0; 8]);
     };
     if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+        super::ambient::note_descriptor(slot.at, amb_idx, 0, 0, 0, false);
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
         return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw, true));
     }
+    let amb_fmt = desc.as_ref().map(|v| v.Format.0).filter(|&f| f != 0).unwrap_or(rdesc.Format.0);
+    super::ambient::note_descriptor(slot.at, amb_idx, res as usize, amb_fmt, rdesc.Format.0, false);
     match srv_tsharp_from_desc(slot.index, &rdesc, desc.as_ref()) {
         Some(t) => super::console_heap::write(&slot, &t),
         None => {
@@ -3078,7 +3084,9 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     pc_uav(slot.pc_uav);
     super::console_heap::publish(&slot, true);
     super::console_heap::note_resource(&slot, res as usize);
+    let amb_idx = if slot.shared_srv != 0 { slot.index } else { 0 };
     let Some(r) = ID3D12Resource::from_raw_borrowed(&uav_res) else {
+        super::ambient::note_descriptor(slot.at, amb_idx, 0, 0, 0, true);
         // A null image UAV was already created and published at `slot.index + 1`. Create a
         // matching null companion SRV at `slot.index` and write a valid T# referencing
         // `slot.index` so shaders never fall back to `ResourceDescriptorHeap[0]` / `[1]`.
@@ -3097,6 +3105,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     };
     let rd = uav_rd_opt.unwrap();
     if let Some(v) = uav_desc.as_ref().filter(|v| v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
+        super::ambient::note_descriptor(slot.at, amb_idx, 0, 0, 0, true);
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
         return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw, false));
@@ -3117,6 +3126,8 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
         }
         None => (rd.Format, resource_dim_to_view(&rd), rd.DepthOrArraySize as u32, 0),
     };
+    let amb_fmt = if format.0 != 0 { format.0 } else { rd.Format.0 };
+    super::ambient::note_descriptor(slot.at, amb_idx, uav_res as usize, amb_fmt, rd.Format.0, true);
     let Some((fmt, ty, w, h, d, _)) = view_shape(r, format, dim, array, 1) else {
         note_buffer_view();
         return super::console_heap::write(&slot, &[0; 8]);
@@ -4808,6 +4819,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
             if let Some(i) = crate::gpu::recomp::pso::compute_interface(cs) {
                 PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (i.user_sgprs, i.threads));
             }
+            super::ambient::note_compute_pso(*ppv as usize, cs);
             note_translated_compute(0, ppv);
             TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
             return Some(Ok(0));
@@ -4845,6 +4857,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if let Some(i) = crate::gpu::recomp::pso::compute_interface(cs) {
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (i.user_sgprs, i.threads));
     }
+    super::ambient::note_compute_pso(*ppv as usize, cs);
     note_translated_compute(hr, ppv);
     crate::xlog_info!(
         "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
@@ -5764,6 +5777,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
     super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("ps", shader_bytes(&d.PS))]);
+    super::ambient::note_graphics_pso(*ppv as usize, shader_bytes(&d.PS));
     TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
     if super::present::trace_frame() {
@@ -6194,9 +6208,137 @@ unsafe fn note_translated_compute(hr: HRESULT, ppv: *mut *mut c_void) {
     }
 }
 
+/// Policy for gating RT traversal (`image_bvh*_intersect_ray`) and RT companion compute shaders
+/// (`XCL_RT_GATE`):
+/// - `hold` / `1` / unset (default): hold RT shaders back without translating, enqueueing, or
+///   compiling them (0 ms compile, 0 MB scratch, 0 split slabs). Pairs with `XCL_AMBIENT=auto`.
+/// - `0` / `off` / `false` / `allow`: disable gating; compile and run RT shaders freely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RtGateMode {
+    Off,
+    Hold,
+}
+
+fn parse_rt_gate_mode(raw: Option<&str>) -> RtGateMode {
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("0" | "off" | "false" | "allow") => RtGateMode::Off,
+        _ => RtGateMode::Hold,
+    }
+}
+
+fn rt_gate_mode() -> RtGateMode {
+    static MODE: std::sync::OnceLock<RtGateMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| parse_rt_gate_mode(std::env::var("XCL_RT_GATE").ok().as_deref()))
+}
+
+/// Whether BVH traversal compute shaders (`image_bvh*_intersect_ray`) are allowed to run.
+pub(super) fn bvh_traversal_allowed() -> bool {
+    rt_gate_mode() == RtGateMode::Off
+}
+
+/// Known RT companion compute shaders that feed ray-tracing passes without directly issuing
+/// `image_bvh*_intersect_ray`.
+const RT_COMPANION_CS_HASHES: &[u64] = &[
+    0x95cc_1328_8a27_a96e,
+];
+
+/// RT companion compute shader name fragments matched in container metadata (`PRIV`/`ILDN`).
+const RT_COMPANION_CS_NAMES: &[&[u8]] = &[
+    b"RaytracingResolve",
+    b"ScreenProbes_ActivateRays",
+    b"IrradianceCache_Shade",
+];
+
+fn parse_rt_skip_hashes(raw: &str) -> HashSet<u64> {
+    raw.split(|c: char| c == ',' || c == ';' || c.is_ascii_whitespace())
+        .filter_map(|tok| {
+            let t = tok.trim().trim_start_matches("0x").trim_start_matches("0X");
+            (!t.is_empty()).then(|| u64::from_str_radix(t, 16).ok()).flatten()
+        })
+        .collect()
+}
+
+fn extra_rt_skip_hashes() -> &'static HashSet<u64> {
+    static SET: std::sync::OnceLock<HashSet<u64>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| std::env::var("XCL_RT_SKIP_HASHES").map_or_else(|_| HashSet::new(), |v| parse_rt_skip_hashes(&v)))
+}
+
+fn is_rt_gated_cs_hash(hash: u64) -> bool {
+    RT_COMPANION_CS_HASHES.contains(&hash) || extra_rt_skip_hashes().contains(&hash)
+}
+
+fn is_rt_gated_cs(cs: &[u8]) -> bool {
+    is_rt_gated_cs_hash(crate::gpu::shader::fnv64(cs))
+        || crate::gpu::effects::container_contains_ascii_any(cs, RT_COMPANION_CS_NAMES)
+        || crate::gpu::effects::uses_bvh_intersect(cs)
+}
+
+/// When `XCL_RT_GATE=hold`, return a lightweight gated stand-in for RT traversal and RT companion
+/// compute shaders without translating, splitting, or compiling them.
+unsafe fn maybe_rt_gated_compute_pso(
+    this: *mut c_void,
+    f: PsoFn,
+    desc: *const c_void,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> Option<HRESULT> {
+    if rt_gate_mode() != RtGateMode::Hold {
+        return None;
+    }
+    if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
+        return None;
+    }
+    let d = &*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
+    let cs = shader_bytes(&d.CS)?;
+    if !crate::gpu::recomp::pso::is_console(cs) || !is_rt_gated_cs(cs) {
+        return None;
+    }
+    let key = if super::standin::enabled() && !ppv.is_null() { compute_key(this, desc) } else { None };
+    let mut driver = 0usize;
+    let hr = match key {
+        Some(key) => {
+            let made = super::standin::shell(key, || {
+                let mut out = std::ptr::null_mut();
+                let hr = standin_compute(this, f, desc, &pc_iid(Kind::PipelineState), &mut out);
+                if hr < 0 || out.is_null() { Err(hr) } else { Ok(out as usize) }
+            });
+            match made {
+                Ok((shell, d)) => {
+                    *ppv = shell;
+                    driver = d;
+                    S_OK
+                }
+                Err(hr) => hr,
+            }
+        }
+        None => standin_compute(this, f, desc, riid, ppv),
+    };
+    if hr < 0 || ppv.is_null() || (*ppv).is_null() {
+        return None;
+    }
+    if driver != 0 {
+        super::pso_async::submit_gated(*ppv as usize, driver);
+    }
+    let record = crate::gpu::shader::fnv64(cs);
+    static GATED_COUNT: AtomicU64 = AtomicU64::new(0);
+    let n = GATED_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 || n.is_power_of_two() {
+        crate::xlog_info!(
+            "D3D12.X: RT-gated compute PSO {record:016x} held back without compiling ({n} so far; XCL_RT_GATE=hold, set XCL_RT_GATE=0 to enable)"
+        );
+    }
+    LAST_COMPUTE_TRANSLATED.with(|c| c.set(false));
+    LAST_COMPUTE_RS.with(|c| c.set(0));
+    note_console_compute(hr, ppv);
+    Some(hr)
+}
+
 unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_compute_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
+    if let Some(hr) = maybe_rt_gated_compute_pso(this, f, desc, riid, ppv) {
+        return hr;
+    }
     let (mut console, missed) = if super::pso_async::enabled() { attempt(|| translated_compute_pso(this, f, desc, riid, ppv)) } else { (translated_compute_pso(this, f, desc, riid, ppv), false) };
     if missed {
         if let Some(hr) = own_compute(desc).and_then(|o| go_background(this, f, desc, riid, ppv, true, o, standin_compute, compute_key, build_compute)) {
@@ -7540,6 +7682,7 @@ unsafe fn translated_graphics_stream_once(this: *mut c_void, desc: *const c_void
     if !ppv.is_null() && !(*ppv).is_null() {
         note_pso_rs(*ppv, rs);
         super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("ps", console_ps)]);
+        super::ambient::note_graphics_pso(*ppv as usize, console_ps);
         TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
         if used_rect_gs { RECT_LIST_GS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize); }
     }
@@ -10372,5 +10515,23 @@ mod outside_buffer_tests {
         assert!(t.insert(base, base + 0x2_0000, uma, false, true, cap));
         assert_eq!(t.release_ref(base), None);
         assert_eq!(t.lookup(base + 0x1000, 0x1000), Some(uma + 0x1000));
+    }
+
+    #[test]
+    fn rt_gate_mode_and_companion_classifiers() {
+        assert_eq!(parse_rt_gate_mode(None), RtGateMode::Hold);
+        assert_eq!(parse_rt_gate_mode(Some("1")), RtGateMode::Hold);
+        assert_eq!(parse_rt_gate_mode(Some("hold")), RtGateMode::Hold);
+        assert_eq!(parse_rt_gate_mode(Some("0")), RtGateMode::Off);
+        assert_eq!(parse_rt_gate_mode(Some("off")), RtGateMode::Off);
+        assert_eq!(parse_rt_gate_mode(Some("allow")), RtGateMode::Off);
+        assert!(is_rt_gated_cs_hash(0x95cc_1328_8a27_a96e));
+        assert!(!is_rt_gated_cs_hash(0xef5e_ce92_2dc3_3bfe));
+        let parsed = parse_rt_skip_hashes("0x39f0e9aeb156a61c, 73fb752d7f62c3a5; not_hex");
+        assert!(parsed.contains(&0x39f0_e9ae_b156_a61c));
+        assert!(parsed.contains(&0x73fb_752d_7f62_c3a5));
+        assert_eq!(parsed.len(), 2);
+        assert!(is_rt_gated_cs(b"HDR\0CS_RaytracingResolve_01\0"));
+        assert!(is_rt_gated_cs(b"HDR\0CS_IrradianceCache_Shade_Low\0"));
     }
 }

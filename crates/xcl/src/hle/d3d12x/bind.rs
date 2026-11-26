@@ -1124,7 +1124,13 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // a split program: its chain (it binds the ABI itself)
         let ei = || fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
         match chained_indirect(this, list, pso, sig, max, (args, args_off_title, args_off), (count_buf, count_off_title, count_off), ei) {
-            Ok(true) => return count(DISPATCHES),
+            Ok(true) => {
+                if super::ambient::has_compute_psos() {
+                    let (layout, args, view_heap) = with(this, |s| (s.layout.clone(), s.args.clone(), s.heaps[0]));
+                    super::ambient::after_compute_dispatch(this, pso, [0, 0, 0], layout.as_deref(), &args, view_heap);
+                }
+                return count(DISPATCHES);
+            }
             Ok(false) => {}
             Err(e) => {
                 count(DISPATCHES_SKIPPED);
@@ -1193,6 +1199,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
             if let Some((b, _)) = guarded {
                 emit_transition(list, &b, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
+            }
+            if compute && super::ambient::has_compute_psos() {
+                let (layout, args, view_heap) = with(this, |s| (s.layout.clone(), s.args.clone(), s.heaps[0]));
+                super::ambient::after_compute_dispatch(this, pso, [0, 0, 0], layout.as_deref(), &args, view_heap);
             }
         }
         Err(e) => {
@@ -1379,10 +1389,18 @@ pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices:
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
     if let Some(list) = graphics_bound(this) {
         if draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
+            if super::ambient::has_sky_psos() {
+                let pso = super::pso_async::resolve(with(this, |s| s.pso));
+                super::ambient::after_draw(this, pso);
+            }
             return;
         }
         super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
         list.DrawInstanced(vertices, instances, first_vertex, first_instance);
+        if super::ambient::has_sky_psos() {
+            let pso = super::pso_async::resolve(with(this, |s| s.pso));
+            super::ambient::after_draw(this, pso);
+        }
     }
 }
 
@@ -1396,6 +1414,10 @@ pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, i
     if let Some(list) = prepare_indexed_draw(this, indices, instances, first_index, base_vertex) {
         super::list_x::sync_title_buffers(this, Some((first_index, indices, base_vertex)), 0, 0, if first_instance != 0 { instances.max(2) } else { instances });
         emit_prepared_indexed_draw(&list, indices, instances, first_index, base_vertex, first_instance);
+        if super::ambient::has_sky_psos() {
+            let pso = super::pso_async::resolve(with(this, |s| s.pso));
+            super::ambient::after_draw(this, pso);
+        }
     }
 }
 
@@ -1941,7 +1963,12 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     // more groups in X than D3D12 takes: folded (`recomp::IO_GROUP_LIMIT`)
     let (limit, [x, y, z]) = fold(x, y, z);
     bind_abi(this, list, pso, false, limit, None)?;
-    super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z])
+    let r = super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z]);
+    if super::ambient::has_compute_psos() {
+        let (layout, args, view_heap) = with(this, |s| (s.layout.clone(), s.args.clone(), s.heaps[0]));
+        super::ambient::after_compute_dispatch(this, pso, [x, y, z], layout.as_deref(), &args, view_heap);
+    }
+    r
 }
 
 /// A dispatch of `x` x `y` x `z` groups as D3D12 takes it: (the count for
