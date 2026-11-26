@@ -538,11 +538,34 @@ impl Lw {
         self.sel(sz, w[0], x)
     }
     /// `st_part`: atomically replace the bits `m` of the dword at `b` by `v`.
+    ///
+    /// Skips both global atomics when the target bits already equal `v & m` (huge win on
+    /// high-contention 8/16-bit formatted stores such as voxel visibility marks over PCIe UMA),
+    /// and skips the AND when setting all bits (`vm == m`) or the OR when clearing all bits
+    /// (`vm == 0`). Reads `b` with `heap_atomic_coherent` so it never aliases stale L1 against
+    /// prior coherent atomics in the same shader.
     fn st_part(&mut self, b: Value, m: Value, v: Value) {
-        let nm = self.not(m);
-        self.mraw_atomic(AtomicOp::And, b, nm);
         let vm = self.and(v, m);
-        self.mraw_atomic(AtomicOp::Or, b, vm);
+        let i32_ty = self.s.m.i32();
+        let cur = self.with_mem_many_tys_coh(None, &[i32_ty], self.heap_atomic_coherent, &mut |lw, mem| {
+            lw.s.raw_load(mem, b, 1)
+        })[0];
+        let cur_m = self.and(cur, m);
+        let diff = self.cmp(Pred::Ne, cur_m, vm);
+        let _ = self.guarded(diff, &mut |lw| {
+            let need_and = lw.cmp(Pred::Ne, vm, m);
+            let _ = lw.guarded(need_and, &mut |lw| {
+                let nm = lw.not(m);
+                lw.mraw_atomic(AtomicOp::And, b, nm);
+                Ok(())
+            });
+            let need_or = lw.cmpc(Pred::Ne, vm, 0);
+            let _ = lw.guarded(need_or, &mut |lw| {
+                lw.mraw_atomic(AtomicOp::Or, b, vm);
+                Ok(())
+            });
+            Ok(())
+        });
     }
     /// `st_bytes`: store the low `n` bytes of `r` at byte address `a` (n ≤ 16; partial
     /// dwords through atomics so neighbours stay intact).

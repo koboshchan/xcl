@@ -801,6 +801,40 @@ fn gpu_direct_unaligned_multi_dword_format_store() {
     assert_eq!(&got[0xFC..0x118], &want[0xFC..0x118], "bytes 0xFC..0x118 after the store at 0x102");
 }
 
+/// Sub-dword `st_part` fast paths: unchanged byte skips atomics, zero skips OR, 0xFF skips AND,
+/// and arbitrary values replace only the target byte without clobbering adjacent lanes' bytes.
+#[test]
+fn gpu_direct_sub_dword_store_fast_paths() {
+    use crate::gpu::recomp::runner::{self, KernelState};
+    // Lanes 0..4 each store one byte at 0x100 + lane via GLOBAL_STORE_BYTE:
+    // lane 0: 0xEF (unchanged), lane 1: 0x00 (clear only), lane 2: 0xFF (set only), lane 3: 0x42 (both).
+    let code = prog(&[
+        ("V_CMPX_GT_U32", "ENC_VOPC", &[("SRC0", 132), ("VSRC1", 0)], None), // exec = lane < 4
+        ("GLOBAL_STORE_BYTE", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 2), ("SADDR", 0x7D), ("OFFSET", 0x100)], None),
+    ]);
+    let dxil = runner::direct_kernel(&code, false).unwrap_or_else(|e| panic!("direct translation: {e}"));
+    super::validate::validate(&dxil).unwrap_or_else(|e| panic!("validator: {e}"));
+    if runner::adapter().is_err() || crate::gpu::recomp::dxc::location().is_err() {
+        runner::skip_test("no GPU / DXC");
+        return;
+    }
+    let mut st = KernelState::default();
+    let bytes = [0xEFu32, 0x00, 0xFF, 0x42];
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = l as u32;
+        r[1] = l as u32;
+        if l < 4 {
+            r[2] = bytes[l];
+        }
+    }
+    let mut mem = vec![0xDEAD_BEEFu32; 128];
+    mem[0x100 / 4] = 0xDEAD_BEEF;
+    let r = runner::run(&dxil, &st, &mem).expect("GPU run");
+    assert_eq!(r.mem[0x100 / 4], 0x42FF_00EF, "all four st_part paths in one dword");
+    assert_eq!(r.mem[0x100 / 4 - 1], 0xDEAD_BEEF, "previous dword untouched");
+    assert_eq!(r.mem[0x100 / 4 + 1], 0xDEAD_BEEF, "next dword untouched");
+}
+
 #[test]
 fn window_at_lowers_to_32bit_carry_without_int64() {
     let ko = KernelOptions { wave64: false, split: false, mem_windows: 4, sampler_base: 0 };
