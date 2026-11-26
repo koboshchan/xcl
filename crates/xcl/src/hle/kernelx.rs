@@ -1810,7 +1810,6 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             }
             away.gone.retain(|&h| h != home);
             if let Some(&old) = away.page.get(&p) {
-                sparse_batch.flush_if_contains(old);
                 unmap_away(away, old, &(home..home + PHYS_PAGE));
             }
             away.title.insert(home, p);

@@ -84,19 +84,14 @@ pub(crate) fn mark(page: usize) {
     LAZY.write().unwrap_or_else(|e| e.into_inner()).insert(page);
 }
 
-/// Whether `page` (64 KiB aligned) is mapped but not committed yet.
-pub fn is_lazy(page: usize) -> bool {
-    LAZY.read().unwrap_or_else(|e| e.into_inner()).contains(&page)
+/// Whether the 64 KiB page containing `addr` is marked lazy (mapped, committed on first touch).
+pub fn is_lazy(addr: usize) -> bool {
+    LAZY.read().unwrap_or_else(|e| e.into_inner()).contains(&(addr & !(PAGE - 1)))
 }
 
 /// `page` is unmapped: true if it was never used (nothing to keep of it).
 pub(crate) fn unmark(page: usize) -> bool {
     LAZY.write().unwrap_or_else(|e| e.into_inner()).remove(&page)
-}
-
-/// Whether the 64 KiB page containing `addr` is marked lazy (mapped, committed on first touch).
-pub(crate) fn is_lazy(addr: usize) -> bool {
-    LAZY.read().unwrap_or_else(|e| e.into_inner()).contains(&(addr & !(PAGE - 1)))
 }
 
 /// The lazy pages of `[p, p + len)` committed – memory a kernel call or XCL writes.

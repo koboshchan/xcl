@@ -1746,7 +1746,15 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
             return;
         }
         let key = queue.as_raw() as usize;
-        let Some((_, q_fence, q_val)) = s.queue_fences.get_mut(&key) else { return };
+        if !s.queue_fences.contains_key(&key) {
+            let mut qdev: Option<ID3D12Device> = None;
+            if queue.GetDevice(&mut qdev).is_err() || qdev.as_ref().is_none_or(|d| d.as_raw() != s.dev.as_raw()) {
+                return;
+            }
+            let Ok(fence) = s.dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return };
+            s.queue_fences.insert(key, (fence, 0));
+        }
+        let Some((q_fence, q_val)) = s.queue_fences.get_mut(&key) else { return };
         *q_val += 1;
         let v = *q_val;
         if queue.Signal(&*q_fence, v).is_err() {
