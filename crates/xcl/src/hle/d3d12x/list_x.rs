@@ -2904,10 +2904,43 @@ pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
             Deferred::Indirect(sig, max, args, args_off, count_buf, count_off) => super::bind::execute_indirect(seg, sig, max, args, args_off, count_buf, count_off),
         }
         let ext = *(seg as *const usize);
-        pc::<unsafe extern "system" fn(*mut c_void) -> i32>(seg, PC_CLOSE)(seg);
+        let hr = segment_close(wrapper, seg);
         real::preserve_vtable(seg, ext);
+        if hr < 0 {
+            // a recording the runtime refused is not submitted: the segment leaves the recording
+            // (a list whose Close failed is still open and cannot be reset), its call is dropped,
+            // and the next one does not follow it
+            static CLOSE_ERR: AtomicU64 = AtomicU64::new(0);
+            warn(&CLOSE_ERR, "deferred call", format_args!("Close failed ({hr:#x}), the call is dropped"));
+            super::bind::dispatch_dropped();
+            super::title_list::drop_segment(wrapper, seg);
+            continue;
+        }
         last = Some(seg);
     }
+}
+
+/// (tests) What the next native Close of a put-off segment of this wrapper does instead
+/// (`segment_close`; tests run in parallel, so it is the given wrapper's only).
+#[cfg(test)]
+type CloseHook = Box<dyn FnOnce(*mut c_void) -> i32 + Send>;
+#[cfg(test)]
+static CLOSE_HOOK: Mutex<Vec<(usize, CloseHook)>> = Mutex::new(Vec::new());
+
+/// The native Close of `wrapper`'s put-off segment `p`: its HRESULT.
+unsafe fn segment_close(wrapper: *mut c_void, p: *mut c_void) -> i32 {
+    #[cfg(test)]
+    {
+        let hook = {
+            let mut g = CLOSE_HOOK.lock().unwrap();
+            g.iter().position(|h| h.0 == wrapper as usize).map(|i| g.remove(i).1)
+        };
+        if let Some(hook) = hook {
+            return hook(p);
+        }
+    }
+    let _ = wrapper;
+    pc::<unsafe extern "system" fn(*mut c_void) -> i32>(p, PC_CLOSE)(p)
 }
 
 /// The allocator `list`'s put-off calls recorded on is reset once the GPU is done with them, so
@@ -3140,8 +3173,15 @@ unsafe fn deferred_segment(wrapper: *mut c_void, list: *mut c_void, ty: D3D12_CO
         None => real::create_raw_pc_command_list(dev.as_raw(), ty, super::alloc_pool::current(own), 0)?,
     };
     let ext = *(p as *const usize);
-    pc::<unsafe extern "system" fn(*mut c_void) -> i32>(p, PC_CLOSE)(p);
+    let hr = segment_close(wrapper, p);
     real::preserve_vtable(p, ext);
+    if hr < 0 {
+        // a list that did not close is no segment: the call waits in its list instead
+        static CLOSE_ERR: AtomicU64 = AtomicU64::new(0);
+        warn(&CLOSE_ERR, "put-off segment", format_args!("Close failed ({hr:#x})"));
+        super::title_list::put_spare(wrapper, p);
+        return None;
+    }
     super::title_list::push_segment(wrapper, p);
     Some(p)
 }
@@ -7523,6 +7563,138 @@ mod tests {
                 pso_async::release(pso_async::released(s));
             }
             pso_async::release(driver);
+        }
+    }
+
+    /// A direct queue, its allocator and a title list wrapped as XCL wraps one, bound to `standin`
+    /// (None: no adapter).
+    unsafe fn put_off_rig(standin: usize) -> Option<(ID3D12Device, ID3D12CommandQueue, ID3D12CommandAllocator, *mut c_void, *mut c_void)> {
+        use super::super::{bind, title_list};
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        let mut dev: Option<ID3D12Device> = None;
+        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+            let warp = CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>());
+            if warp.and_then(|w| D3D12CreateDevice(&w, D3D_FEATURE_LEVEL_11_0, &mut dev)).is_err() {
+                return None;
+            }
+        }
+        let dev = dev.unwrap();
+        let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap();
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+        let raw: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
+        let pc0 = raw.into_raw();
+        real::adopt(pc0, real::Kind::CommandList);
+        on_create(pc0, alloc.as_raw() as usize, 0, ty);
+        bind::reset(pc0, alloc.as_raw() as usize, standin);
+        let wrap = title_list::wrap(pc0);
+        Some((dev, queue, alloc, pc0, wrap))
+    }
+
+    /// A put-off call whose recording the driver refuses at the submit (its segment's Close
+    /// fails) is not submitted as it is: the segment goes out empty, the call is dropped, and the
+    /// rest of the submission runs (its fence is signalled, the device stays).
+    #[test]
+    fn a_put_off_call_whose_close_fails_is_not_submitted() {
+        use super::super::{bind, pso_async, title_list};
+        use std::time::{Duration, Instant};
+        unsafe {
+            let standin = 0x7E57_C105usize;
+            static BUILD: AtomicBool = AtomicBool::new(false);
+            BUILD.store(false, Ordering::Release);
+            pso_async::submit(standin, true, Box::new(|| {
+                let t = Instant::now();
+                while !BUILD.load(Ordering::Acquire) && t.elapsed() < Duration::from_secs(10) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                0
+            }));
+            let Some((dev, queue, _alloc, pc0, wrap)) = put_off_rig(standin) else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            bind::dispatch(pc0, 1, 1, 1);
+            let mut segs = Vec::new();
+            assert!(title_list::push_segments(wrap, &mut segs));
+            assert_eq!(segs.len(), 3, "the dispatch was put off");
+
+            // the replay's recording fails in the runtime: a query begun and never ended
+            let mut heap: Option<ID3D12QueryHeap> = None;
+            dev.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_OCCLUSION, Count: 1, NodeMask: 0 }, &mut heap).unwrap();
+            let heap = heap.unwrap();
+            let h = heap.as_raw() as usize;
+            static REFUSED: AtomicU32 = AtomicU32::new(0);
+            CLOSE_HOOK.lock().unwrap().push((wrap as usize, Box::new(move |p| unsafe {
+                pc::<QueryFn>(p, PC_BEGIN_QUERY)(p, h, D3D12_QUERY_TYPE_OCCLUSION, 0);
+                let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(p, PC_CLOSE)(p);
+                REFUSED.store(hr as u32, Ordering::Release);
+                hr
+            })));
+            let close_fn: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(9));
+            assert_eq!(close_fn(wrap), 0);
+            BUILD.store(true, Ordering::Release);
+            record_deferred(wrap);
+            assert!(!CLOSE_HOOK.lock().unwrap().iter().any(|h| h.0 == wrap as usize), "the replay closed its segment");
+            assert!((REFUSED.load(Ordering::Acquire) as i32) < 0, "the runtime refused the recording ({:#x})", REFUSED.load(Ordering::Acquire));
+            // what the submit collects after the replay (`q_execute_command_lists`)
+            segs.clear();
+            assert!(title_list::push_segments(wrap, &mut segs));
+            assert_eq!(segs.len(), 2, "the refused segment is not submitted");
+
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+            let exec: ExecFn = std::mem::transmute(*(*(queue.as_raw() as *const *const usize)).add(PC_QUEUE_EXECUTE_COMMAND_LISTS));
+            exec(queue.as_raw(), segs.len() as u32, segs.as_ptr());
+            queue.Signal(&done, 1).unwrap();
+            crate::gpu::fence::wait(&done, 1, &dev, None, 2000).expect("the submission runs");
+            assert!(dev.GetDeviceRemovedReason().is_ok(), "the device stays");
+
+            let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
+            rel_fn(wrap);
+            let _ = pso_async::released(standin);
+        }
+    }
+
+    /// A put-off segment that does not close when it is made is not used: the call waits in its
+    /// list instead of being put off.
+    #[test]
+    fn a_put_off_segment_that_does_not_close_is_not_used() {
+        use super::super::{bind, pso_async, title_list};
+        unsafe {
+            let standin = 0x7E57_C106usize;
+            static BUILD: AtomicBool = AtomicBool::new(false);
+            BUILD.store(false, Ordering::Release);
+            pso_async::submit(standin, true, Box::new(|| {
+                let t = std::time::Instant::now();
+                while !BUILD.load(Ordering::Acquire) && t.elapsed() < std::time::Duration::from_secs(10) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                0
+            }));
+            let Some((_dev, _queue, _alloc, pc0, wrap)) = put_off_rig(standin) else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            CLOSE_HOOK.lock().unwrap().push((wrap as usize, Box::new(|p| unsafe {
+                pc::<unsafe extern "system" fn(*mut c_void) -> i32>(p, PC_CLOSE)(p);
+                windows::Win32::Foundation::E_FAIL.0
+            })));
+            // (the call that is not put off waits for the build in the call; started here, after
+            // the device is made, so the build is still going when the call comes)
+            let ends = std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                BUILD.store(true, Ordering::Release);
+            });
+            bind::dispatch(pc0, 1, 1, 1);
+            ends.join().unwrap();
+            assert!(!CLOSE_HOOK.lock().unwrap().iter().any(|h| h.0 == wrap as usize), "the put-off segment was closed");
+            let mut segs = Vec::new();
+            assert!(title_list::push_segments(wrap, &mut segs));
+            assert_eq!(segs.len(), 1, "nothing was put off");
+            let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
+            rel_fn(wrap);
+            let _ = pso_async::released(standin);
         }
     }
 
