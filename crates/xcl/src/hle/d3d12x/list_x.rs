@@ -178,6 +178,9 @@ pub(super) unsafe fn restore_after_internal_pass(list: *mut c_void, clobbered_gf
     };
     restore_bindings(list, &bindings, ty);
     let (rs_gfx, rs_cs) = super::bind::tracked_root_sigs(list);
+    if clobbered_gfx || clobbered_cs {
+        super::bind::invalidate_pc_abi(list, clobbered_gfx, clobbered_cs);
+    }
     if clobbered_gfx && rs_gfx != 0 {
         pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, 30)(list, rs_gfx);
     }
@@ -2853,7 +2856,7 @@ const WANTED_AT_ONCE: usize = 4;
 /// Records the put-off calls of `wrapper`'s recording, waiting for their pipelines as a bind did.
 pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
     let mut segs = Vec::new();
-    super::title_list::push_segments(wrapper, &mut segs);
+    super::title_list::raw_segments(wrapper, &mut segs);
     let Some(&first) = segs.first() else { return };
     segs.retain(|&seg| seg == first || LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(seg as usize))).is_some_and(|s| s.deferred.is_some()));
     let mut last: Option<*mut c_void> = None;
@@ -3147,7 +3150,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
 unsafe fn deferred_segment(wrapper: *mut c_void, list: *mut c_void, ty: D3D12_COMMAND_LIST_TYPE) -> Option<*mut c_void> {
     let dev = device_of(list)?;
     let mut segs = Vec::new();
-    super::title_list::push_segments(wrapper, &mut segs);
+    super::title_list::raw_segments(wrapper, &mut segs);
     let first = *segs.first()? as usize;
     let own = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&first)?.own_alloc.clone());
     let own = match own {

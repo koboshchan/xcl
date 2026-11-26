@@ -224,17 +224,67 @@ fn sgprs(first: usize, inline: u32, args: &[u8], table_at: u64) -> Vec<u32> {
     s
 }
 
-static LAYOUTS: Mutex<Option<HashMap<usize, Arc<Layout>>>> = Mutex::new(None);
+/// Zero-allocation stack form of `with_heaps(l, user_sgprs, user_data_*, heaps)` writing into
+/// `dst` (which must be zeroed and at least `KERNEL_SGPRS` dwords).
+pub fn fill_user_data(l: &Layout, gfx: bool, user_sgprs: Option<u32>, args: &[u8], table_at: u64, heaps: [u32; 2], dst: &mut [u32]) {
+    let (first, inline) = if gfx { (FIRST_SGPR_GFX, l.inline_gfx) } else { (FIRST_SGPR, inline_for(l, user_sgprs)) };
+    dst[0] = table_at as u32;
+    dst[1] = (table_at >> 32) as u32;
+    let slice = &args[..(inline as usize).min(args.len())];
+    let mut len = first;
+    for chunk in slice.chunks(4) {
+        if len >= dst.len() {
+            break;
+        }
+        let mut w = [0u8; 4];
+        w[..chunk.len()].copy_from_slice(chunk);
+        dst[len] = u32::from_le_bytes(w);
+        len += 1;
+    }
+    for (_, base) in l.heaps.iter().zip(heaps).filter(|(&used, _)| used) {
+        if user_sgprs.is_some_and(|n| len as u32 >= n) || len >= dst.len() {
+            break;
+        }
+        dst[len] = base;
+        len += 1;
+    }
+}
+
+/// Zero-allocation stack form of `with_heaps(l, None, user_data_ms(l, args, table_at), heaps)`.
+pub fn fill_user_data_ms(l: &Layout, args: &[u8], table_at: u64, heaps: [u32; 2], dst: &mut [u32]) {
+    dst[8] = table_at as u32;
+    dst[9] = (table_at >> 32) as u32;
+    let slice = &args[..(l.inline_ms as usize).min(args.len())];
+    let mut len = FIRST_SGPR_MS;
+    for chunk in slice.chunks(4) {
+        if len >= dst.len() {
+            break;
+        }
+        let mut w = [0u8; 4];
+        w[..chunk.len()].copy_from_slice(chunk);
+        dst[len] = u32::from_le_bytes(w);
+        len += 1;
+    }
+    for (_, base) in l.heaps.iter().zip(heaps).filter(|(&used, _)| used) {
+        if len >= dst.len() {
+            break;
+        }
+        dst[len] = base;
+        len += 1;
+    }
+}
+
+static LAYOUTS: std::sync::RwLock<Option<HashMap<usize, Arc<Layout>>>> = std::sync::RwLock::new(None);
 
 /// A root signature was created from `blob`: remember its argument layout.
 pub fn note_root_signature(rs: usize, blob: &[u8]) {
     if let Some(l) = layout_from_blob(blob) {
-        LAYOUTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(rs, Arc::new(l));
+        LAYOUTS.write().unwrap().get_or_insert_with(HashMap::new).insert(rs, Arc::new(l));
     }
 }
 
 pub(super) fn layout_of(rs: usize) -> Option<Arc<Layout>> {
-    LAYOUTS.lock().unwrap().as_ref()?.get(&rs).cloned()
+    LAYOUTS.read().unwrap().as_ref()?.get(&rs).cloned()
 }
 
 /// Both are the layout of the same root signature object (not merely of one at the same
