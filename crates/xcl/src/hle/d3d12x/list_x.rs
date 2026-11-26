@@ -3575,7 +3575,14 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let kickoff_split = super::title_list::reclaim_for_kickoff(this);
     if let Some((_, ref prior, _)) = kickoff_split {
         if !prior.is_empty() {
-            execute_with_waits_on(q_raw, prior, |chunk| {
+            let mut prior_with_preludes = Vec::with_capacity(prior.len() * 2);
+            for &p in prior {
+                if let Some(pre) = super::bind::prelude_list_for(p) {
+                    prior_with_preludes.push(pre);
+                }
+                prior_with_preludes.push(p);
+            }
+            execute_with_waits_on(q_raw, &prior_with_preludes, |chunk| {
                 exec(q_raw, chunk.len() as u32, chunk.as_ptr());
                 copy_scratch_submitted(q_raw, chunk);
                 super::alloc_pool::executed(q_raw, chunk);
@@ -3595,7 +3602,12 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
 
     let one = [this];
-    exec(q_raw, 1, one.as_ptr());
+    if let Some(pre) = super::bind::prelude_list_for(this) {
+        let pair = [pre, this];
+        exec(q_raw, 2, pair.as_ptr());
+    } else {
+        exec(q_raw, 1, one.as_ptr());
+    }
     copy_scratch_submitted(q_raw, &one);
     super::alloc_pool::executed(q_raw, &one);
     signal_write64_pairs(q_raw, &write64_signals);

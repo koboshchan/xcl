@@ -551,11 +551,6 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
 pub(super) fn rebind_allocator(list: *mut c_void, allocator: usize) {
     let backing = backing_allocator(list, allocator);
     let (old, blocks, res_bufs, io_blocks, prelude) = with(list, |s| {
-        if s.allocator == backing {
-            s.pc_abi_gfx = AbiBound::default();
-            s.pc_abi_cs = AbiBound::default();
-            return (0, Vec::new(), Vec::new(), Vec::new(), None);
-        }
         let old = std::mem::replace(&mut s.allocator, backing);
         s.arena = Default::default();
         s.dummy_table_p = 0;
@@ -1058,6 +1053,7 @@ unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D1
 /// The `io` block of a two-pass stage: its user SGPRs (`compute_pass`: the MS layout) with the
 /// argument table at `table_at`, and the high dword of unified memory's base, as the other binds
 /// write it (the translated pair picks each access's memory window from it).
+#[cfg(test)]
 fn two_pass_io(layout: Option<&Layout>, args: &[u8], table_at: u64, compute_pass: bool, uma_base: usize, heaps: [u32; 2]) -> Vec<u32> {
     let mut io = match layout {
         Some(l) if compute_pass => console_list::with_heaps(l, None, console_list::user_data_ms(l, args, table_at), heaps),
@@ -2070,8 +2066,27 @@ unsafe fn chained_indirect(this: *mut c_void, list: &ID3D12GraphicsCommandList, 
     let n = if count_buf == 0 { max } else { read(count_buf, count_title, 1).map_or(max, |c| c[0].min(max)) };
     let seen: Vec<[u32; 3]> = (0..n.min(64)).filter_map(|k| read(args, args_title + u64::from(k * stride), 3)).map(|v| [v[0], v[1], v[2]]).collect();
     let predicated = super::list_x::predication_active(this);
-    super::real::dispatch_chain::execute_indirect(list, pso, with(this, |s| s.allocator), args_va, stride, max, count_va, &seen,
-        predicated, || bind_abi(this, list, pso, false, 0, None), ei)
+    let r = super::real::dispatch_chain::execute_indirect(
+        list,
+        pso,
+        with(this, |s| s.allocator),
+        args_va,
+        stride,
+        max,
+        count_va,
+        &seen,
+        predicated,
+        || {
+            // `pso::record_slicer` binds the slicer's compute root signature before invoking `bind`.
+            invalidate_pc_abi(this, false, true);
+            bind_abi(this, list, pso, false, 0, None)
+        },
+        ei,
+    );
+    if matches!(r, Ok(true)) {
+        invalidate_pc_abi(this, false, true);
+    }
+    r
 }
 
 /// The GPU address of a title's buffer `res` at its offset `title` (a buffer in unified memory) or
@@ -2805,6 +2820,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     let t = super::gpu_profile::begin(this, pso, super::gpu_profile::Kind::Dispatch, [x, y, z]);
     let r = super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z]);
     super::gpu_profile::end(this, t);
+    invalidate_pc_abi(this, false, true);
     if super::ambient::has_compute_psos() {
         let (layout, args, view_heap) = with(this, |s| (s.layout.clone(), s.args.clone(), s.heaps[0]));
         super::ambient::after_compute_dispatch(this, pso, [x, y, z], layout.as_deref(), &args, view_heap);
