@@ -359,6 +359,25 @@ pub(super) fn note_signature_dispatches(sig: usize, dispatches: bool) {
     }
 }
 
+/// command signatures whose arguments only draw (Draw, DrawIndexed, DispatchMesh): an
+/// ExecuteIndirect of one leaves no state behind, so it can be recorded at the submit (noted at
+/// every creation, as `DISPATCH_SIGNATURES`)
+static DRAW_ONLY_SIGNATURES: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+
+pub(super) fn note_signature_draws_only(sig: usize, draws_only: bool) {
+    let mut s = DRAW_ONLY_SIGNATURES.lock().unwrap();
+    let s = s.get_or_insert_with(Default::default);
+    if draws_only {
+        s.insert(sig);
+    } else {
+        s.remove(&sig);
+    }
+}
+
+fn signature_draws_only(sig: usize) -> bool {
+    DRAW_ONLY_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig))
+}
+
 fn signature_dispatches(sig: usize) -> bool {
     DISPATCH_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig))
 }
@@ -771,8 +790,13 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let raw_pso = with(this, |s| s.pso);
-    let unbuilt_compute = signature_dispatches(sig) && super::pso_async::is_pending(raw_pso) && super::real::is_console_compute(raw_pso);
-    if unbuilt_compute && super::list_x::defer(this, super::list_x::Deferred::Indirect(sig, max, args, args_off, count_buf, count_off)) {
+    let pending = super::pso_async::is_pending(raw_pso);
+    let unbuilt_compute = signature_dispatches(sig) && pending && super::real::is_console_compute(raw_pso);
+    // a graphics one too: the title's thread goes on to its next binds, whose builds then run on
+    // the workers at once instead of one after another here (only a signature that just draws:
+    // vertex / index buffer views and root arguments it sets would stay on the list after it)
+    let unbuilt_graphics = signature_draws_only(sig) && pending && !super::real::is_console_compute(raw_pso);
+    if (unbuilt_compute || unbuilt_graphics) && super::list_x::defer(this, super::list_x::Deferred::Indirect(sig, max, args, args_off, count_buf, count_off)) {
         return super::pso_async::need_by_submit(raw_pso);
     }
     let pso = super::pso_async::resolve_wait(raw_pso);
@@ -1745,7 +1769,7 @@ pub(super) fn counts_snapshot() -> [u64; 5] {
     std::array::from_fn(|k| COUNTS[k].load(Ordering::Relaxed))
 }
 
-#[cfg(test)]
+/// The pipeline `list` has bound (as the title made it; 0: none).
 pub(super) fn tracked_pso(list: *mut c_void) -> usize {
     STATES
         .lock()
