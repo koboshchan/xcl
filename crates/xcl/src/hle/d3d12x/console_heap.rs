@@ -472,47 +472,74 @@ pub unsafe fn publish(s: &Slot, uav: bool) {
         return;
     }
     if s.sampler {
-        if let Some(g) = GLOBAL_SAMPLER.lock().unwrap().as_ref() {
-            g.dev.CopyDescriptorsSimple(
-                1,
-                D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv as usize },
-                D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.pc_srv as usize },
-                D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-            );
-        }
+        let Some(dev) = GLOBAL_SAMPLER.lock().unwrap().as_ref().map(|g| g.dev.clone()) else {
+            return;
+        };
+        dev.CopyDescriptorsSimple(
+            1,
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv as usize },
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.pc_srv as usize },
+            D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+        );
         return;
     }
-    if let Some(g) = GLOBAL.lock().unwrap().as_ref() {
-        let (dst, src) = if uav { (s.shared_srv + g.inc as u64, s.pc_uav) } else { (s.shared_srv, s.pc_srv) };
-        g.dev.CopyDescriptorsSimple(1, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: dst as usize }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: src as usize }, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    }
+    let Some((dev, inc)) = GLOBAL.lock().unwrap().as_ref().map(|g| (g.dev.clone(), g.inc)) else {
+        return;
+    };
+    let (dst, src) = if uav { (s.shared_srv + inc as u64, s.pc_uav) } else { (s.shared_srv, s.pc_srv) };
+    dev.CopyDescriptorsSimple(1, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: dst as usize }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: src as usize }, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 }
 
 /// `n` view or sampler slots from `first` were copied (in the title's heap): they go to the shared heap,
-/// a run per page (a heap's pages lie apart there).
+/// a run per page (a heap's pages lie apart there), clamped to the heap's bounds.
 pub unsafe fn publish_range(first: &Slot, n: u32) {
+    if n == 0 {
+        return;
+    }
+    // Snapshot shared-heap metadata before locking HEAPS so lock order stays HEAPS -> GLOBAL*.
+    let Some((dev, g_cpu, g_inc)) = (if first.sampler {
+        GLOBAL_SAMPLER.lock().unwrap().as_ref().map(|g| (g.dev.clone(), g.cpu, g.inc))
+    } else {
+        GLOBAL.lock().unwrap().as_ref().map(|g| (g.dev.clone(), g.cpu, g.inc))
+    }) else {
+        return;
+    };
+    let mul = if first.sampler { 1u32 } else { 2u32 };
     let page_slots = if first.sampler { SAMPLER_PAGE_SLOTS } else { PAGE_SLOTS };
-    let step = if first.sampler { SAMPLER_SLOT } else { SLOT };
-    let mut done = 0;
-    while done < n {
-        let s = if done == 0 { Some(*first) } else { slot((first.at + (done * step) as usize) as u64) };
-        let Some(s) = s else { return };
-        let run = (page_slots - s.k % page_slots).min(n - done);
-        if s.shared_srv != 0 {
-            if s.sampler {
-                if let Some(g) = GLOBAL_SAMPLER.lock().unwrap().as_ref() {
-                    g.dev.CopyDescriptorsSimple(
-                        run,
-                        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv as usize },
-                        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.pc_srv as usize },
-                        D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-                    );
+    let mut runs: Vec<(u64, u64, u32)> = Vec::new();
+    {
+        let mut heaps = HEAPS.lock().unwrap();
+        if let Some(h) = heaps.iter_mut().find(|h| {
+            let end = h.shadow.saturating_add((h.n as usize).saturating_mul(h.slot_bytes() as usize));
+            h.sampler == first.sampler && first.at >= h.shadow && first.at < end
+        }) {
+            let start_k = ((first.at - h.shadow) / h.slot_bytes() as usize) as u32;
+            let limit = n.min(h.n.saturating_sub(start_k));
+            let mut done = 0u32;
+            while done < limit {
+                let k = start_k + done;
+                let run = (page_slots - k % page_slots).min(limit - done);
+                let page = if h.sampler { sampler_page_of(h, k) } else { page_of(h, k) };
+                if let Some((first_idx, k0)) = page {
+                    let dst = g_cpu + ((first_idx + mul * (k - k0)) as u64) * g_inc as u64;
+                    let src = h.pc_cpu + (mul as u64 * k as u64) * h.inc as u64;
+                    runs.push((dst, src, mul * run));
                 }
-            } else if let Some(g) = GLOBAL.lock().unwrap().as_ref() {
-                g.dev.CopyDescriptorsSimple(2 * run, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv as usize }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.pc_srv as usize }, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                done += run;
             }
+        } else if first.shared_srv != 0 {
+            let run = (page_slots - first.k % page_slots).min(n);
+            runs.push((first.shared_srv, first.pc_srv, mul * run));
         }
-        done += run;
+    }
+    let heap_ty = if first.sampler { D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER } else { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV };
+    for (dst, src, count) in runs {
+        dev.CopyDescriptorsSimple(
+            count,
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: dst as usize },
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: src as usize },
+            heap_ty,
+        );
     }
 }
 
@@ -1180,5 +1207,135 @@ mod tests {
         // Unhosted sampler heap (empty pages) keeps local slot index k.
         assert_eq!(sampler_own_index(&[], 0), 0);
         assert_eq!(sampler_own_index(&[], 42), 42);
+    }
+
+    #[test]
+    fn publish_and_publish_range_do_not_hold_locks_during_device_calls() {
+        const CHILD: &str = "XCL_TEST_PUBLISH_LOCKS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::d3d12x::console_heap::tests::publish_and_publish_range_do_not_hold_locks_during_device_calls", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        use std::ffi::c_void;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static UNLOCKED: AtomicBool = AtomicBool::new(true);
+        static CALLS: Mutex<Vec<(u32, u64, u64, i32)>> = Mutex::new(Vec::new());
+        #[repr(C)]
+        struct Object { vt: *const usize }
+        unsafe extern "system" fn retain(_this: *mut c_void) -> u32 { 1 }
+        unsafe extern "system" fn copy_simple(_this: *mut c_void, n: u32, dst: D3D12_CPU_DESCRIPTOR_HANDLE, src: D3D12_CPU_DESCRIPTOR_HANDLE, ty: D3D12_DESCRIPTOR_HEAP_TYPE) {
+            let ok = GLOBAL.try_lock().is_ok() && GLOBAL_SAMPLER.try_lock().is_ok() && HEAPS.try_lock().is_ok();
+            UNLOCKED.fetch_and(ok, Ordering::Relaxed);
+            CALLS.lock().unwrap().push((n, dst.ptr as u64, src.ptr as u64, ty.0));
+        }
+        let mut vt = [0usize; 25];
+        vt[1] = retain as usize;
+        vt[2] = retain as usize;
+        vt[24] = copy_simple as usize;
+        let (mut device, mut vheap, mut sheap) = (Object { vt: vt.as_ptr() }, Object { vt: vt.as_ptr() }, Object { vt: vt.as_ptr() });
+        let view_shadow = vec![0u8; (260 * SLOT) as usize];
+        let samp_shadow = vec![0u8; (12 * SAMPLER_SLOT) as usize];
+        unsafe {
+            let dev = ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void);
+            *GLOBAL.lock().unwrap() = Some(Global { dev: dev.clone(), heap: ID3D12DescriptorHeap::from_raw(&mut vheap as *mut _ as *mut c_void), cpu: 0x10_0000, gpu: 0x18_0000, inc: 32, cap: 4096, next: 64, free: Vec::new() });
+            *GLOBAL_SAMPLER.lock().unwrap() = Some(GlobalSampler { dev, heap: ID3D12DescriptorHeap::from_raw(&mut sheap as *mut _ as *mut c_void), cpu: 0x20_0000, inc: 16, cap: 256, next: 1, free: Vec::new() });
+            {
+                let mut heaps = HEAPS.lock().unwrap();
+                heaps.push(Heap { obj: 0xA1, shadow: view_shadow.as_ptr() as usize, n: 260, pc_cpu: 0x30_0000, pc_gpu: 0, inc: 32, sampler: false, pages: vec![UNMAPPED; 2], visible: true, memory: Memory::Uma });
+                heaps.push(Heap { obj: 0xA2, shadow: samp_shadow.as_ptr() as usize, n: 12, pc_cpu: 0x40_0000, pc_gpu: 0, inc: 16, sampler: true, pages: vec![UNMAPPED; 2], visible: true, memory: Memory::Uma });
+            }
+            let vs = slot(view_shadow.as_ptr() as u64).unwrap();
+            let ss = slot(samp_shadow.as_ptr() as u64).unwrap();
+            publish(&vs, false);
+            publish(&vs, true);
+            publish(&ss, false);
+            let v250 = slot(view_shadow.as_ptr() as u64 + (250 * SLOT) as u64).unwrap();
+            publish_range(&v250, 10);
+            let s6 = slot(samp_shadow.as_ptr() as u64 + (6 * SAMPLER_SLOT) as u64).unwrap();
+            publish_range(&s6, 6);
+            HEAPS.lock().unwrap().clear();
+            *GLOBAL_SAMPLER.lock().unwrap() = None;
+            *GLOBAL.lock().unwrap() = None;
+        }
+        assert!(UNLOCKED.load(Ordering::Relaxed), "CopyDescriptorsSimple ran while GLOBAL, GLOBAL_SAMPLER, or HEAPS was locked");
+        let calls = CALLS.lock().unwrap();
+        assert_eq!(calls.len(), 7, "3 single publish + 2 view pages + 2 sampler pages");
+        assert_eq!(calls[0], (1, 0x10_0000 + 64 * 32, 0x30_0000, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0));
+        assert_eq!(calls[1], (1, 0x10_0000 + 65 * 32, 0x30_0000 + 32, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0));
+        assert_eq!(calls[2], (1, 0x20_0000 + 16, 0x40_0000, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0));
+        assert_eq!(calls[3], (12, 0x10_0000 + (64 + 500) * 32, 0x30_0000 + 500 * 32, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0));
+        assert_eq!(calls[4], (8, 0x10_0000 + (64 + 512) * 32, 0x30_0000 + 512 * 32, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0));
+        assert_eq!(calls[5], (2, 0x20_0000 + 7 * 16, 0x40_0000 + 6 * 16, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0));
+        assert_eq!(calls[6], (4, 0x20_0000 + 9 * 16, 0x40_0000 + 8 * 16, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0));
+    }
+
+    #[test]
+    fn publish_range_clamps_to_heap_bounds_without_overrunning_tail_pages() {
+        const CHILD: &str = "XCL_TEST_PUBLISH_BOUNDS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::d3d12x::console_heap::tests::publish_range_clamps_to_heap_bounds_without_overrunning_tail_pages", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        use std::ffi::c_void;
+        static CALLS: Mutex<Vec<(u32, u64, u64, i32)>> = Mutex::new(Vec::new());
+        #[repr(C)]
+        struct Object { vt: *const usize }
+        unsafe extern "system" fn retain(_this: *mut c_void) -> u32 { 1 }
+        unsafe extern "system" fn copy_simple(_this: *mut c_void, n: u32, dst: D3D12_CPU_DESCRIPTOR_HANDLE, src: D3D12_CPU_DESCRIPTOR_HANDLE, ty: D3D12_DESCRIPTOR_HEAP_TYPE) {
+            CALLS.lock().unwrap().push((n, dst.ptr as u64, src.ptr as u64, ty.0));
+        }
+        let mut vt = [0usize; 25];
+        vt[1] = retain as usize;
+        vt[2] = retain as usize;
+        vt[24] = copy_simple as usize;
+        let (mut device, mut vheap, mut sheap) = (Object { vt: vt.as_ptr() }, Object { vt: vt.as_ptr() }, Object { vt: vt.as_ptr() });
+        let v4_shadow = vec![0u8; (4 * SLOT) as usize];
+        let s3_shadow = vec![0u8; (3 * SAMPLER_SLOT) as usize];
+        let v260_shadow = vec![0u8; (260 * SLOT) as usize];
+        unsafe {
+            let dev = ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void);
+            *GLOBAL.lock().unwrap() = Some(Global { dev: dev.clone(), heap: ID3D12DescriptorHeap::from_raw(&mut vheap as *mut _ as *mut c_void), cpu: 0x10_0000, gpu: 0x18_0000, inc: 32, cap: 4096, next: 64, free: Vec::new() });
+            *GLOBAL_SAMPLER.lock().unwrap() = Some(GlobalSampler { dev, heap: ID3D12DescriptorHeap::from_raw(&mut sheap as *mut _ as *mut c_void), cpu: 0x20_0000, inc: 16, cap: 256, next: 1, free: Vec::new() });
+            {
+                let mut heaps = HEAPS.lock().unwrap();
+                heaps.push(Heap { obj: 0xB1, shadow: v4_shadow.as_ptr() as usize, n: 4, pc_cpu: 0x30_0000, pc_gpu: 0, inc: 32, sampler: false, pages: vec![UNMAPPED], visible: true, memory: Memory::Uma });
+                heaps.push(Heap { obj: 0xB2, shadow: s3_shadow.as_ptr() as usize, n: 3, pc_cpu: 0x40_0000, pc_gpu: 0, inc: 16, sampler: true, pages: vec![UNMAPPED], visible: true, memory: Memory::Uma });
+                heaps.push(Heap { obj: 0xB3, shadow: v260_shadow.as_ptr() as usize, n: 260, pc_cpu: 0x50_0000, pc_gpu: 0, inc: 32, sampler: false, pages: vec![UNMAPPED; 2], visible: true, memory: Memory::Uma });
+            }
+            let v4_s1 = slot(v4_shadow.as_ptr() as u64 + SLOT as u64).unwrap();
+            publish_range(&v4_s1, 0);
+            publish_range(&v4_s1, 10);
+            let s3_s1 = slot(s3_shadow.as_ptr() as u64 + SAMPLER_SLOT as u64).unwrap();
+            publish_range(&s3_s1, 10);
+            let v260_s250 = slot(v260_shadow.as_ptr() as u64 + (250 * SLOT) as u64).unwrap();
+            publish_range(&v260_s250, 20);
+            HEAPS.lock().unwrap().clear();
+            *GLOBAL_SAMPLER.lock().unwrap() = None;
+            *GLOBAL.lock().unwrap() = None;
+        }
+        let calls = CALLS.lock().unwrap();
+        assert_eq!(
+            *calls,
+            vec![
+                // 4-slot view heap (allocated 64..72): k=1..4 => 6 descriptors (ending at 72, 0 overrun)
+                (6, 0x10_0000 + 66 * 32, 0x30_0000 + 2 * 32, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0),
+                // 3-slot sampler heap (allocated 1..4): k=1..3 => 2 descriptors (ending at 4, 0 overrun)
+                (2, 0x20_0000 + 2 * 16, 0x40_0000 + 16, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0),
+                // 260-slot view heap: page 0 (72..584) k=250..256 => 12 descs; tail page 1 (584..592) k=256..260 => 8 descs
+                (12, 0x10_0000 + (72 + 500) * 32, 0x50_0000 + 500 * 32, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0),
+                (8, 0x10_0000 + 584 * 32, 0x50_0000 + 512 * 32, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0),
+            ],
+            "publish_range must clamp strictly to heap bounds with 0 tail-page overrun"
+        );
     }
 }
