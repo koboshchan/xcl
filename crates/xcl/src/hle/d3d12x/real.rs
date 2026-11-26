@@ -1278,14 +1278,246 @@ fn resource_dim_to_view(r: &D3D12_RESOURCE_DESC) -> i32 {
 }
 
 static NON_UMA_BUFFER_VIEWS: AtomicU64 = AtomicU64::new(0);
+static GPU_VIEW_BUFFER_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Default total VRAM-only sparse backing cap for GPU-writable buffers placed at unresolved
+/// addresses outside the UMA windows (`0xc_..–0x13_..` GPU views or outside-window reservations).
+/// Override with `XCL_OUTSIDE_BUFFER_MB` (`0` or `XCL_OUTSIDE_BUFFERS=0` disables).
+const OUTSIDE_BUFFER_DEFAULT_MB: usize = 256;
+const OUTSIDE_BUFFER_MAX_ITEM: usize = 64 << 20;
+const OUTSIDE_TILE: usize = 0x1_0000;
+
+fn outside_buffer_cap_bytes() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        if std::env::var("XCL_OUTSIDE_BUFFERS").is_ok_and(|v| v.trim() == "0") {
+            return 0;
+        }
+        std::env::var("XCL_OUTSIDE_BUFFER_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(OUTSIDE_BUFFER_DEFAULT_MB)
+            .saturating_mul(1 << 20)
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OutsideEntry {
+    title_base: usize,
+    title_end: usize,
+    uma_base: usize,
+    refs: usize,
+    pinned_uav: bool,
+}
+
+#[derive(Default)]
+struct OutsideBufferTable {
+    entries: Vec<OutsideEntry>,
+    total_bytes: usize,
+}
+
+impl OutsideBufferTable {
+    fn lookup(&self, va: usize, len: usize) -> Option<usize> {
+        let end = va.checked_add(len)?;
+        self.entries
+            .iter()
+            .find(|e| e.title_base <= va && end <= e.title_end)
+            .map(|e| e.uma_base + (va - e.title_base))
+    }
+
+    fn retain_existing(&mut self, va: usize, len: usize, add_ref: bool, pin_uav: bool) -> Option<(usize, usize)> {
+        let end = va.checked_add(len)?;
+        let e = self.entries.iter_mut().find(|e| e.title_base <= va && end <= e.title_end)?;
+        if add_ref {
+            e.refs = e.refs.saturating_add(1);
+        }
+        if pin_uav {
+            e.pinned_uav = true;
+        }
+        Some((e.title_base, e.uma_base + (va - e.title_base)))
+    }
+
+    fn can_insert(&self, title_base: usize, title_end: usize, cap_bytes: usize) -> bool {
+        if cap_bytes == 0 || title_end <= title_base {
+            return false;
+        }
+        let span = title_end - title_base;
+        if span > OUTSIDE_BUFFER_MAX_ITEM || self.total_bytes.saturating_add(span) > cap_bytes {
+            return false;
+        }
+        !self.entries.iter().any(|e| e.title_base < title_end && title_base < e.title_end)
+    }
+
+    fn insert(&mut self, title_base: usize, title_end: usize, uma_base: usize, add_ref: bool, pin_uav: bool, cap_bytes: usize) -> bool {
+        if !self.can_insert(title_base, title_end, cap_bytes) {
+            return false;
+        }
+        self.total_bytes = self.total_bytes.saturating_add(title_end - title_base);
+        self.entries.push(OutsideEntry {
+            title_base,
+            title_end,
+            uma_base,
+            refs: usize::from(add_ref),
+            pinned_uav: pin_uav,
+        });
+        true
+    }
+
+    fn release_ref(&mut self, title_base: usize) -> Option<usize> {
+        let idx = self.entries.iter().position(|e| e.title_base == title_base)?;
+        let e = &mut self.entries[idx];
+        e.refs = e.refs.saturating_sub(1);
+        if e.refs == 0 && !e.pinned_uav {
+            let gone = self.entries.swap_remove(idx);
+            self.total_bytes = self.total_bytes.saturating_sub(gone.title_end - gone.title_base);
+            Some(gone.uma_base)
+        } else {
+            None
+        }
+    }
+}
+
+static OUTSIDE_BUFFERS: std::sync::RwLock<OutsideBufferTable> = std::sync::RwLock::new(OutsideBufferTable { entries: Vec::new(), total_bytes: 0 });
+static OUTSIDE_RES: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+static HAS_OUTSIDE_BUFFERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn lookup_outside_buffer(va: usize, len: usize) -> Option<usize> {
+    if !HAS_OUTSIDE_BUFFERS.load(Ordering::Acquire) {
+        return None;
+    }
+    OUTSIDE_BUFFERS.read().unwrap().lookup(va, len)
+}
+
+unsafe fn ensure_outside_buffer(va: usize, len: usize, add_ref: bool, pin_uav: bool) -> Option<(usize, usize)> {
+    let cap = outside_buffer_cap_bytes();
+    if cap == 0 || va == 0 || len == 0 || len > OUTSIDE_BUFFER_MAX_ITEM {
+        return None;
+    }
+    if let Some(hit) = OUTSIDE_BUFFERS.write().unwrap().retain_existing(va, len, add_ref, pin_uav) {
+        return Some(hit);
+    }
+    let title_base = va & !(OUTSIDE_TILE - 1);
+    let title_end = va.checked_add(len)?.checked_next_multiple_of(OUTSIDE_TILE)?;
+    let span = title_end - title_base;
+    if !OUTSIDE_BUFFERS.read().unwrap().can_insert(title_base, title_end, cap) {
+        return None;
+    }
+    // Allocate VRAM-only sparse backing OUTSIDE `OUTSIDE_BUFFERS` lock (zero lock-order hazard).
+    let (uma_base, _) = super::sparse::alloc_vram_only(span, OUTSIDE_TILE)?;
+    let inserted = {
+        let mut t = OUTSIDE_BUFFERS.write().unwrap();
+        if let Some(hit) = t.retain_existing(va, len, add_ref, pin_uav) {
+            drop(t);
+            super::sparse::free_vram_only(uma_base);
+            return Some(hit);
+        }
+        t.insert(title_base, title_end, uma_base, add_ref, pin_uav, cap)
+    };
+    if !inserted {
+        super::sparse::free_vram_only(uma_base);
+        return None;
+    }
+    HAS_OUTSIDE_BUFFERS.store(true, Ordering::Release);
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    let n = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 || n.is_power_of_two() {
+        crate::xlog_info!(
+            "D3D12.X: shared GPU-writable backing for outside-UMA buffer {va:#x} ({len} B) -> sparse UMA {:#x} (#{n})",
+            uma_base + (va - title_base)
+        );
+    }
+    Some((title_base, uma_base + (va - title_base)))
+}
+
+unsafe fn release_outside_ref(title_base: usize) {
+    let free_uma = OUTSIDE_BUFFERS.write().unwrap().release_ref(title_base);
+    if let Some(uma_base) = free_uma {
+        super::sparse::free_vram_only(uma_base);
+    }
+}
+
+unsafe fn forget_outside_resource(res: usize) {
+    if !HAS_OUTSIDE_BUFFERS.load(Ordering::Relaxed) {
+        return;
+    }
+    let title_base = OUTSIDE_RES.lock().unwrap().as_mut().and_then(|m| m.remove(&res));
+    if let Some(tb) = title_base {
+        release_outside_ref(tb);
+    }
+}
+
+fn is_gpu_writable_placed_buffer(d: &D3D12_RESOURCE_DESC, state: u32) -> bool {
+    const WRITABLE_STATES: u32 = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32
+        | D3D12_RESOURCE_STATE_COPY_DEST.0 as u32
+        | D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32;
+    (d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0) || (state & WRITABLE_STATES != 0)
+}
+
+/// Resolve a console GPU virtual address range `[va, va + len)` to a shader-readable UMA address.
+/// Fast path: addresses already inside UMA return as-is.
+/// Fallback: checks shared GPU-writable outside-UMA backings (`OUTSIDE_BUFFERS`), then consults
+/// `kernelx::mirrors::mapped_source` (and paired CPU view `mirrors::source`), verifying every
+/// 64 KiB page across `len` maps contiguously into UMA so direct zero-copy SRV/CBV/UAV access
+/// never aliases scattered physical pages.
+pub(super) fn resolve_uma_va(va: u64, len: usize) -> Option<u64> {
+    if va == 0 {
+        return None;
+    }
+    let u = crate::gpu::uma::get()?;
+    let start = va as usize;
+    if u.contains(start) {
+        if len == 0 || start.checked_add(len - 1).is_some_and(|e| u.contains(e)) {
+            return Some(va);
+        }
+        return None;
+    }
+    if let Some(mapped) = lookup_outside_buffer(start, len) {
+        return Some(mapped as u64);
+    }
+    const MAX_CHECK: usize = 256 << 20;
+    if len > MAX_CHECK {
+        return None;
+    }
+    let resolve_byte = |addr: usize| -> Option<usize> {
+        match crate::hle::kernelx::mirrors::mapped_source(addr) {
+            Some(Some(backing)) => Some(backing),
+            Some(None) => None,
+            None => crate::hle::kernelx::mirrors::source(addr),
+        }
+    };
+    let resolved = resolve_byte(start)?;
+    if !u.contains(resolved) {
+        return None;
+    }
+    if len > 0 {
+        let end = start.checked_add(len - 1)?;
+        let resolved_end = resolved.checked_add(len - 1)?;
+        if !u.contains(resolved_end) {
+            return None;
+        }
+        const PAGE: usize = crate::hle::kernelx::mirrors::PAGE;
+        let mut page = (start & !(PAGE - 1)).checked_add(PAGE);
+        while let Some(p) = page {
+            if p > end {
+                break;
+            }
+            let expected = resolved.checked_add(p - start)?;
+            if resolve_byte(p) != Some(expected) {
+                return None;
+            }
+            page = p.checked_add(PAGE);
+        }
+    }
+    let n = GPU_VIEW_BUFFER_HITS.fetch_add(1, Ordering::Relaxed);
+    if n < 8 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: resolved GPU-view buffer/root VA {va:#x} -> UMA {resolved:#x} ({len} B, {} resolved)", n + 1);
+    }
+    Some(resolved as u64)
+}
 
 /// V# of a buffer view (raw: 4-byte elements, num_records in bytes; structured / typed:
 /// stride = element size, num_records in elements); empty when the buffer is not in UMA.
-fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool) -> [u32; 4] {
-    let Some((at, bytes)) = console_buffer(res) else {
-        note_buffer_view();
-        return [0; 4];
-    };
+fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool, read_only: bool) -> [u32; 4] {
     let fmt = crate::gpu::desc::gfx10_format(format).unwrap_or(22);
     let (stride, elem) = if raw {
         (0, 4)
@@ -1295,10 +1527,36 @@ fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_
         let e = crate::gpu::desc::format_bytes(fmt);
         (e, e)
     };
-    let base = at as u64 + first * elem as u64;
-    let room = (bytes as u64).saturating_sub(first * elem as u64);
-    let records = if stride == 0 { (n as u64 * 4).min(room) } else { (n as u64).min(room / stride as u64) };
-    crate::gpu::desc::buffer_words(base, stride, records as u32, fmt)
+    if let Some((at, bytes)) = console_buffer(res) {
+        let base = at as u64 + first * elem as u64;
+        let room = (bytes as u64).saturating_sub(first * elem as u64);
+        let records = if stride == 0 { (n as u64 * 4).min(room) } else { (n as u64).min(room / stride as u64) };
+        return crate::gpu::desc::buffer_words(base, stride, records as u32, fmt);
+    }
+    if let Some((ta, width)) = title_address(res).and_then(|ta| {
+        let raw_ptr = res as *mut c_void;
+        let w = unsafe { ID3D12Resource::from_raw_borrowed(&raw_ptr) }.map(|r| unsafe { r.GetDesc().Width as usize })?;
+        Some((ta, w))
+    }) {
+        let off = first.saturating_mul(elem as u64);
+        let room = (width as u64).saturating_sub(off);
+        let records = if stride == 0 { (n as u64 * 4).min(room) } else { (n as u64).min(room / stride as u64) };
+        let view_bytes = if stride == 0 { records } else { records.saturating_mul(stride as u64) } as usize;
+        let target = (ta as u64).saturating_add(off);
+        let resolved = resolve_uma_va(target, view_bytes)
+            .or_else(|| {
+                if read_only {
+                    super::sparse::gpu_view::base_for(target as usize, view_bytes).map(|b| b as u64)
+                } else {
+                    unsafe { ensure_outside_buffer(target as usize, view_bytes, false, true).map(|(_, u)| u as u64) }
+                }
+            });
+        if let Some(base) = resolved {
+            return crate::gpu::desc::buffer_words(base, stride, records as u32, fmt);
+        }
+    }
+    note_buffer_view();
+    [0; 4]
 }
 
 /// Console buffer → a placed resource in the unified memory heap, so its console address is
@@ -1496,36 +1754,83 @@ unsafe fn place_console_buffer(this: *mut c_void, props: usize, desc: usize, sta
 /// title's allocation stays the title's.
 pub(super) unsafe fn place_at_title_address(this: *mut c_void, va: usize, desc: &[u8; 0x38], state: u32, clear: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
     let u = crate::gpu::uma::get()?;
-    let k = u.window_of(va)?;
-    let (base, size) = u.window(k);
     let mut d: D3D12_RESOURCE_DESC = std::ptr::read_unaligned(desc.as_ptr() as *const D3D12_RESOURCE_DESC);
     let bytes = d.Width as usize;
+    if bytes == 0 {
+        return None;
+    }
+    let (va, outside_base) = match u.window_of(va) {
+        Some(_) => (va, None),
+        None => {
+            if let Some(resolved) = resolve_uma_va(va as u64, bytes) {
+                let tb = OUTSIDE_BUFFERS.write().unwrap().retain_existing(va, bytes, true, false).map(|(tb, _)| tb);
+                (resolved as usize, tb)
+            } else if u.has_sparse() && is_gpu_writable_placed_buffer(&d, state) {
+                let (tb, mapped) = ensure_outside_buffer(va, bytes, true, false)?;
+                (mapped, Some(tb))
+            } else {
+                return None;
+            }
+        }
+    };
+    let k = match u.window_of(va) {
+        Some(k) => k,
+        None => {
+            if let Some(tb) = outside_base {
+                release_outside_ref(tb);
+            }
+            return None;
+        }
+    };
+    let (base, size) = u.window(k);
     // a placed PC buffer starts at 64 KiB: one at another address starts below it and XCL adds
     // the difference where PC methods take an offset into it (`buffer_delta`)
     let start = va & !0xFFFF;
     let delta = va - start;
-    if bytes == 0 || va - base + bytes > size {
+    if va - base + bytes > size {
+        if let Some(tb) = outside_base {
+            release_outside_ref(tb);
+        }
         return None;
     }
     // the title's own memory (a sparse window): a resource over its video-memory tiles
     if u.is_sparse(va) {
-        let (hr, delta) = super::sparse::place_buffer(this, va, &d, state, riid, ppv)?;
+        let Some((hr, delta)) = super::sparse::place_buffer(this, va, &d, state, riid, ppv) else {
+            if let Some(tb) = outside_base {
+                release_outside_ref(tb);
+            }
+            return None;
+        };
         UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (va, bytes, false));
+        if let Some(tb) = outside_base {
+            OUTSIDE_RES.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, tb);
+        }
         if delta != 0 {
             BUFFER_DELTA.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, delta as u64);
         }
         return Some(hr);
     }
-    let heap = (*UMA_HEAPS.lock().unwrap().get(k)?)?;
+    let Some(heap) = UMA_HEAPS.lock().unwrap().get(k).copied().flatten() else {
+        if let Some(tb) = outside_base {
+            release_outside_ref(tb);
+        }
+        return None;
+    };
     d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
     d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     d.Alignment = 0;
     d.Width = (delta + bytes) as u64;
     let hr = dev_create_placed_resource(this, heap, start - base, &d as *const _ as usize, state as usize, clear as usize, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
+        if let Some(tb) = outside_base {
+            release_outside_ref(tb);
+        }
         return None;
     }
     UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (va, bytes, false));
+    if let Some(tb) = outside_base {
+        OUTSIDE_RES.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, tb);
+    }
     if delta != 0 {
         BUFFER_DELTA.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, delta as u64);
     }
@@ -1587,6 +1892,9 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
     // the start of the PC resource, before the address for a buffer placed below it)
     if let Some((p, bytes)) = console_buffer(this as usize) {
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(p)) {
+            // If this buffer uses a lazy VRAM-only sparse backing (`alloc_vram_only`, #2582),
+            // commit its CPU pages before readback or returning the pointer to the title.
+            let _opened = crate::hle::kernelx::lazy::ensure(p, bytes);
             if !range.is_null() {
                 let r = *(range as *const D3D12_RANGE);
                 if r.End > r.Begin {
@@ -1721,6 +2029,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         super::title_textures::forget(this as usize);
         super::depth_uav::forget(this as usize);
         super::format_alias::forget(this as usize);
+        forget_outside_resource(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
@@ -2361,7 +2670,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
-        return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw));
+        return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw, true));
     }
     match srv_tsharp_from_desc(slot.index, &rdesc, desc.as_ref()) {
         Some(t) => super::console_heap::write(&slot, &t),
@@ -2463,13 +2772,17 @@ fn buffer_words_at(va: u64, format: windows::Win32::Graphics::Dxgi::Common::DXGI
         (false, s) => (s, s),
     };
     let records = if stride == 0 { n.saturating_mul(4) } else { n };
-    let mut base = va + first * elem as u64;
-    if read_only {
-        let len = (n as u64).saturating_mul(elem as u64);
-        if let Some(b) = super::sparse::gpu_view::base_for(base as usize, len as usize) {
-            base = b as u64;
-        }
-    }
+    let target = va.saturating_add(first.saturating_mul(elem as u64));
+    let len = (n as u64).saturating_mul(elem as u64) as usize;
+    let base = resolve_uma_va(target, len)
+        .or_else(|| {
+            if read_only {
+                super::sparse::gpu_view::base_for(target as usize, len).map(|b| b as u64)
+            } else {
+                unsafe { ensure_outside_buffer(target as usize, len, false, true).map(|(_, u)| u as u64) }
+            }
+        })
+        .unwrap_or(target);
     crate::gpu::desc::buffer_words(base, stride, records, fmt)
 }
 
@@ -2786,7 +3099,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     if let Some(v) = uav_desc.as_ref().filter(|v| v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
-        return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw));
+        return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw, false));
     }
     // UAV dimensions: 1 buffer, 2 tex1d, 3 tex1d array, 4 tex2d, 5 tex2d array, 8 tex3d
     let (format, dim, array, mip) = match uav_desc.as_ref() {
@@ -10021,5 +10334,43 @@ mod heap_vtable_tests {
             heap_vtbl[47] = method_a as usize;
             assert_eq!(class_for(obj_ptr, orig, Kind::CommandList), ext1);
         }
+    }
+}
+
+#[cfg(test)]
+mod outside_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn outside_buffer_table_shares_uav_and_srv_subranges_and_reclaims_on_release() {
+        let mut t = OutsideBufferTable::default();
+        let cap = 1 << 20; // 1 MiB cap
+        let base = 0x0c00_0000_0000usize;
+        let uma = 0x0003_1000_0000usize;
+
+        // Disabled cap rejects insertion.
+        assert!(!t.insert(base, base + 0x4_0000, uma, true, false, 0));
+
+        // Insert a 256 KiB GPU-writable placed buffer range; sub-range SRV/UAV lookups hit the
+        // exact same sparse UMA backing at matching byte offsets.
+        assert!(t.insert(base, base + 0x4_0000, uma, true, false, cap));
+        assert_eq!(t.lookup(base, 0x4_0000), Some(uma));
+        assert_eq!(t.lookup(base + 0x1_2340, 0x4000), Some(uma + 0x1_2340));
+        assert_eq!(t.lookup(base + 0x3_f000, 0x2000), None); // past end
+
+        // Overlapping non-contained insertion is rejected to avoid splitting live tiles.
+        assert!(!t.insert(base + 0x2_0000, base + 0x6_0000, uma + 0x10_0000, true, false, cap));
+
+        // Second placed alias retains refcount; releasing first keeps backing alive, releasing second reclaims.
+        assert_eq!(t.retain_existing(base + 0x1_0000, 0x1_0000, true, false), Some((base, uma + 0x1_0000)));
+        assert_eq!(t.release_ref(base), None);
+        assert_eq!(t.release_ref(base), Some(uma));
+        assert_eq!(t.total_bytes, 0);
+        assert_eq!(t.lookup(base, 0x1000), None);
+
+        // UAV-pinned backing created without a placed resource stays resident across release_ref.
+        assert!(t.insert(base, base + 0x2_0000, uma, false, true, cap));
+        assert_eq!(t.release_ref(base), None);
+        assert_eq!(t.lookup(base + 0x1000, 0x1000), Some(uma + 0x1000));
     }
 }

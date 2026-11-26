@@ -1318,6 +1318,69 @@ pub unsafe fn free_nonblocking(p: usize) {
     }
 }
 
+/// 64 KiB sparse pages lazily committed by `kernelx::lazy` when the title first CPU-touches an
+/// `alloc_vram_only` buffer (queued without locking `STATE` so the VEH can never deadlock).
+static LAZY_COMMITS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static HAS_LAZY_COMMITS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record that `kernelx::lazy` just CPU-committed 64 KiB page `page`. Safe inside the VEH:
+/// never acquires `STATE`.
+pub(crate) fn note_lazy_commit(page: usize) {
+    if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(page)) {
+        LAZY_COMMITS.lock().unwrap_or_else(|e| e.into_inner()).push(page);
+        HAS_LAZY_COMMITS.store(true, Ordering::Release);
+    }
+}
+
+/// Allocate a VRAM-only sparse block (zero upfront CPU commit, `holes = 0xFFFF` so CPU
+/// write-watch never overwrites GPU UAV writes) for GPU-writable buffers placed outside the UMA
+/// windows. Each 64 KiB page is marked with `kernelx::lazy` so if the title later CPU-writes or
+/// reads it (via `GetGPUVirtualAddress()` or `Map()`, #2582), the page commits on demand and
+/// subsequent CPU writes upload cleanly to sparse VRAM.
+pub unsafe fn alloc_vram_only(size: usize, align: usize) -> Option<(usize, usize)> {
+    let u = crate::gpu::uma::get()?;
+    let (addr, rounded) = u.sparse_alloc(size, align.max(TILE))?;
+    let ok = {
+        let mut g = lock_state();
+        if let Some(s) = g.as_mut() {
+            s.ensure_mapped(addr, rounded, |_| 0xFFFF);
+            let last_tile = (addr + rounded - 1) & !(TILE - 1);
+            if s.mapped.contains_key(&addr) && s.mapped.contains_key(&last_tile) {
+                true
+            } else {
+                s.decommit_range(addr, rounded);
+                false
+            }
+        } else {
+            false
+        }
+    };
+    if !ok {
+        u.sparse_release(addr);
+        return None;
+    }
+    for page in (addr..addr + rounded).step_by(TILE) {
+        crate::hle::kernelx::lazy::mark(page);
+    }
+    Some((addr, rounded))
+}
+
+/// Release a VRAM-only sparse block from `alloc_vram_only` (unmarks lazy pages, decommits any
+/// CPU pages that were lazily committed, and defers tile unmap behind GPU fences).
+pub unsafe fn free_vram_only(p: usize) -> bool {
+    let Some(u) = crate::gpu::uma::get() else { return false };
+    if !u.is_sparse(p) {
+        return false;
+    }
+    let Some((start, len)) = u.sparse_reservation(p).filter(|&(start, _)| start == p) else { return false };
+    for page in (start..start + len).step_by(TILE) {
+        crate::hle::kernelx::lazy::unmark(page);
+    }
+    decommitted(start, len);
+    VirtualFree(start as *mut c_void, len, MEM_DECOMMIT);
+    u.sparse_release(p).is_some()
+}
+
 /// After `queue.ExecuteCommandLists`: copy GPU-written sparse ranges (e.g. `Write32/64`,
 /// `FillMemoryWith32BitValueX`, `CopyMemoryToMemoryX`) back to their CPU view so CPU reads
 /// and spin-waits see the GPU writes without clobbering `sent` hashes.
@@ -1662,6 +1725,7 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     let req = {
         let mut g = lock_state();
         let Some(s) = g.as_mut() else { return };
+        s.drain_lazy_commits();
         s.note_queue(queue);
         let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| n > 0 && s.window_index(a).is_some()).collect();
         if filtered.is_empty() {
@@ -1714,6 +1778,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     let prepared = {
         let mut g = lock_state();
         let Some(s) = g.as_mut() else { return };
+        s.drain_lazy_commits();
         if s.window_index(va).is_none() {
             return;
         }
@@ -1811,9 +1876,25 @@ impl State {
         }
     }
 
+    /// Clear hole masks for 64 KiB tiles lazily CPU-committed by `kernelx::lazy` (#2582).
+    /// Leaves `to_zero` untouched so existing GPU VRAM contents remain intact while subsequent
+    /// write-watch dirty 4 KiB pages upload cleanly from the CPU view.
+    fn drain_lazy_commits(&mut self) {
+        if !HAS_LAZY_COMMITS.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let pages = std::mem::take(&mut *LAZY_COMMITS.lock().unwrap_or_else(|e| e.into_inner()));
+        for page in pages {
+            if let Some(entry) = self.mapped.get_mut(&(page & !(TILE - 1))) {
+                entry.holes = 0;
+            }
+        }
+    }
+
     /// `decommitted` with the state locked: the tiles that go are parked (`flush_parked` unmaps
     /// them and frees their pool tiles)
     unsafe fn decommit_range(&mut self, a: usize, n: usize) {
+        self.drain_lazy_commits();
         let mut pools: Vec<(usize, (u32, u32))> = Vec::new();
         let mut t = a & !(TILE - 1);
         let end = a.saturating_add(n);
@@ -2034,6 +2115,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     }
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
+    s.drain_lazy_commits();
     s.drain_deferred();
     s.note_queue(queue);
     // the title's work sees what was decommitted unmapped, as it was
@@ -3139,6 +3221,45 @@ mod tests {
             }
             drop(ours);
             assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn lazy_commit_clears_vram_only_holes_without_clobbering_to_zero() {
+        let mut mapped = BTreeMap::new();
+        let tile_a = 0x4_6eb2_0000usize;
+        let tile_unmapped = 0x4_6eb3_0000usize;
+        mapped.insert(tile_a, TileEntry { pool: (0, 0), holes: 0xFFFF, sent: std::array::from_fn(|_| None) });
+        {
+            let mut g = LAZY_COMMITS.lock().unwrap_or_else(|e| e.into_inner());
+            g.clear();
+            g.push(tile_a + 0x5920);
+            g.push(tile_unmapped);
+        }
+        HAS_LAZY_COMMITS.store(true, Ordering::Release);
+
+        assert!(HAS_LAZY_COMMITS.swap(false, Ordering::AcqRel));
+        let pages = std::mem::take(&mut *LAZY_COMMITS.lock().unwrap_or_else(|e| e.into_inner()));
+        for page in pages {
+            if let Some(entry) = mapped.get_mut(&(page & !(TILE - 1))) {
+                entry.holes = 0;
+            }
+        }
+        assert_eq!(mapped[&tile_a].holes, 0);
+        assert!(!mapped.contains_key(&tile_unmapped));
+        assert!(!HAS_LAZY_COMMITS.load(Ordering::Acquire));
+
+        unsafe {
+            use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE};
+            let p = VirtualAlloc(std::ptr::null(), TILE, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(p, 0);
+            crate::hle::kernelx::lazy::mark(p);
+            let slice = std::slice::from_raw_parts_mut((p + 0x5920) as *mut u32, 0x100);
+            slice.fill(0xFFFF_FFFF);
+            assert_eq!(slice[0], 0xFFFF_FFFF);
+            assert_eq!(slice[0xFF], 0xFFFF_FFFF);
+            assert!(!crate::hle::kernelx::lazy::unmark(p), "page must already have been committed by VEH");
+            assert_ne!(VirtualFree(p as *mut c_void, 0, MEM_RELEASE), 0);
         }
     }
 

@@ -1795,6 +1795,23 @@ fn tier2(dev: &ID3D12Device) -> bool {
     unsafe { dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut o as *mut _ as *mut c_void, std::mem::size_of_val(&o) as u32).is_ok() && o.ResourceHeapTier.0 >= 2 }
 }
 
+/// Whether `dev` already has a live GPU-owned page mapped at canonical 64 KiB address `va`.
+fn has_live_page(dev_key: usize, va: usize) -> bool {
+    PAGES.lock().unwrap().get(&dev_key).and_then(|o| o.as_ref()).is_some_and(|p| p.pages.contains_key(&va))
+}
+
+/// Sampled 2D single-slice textures may map mip levels lazily under `XCL_TEXTURE_LEVEL_PAGES=1`,
+/// except when they alias a live GPU-owned page (render target / depth / Hi-Z UAV pyramid), whose
+/// CPU memory is zeros so lazy texel scanning would leave every tile unmapped.
+fn should_use_lazy_levels(level_pages_on: bool, aliases_live: bool, desc: &D3D12_RESOURCE_DESC) -> bool {
+    level_pages_on
+        && !aliases_live
+        && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && desc.DepthOrArraySize == 1
+        && desc.SampleDesc.Count == 1
+        && desc.Flags == D3D12_RESOURCE_FLAG_NONE
+}
+
 /// A sampled texture of the title at `va` (`desc`: the PC description, `console_bytes` its size on
 /// the console) backed by shared 64 KiB video-memory pages; None when reserved placement is not
 /// available (the caller falls back to a committed resource).
@@ -1817,7 +1834,8 @@ pub unsafe fn place_pages(
         return None;
     }
     // (one slice: the tiles of an array's packed levels are not asked about here)
-    let lazy = level_pages() && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.DepthOrArraySize == 1 && desc.SampleDesc.Count == 1 && desc.Flags == D3D12_RESOURCE_FLAG_NONE;
+    let aliases_live = va % PAGE == 0 && has_live_page(dev.as_raw() as usize, canonical_va(va));
+    let lazy = should_use_lazy_levels(level_pages(), aliases_live, desc);
     place_on_pages(dev, this, va, desc, state, clear, console_bytes, false, lazy, riid, ppv)
 }
 
@@ -2919,5 +2937,31 @@ void main() {
         assert_eq!(coalesce_tile_runs(&mut tiles), vec![(0, 2, 2), (0, 10, 1), (1, 4, 3)]);
         let mut empty = Vec::new();
         assert!(coalesce_tile_runs(&mut empty).is_empty());
+    }
+
+    #[test]
+    fn should_use_lazy_levels_skips_gpu_aliased_sampled_textures() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16_FLOAT, DXGI_SAMPLE_DESC};
+        let tex = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 1024,
+            Height: 1024,
+            DepthOrArraySize: 1,
+            MipLevels: 10,
+            Format: DXGI_FORMAT_R16_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+            ..Default::default()
+        };
+        assert!(should_use_lazy_levels(true, false, &tex));
+        assert!(!should_use_lazy_levels(true, true, &tex), "sampled view aliasing a live GPU page must map eagerly");
+        assert!(!should_use_lazy_levels(false, false, &tex));
+        let mut uav = tex;
+        uav.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        assert!(!should_use_lazy_levels(true, false, &uav));
+        let mut arr = tex;
+        arr.DepthOrArraySize = 2;
+        assert!(!should_use_lazy_levels(true, false, &arr));
     }
 }
