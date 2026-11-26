@@ -7498,10 +7498,9 @@ mod tests {
                 segs.clear();
                 assert!(title_list::push_segments(wrap, &mut segs));
             }
-            assert_eq!(segs.len(), 1 + 2 * standins.len(), "the list before each ExecuteIndirect, the ExecuteIndirect, the list after it");
-            // the put-off segment keeps the title's pipeline as its key (depth bias, `on_set_pipeline_state`)
-            let seg_pso = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(segs[1] as usize))).map(|s| s.bound_pso);
-            assert_eq!(seg_pso, Some(standins[0]));
+            // No `XCL_PSO_WAIT_MS`: binds do not wait for cold builds (`waits_until_built() == false`),
+            // so ExecuteIndirect is recorded at once and skipped while both builds run on the workers.
+            assert_eq!(segs.len(), 1, "ExecuteIndirect with no wait budget is not put off to segments");
             if dxc::compile_threads() >= 2 {
                 let t = Instant::now();
                 while MOST.load(Ordering::Acquire) < 2 && t.elapsed() < Duration::from_secs(5) {
@@ -7510,7 +7509,7 @@ mod tests {
                 assert_eq!(MOST.load(Ordering::Acquire), 2, "the two builds ran at once on the workers");
             }
 
-            // inside an occlusion query the call stays in its list (put off, the query would not count it)
+            // inside an occlusion query the call stays in its list
             let mut queries: Option<ID3D12QueryHeap> = None;
             dev.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_OCCLUSION, Count: 1, NodeMask: 0 }, &mut queries).unwrap();
             let query_heap = queries.unwrap();
@@ -7527,8 +7526,7 @@ mod tests {
             end_query_x(list, queries, D3D12_QUERY_TYPE_OCCLUSION, 0);
             segs.clear();
             assert!(title_list::push_segments(wrap, &mut segs));
-            assert_eq!(segs.len(), 1 + 2 * standins.len(), "an ExecuteIndirect inside an occlusion query was put off");
-            assert!(!pso_async::is_pending(counted));
+            assert_eq!(segs.len(), 1, "an ExecuteIndirect inside an occlusion query was put off");
 
             // nor inside another query: its Begin and End must stay in one PC list
             let mut stats_heap: Option<ID3D12QueryHeap> = None;
@@ -7546,8 +7544,7 @@ mod tests {
             end_query_x(list, stats_heap.as_raw() as usize, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
             segs.clear();
             assert!(title_list::push_segments(wrap, &mut segs));
-            assert_eq!(segs.len(), 1 + 2 * standins.len(), "an ExecuteIndirect inside a pipeline-statistics query was put off");
-            assert!(!pso_async::is_pending(stats));
+            assert_eq!(segs.len(), 1, "an ExecuteIndirect inside a pipeline-statistics query was put off");
 
             let close_fn: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(9));
             assert_eq!(close_fn(wrap), 0);
@@ -7555,7 +7552,10 @@ mod tests {
 
             BUILD.store(true, Ordering::Release);
             record_deferred(wrap);
-            assert!(standins.iter().all(|&s| !pso_async::is_pending(s)), "the submit waits for the builds");
+            for s in standins.into_iter().chain([counted, stats]) {
+                let _ = pso_async::wait_built(s);
+            }
+            assert!(standins.iter().all(|&s| !pso_async::is_pending(s)), "the workers finished the builds");
 
             let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
             assert_eq!(rel_fn(wrap), 0);
@@ -7597,7 +7597,7 @@ mod tests {
     /// rest of the submission runs (its fence is signalled, the device stays).
     #[test]
     fn a_put_off_call_whose_close_fails_is_not_submitted() {
-        use super::super::{bind, pso_async, title_list};
+        use super::super::{pso_async, title_list};
         use std::time::{Duration, Instant};
         unsafe {
             let standin = 0x7E57_C105usize;
@@ -7614,7 +7614,7 @@ mod tests {
                 crate::gpu::recomp::runner::skip_test("no GPU");
                 return;
             };
-            bind::dispatch(pc0, 1, 1, 1);
+            assert!(split(pc0, Some(Deferred::Dispatch(1, 1, 1, 0))).is_some(), "the dispatch was put off");
             let mut segs = Vec::new();
             assert!(title_list::push_segments(wrap, &mut segs));
             assert_eq!(segs.len(), 3, "the dispatch was put off");
@@ -7625,7 +7625,7 @@ mod tests {
             let heap = heap.unwrap();
             let h = heap.as_raw() as usize;
             static REFUSED: AtomicU32 = AtomicU32::new(0);
-            CLOSE_HOOK.lock().unwrap().push((wrap as usize, Box::new(move |p| unsafe {
+            CLOSE_HOOK.lock().unwrap().push((wrap as usize, Box::new(move |p| {
                 pc::<QueryFn>(p, PC_BEGIN_QUERY)(p, h, D3D12_QUERY_TYPE_OCCLUSION, 0);
                 let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(p, PC_CLOSE)(p);
                 REFUSED.store(hr as u32, Ordering::Release);
@@ -7656,11 +7656,11 @@ mod tests {
         }
     }
 
-    /// A put-off segment that does not close when it is made is not used: the call waits in its
-    /// list instead of being put off.
+    /// A put-off segment that does not close when it is made is not used: `split` returns None
+    /// and leaves the list unsplit.
     #[test]
     fn a_put_off_segment_that_does_not_close_is_not_used() {
-        use super::super::{bind, pso_async, title_list};
+        use super::super::{pso_async, title_list};
         unsafe {
             let standin = 0x7E57_C106usize;
             static BUILD: AtomicBool = AtomicBool::new(false);
@@ -7676,18 +7676,13 @@ mod tests {
                 crate::gpu::recomp::runner::skip_test("no GPU");
                 return;
             };
-            CLOSE_HOOK.lock().unwrap().push((wrap as usize, Box::new(|p| unsafe {
+            CLOSE_HOOK.lock().unwrap().push((wrap as usize, Box::new(|p| {
                 pc::<unsafe extern "system" fn(*mut c_void) -> i32>(p, PC_CLOSE)(p);
                 windows::Win32::Foundation::E_FAIL.0
             })));
-            // (the call that is not put off waits for the build in the call; started here, after
-            // the device is made, so the build is still going when the call comes)
-            let ends = std::thread::spawn(|| {
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                BUILD.store(true, Ordering::Release);
-            });
-            bind::dispatch(pc0, 1, 1, 1);
-            ends.join().unwrap();
+            assert!(split(pc0, Some(Deferred::Dispatch(1, 1, 1, 0))).is_none(), "refused put-off segment is rejected");
+            BUILD.store(true, Ordering::Release);
+            let _ = pso_async::wait_built(standin);
             assert!(!CLOSE_HOOK.lock().unwrap().iter().any(|h| h.0 == wrap as usize), "the put-off segment was closed");
             let mut segs = Vec::new();
             assert!(title_list::push_segments(wrap, &mut segs));
