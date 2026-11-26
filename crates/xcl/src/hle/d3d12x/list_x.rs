@@ -2667,6 +2667,13 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
 
 /// Gives a dispatch whose pipeline is still being built a segment of its own, recorded at the submit.
 pub(super) unsafe fn defer(list: *mut c_void, what: Deferred) -> bool {
+    // With bounded waits (`XCL_PSO_WAIT_MS`) the call is recorded now and its bind waits at most
+    // that long, as before calls were put off: a segment per unbuilt call ran a retail title out
+    // of command list memory (Close: E_OUTOFMEMORY, then the device was removed, 0x887a0001)
+    // when its world start bound thousands of them with `XCL_PSO_WAIT_MS=1`.
+    if super::pso_async::waits_bounded() {
+        return false;
+    }
     if split(list, Some(what)).is_none() {
         return false;
     }
