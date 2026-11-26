@@ -679,6 +679,22 @@ impl Uma {
         Some(p)
     }
 
+    /// The committed-window allocation covering `p`: `(start, bytes)` (excluding XCL's arena pool).
+    pub fn allocation_at(&self, p: usize) -> Option<(usize, usize)> {
+        if !self.is_committed(p) {
+            return None;
+        }
+        {
+            let pool = self.pool.lock().unwrap();
+            if p >= pool.0 && p < pool.1 {
+                return None;
+            }
+        }
+        let off = p - self.base;
+        let g = self.inner.lock().unwrap();
+        g.used.range(..=off).next_back().map(|(&o, &l)| (self.base + o, l)).filter(|&(a, l)| p < a + l)
+    }
+
     /// Release a block from `alloc` (false: not one of ours).
     pub fn free(&self, p: usize) -> bool {
         if !self.is_committed(p) {

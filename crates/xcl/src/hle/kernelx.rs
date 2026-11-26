@@ -692,10 +692,23 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
         return 1;
     }
     if let Some(u) = crate::gpu::uma::get().filter(|u| u.contains(addr as usize)) {
+        let a = addr as usize;
         if t & 0x8000 != 0 {
-            return u.free(addr as usize) as BOOL;
+            let len = u.allocation_at(a).filter(|&(start, _)| start == a).map(|(_, l)| l);
+            if let Some(n) = len {
+                unmap_away_range(a, n);
+            }
+            let ok = u.free(a);
+            if ok {
+                mirrors::released(a);
+                if let Some(n) = len {
+                    forget_title_mappings(a, n);
+                }
+            }
+            return ok as BOOL;
         }
         if t & 0x4000 != 0 && size > 0 {
+            unmap_away_range(a, size);
             std::ptr::write_bytes(addr as *mut u8, 0, size);
         }
         return 1;
@@ -3890,6 +3903,21 @@ mod tests {
             assert!(!physical_page_at(sp) && physical_page_at(sp + PHYS_PAGE));
             assert_eq!(VirtualFree(sp as *mut c_void, 0, mem::MEM_RELEASE), 1);
             assert!(!physical_page_at(sp + PHYS_PAGE) && !lazy::unmark(sp + PHYS_PAGE));
+            // Coherent UMA allocation: partial MEM_DECOMMIT + MEM_RELEASE unmap AWAY pages cleanly.
+            let coh = u.alloc(2 * PHYS_PAGE, PHYS_PAGE).expect("coherent UMA alloc") as usize;
+            assert!(u.is_committed(coh));
+            assert_eq!(MapTitlePhysicalPages(coh as *mut c_void, 2, 0, 4, [p0, p2].as_mut_ptr()) as usize, coh);
+            assert_eq!(*(coh as *const u32), 0x6666_0001);
+            *(coh as *mut u32) = 0x7777_0001;
+            *(coh.wrapping_add(PHYS_PAGE) as *mut u32) = 0x7777_0002;
+            assert_eq!(VirtualFree(coh as *mut c_void, PHYS_PAGE, mem::MEM_DECOMMIT), 1);
+            assert!(!physical_page_at(coh) && physical_page_at(coh + PHYS_PAGE));
+            assert_eq!(*(coh as *const u32), 0, "MEM_DECOMMIT zeroes coherent UMA range");
+            assert_eq!(VirtualFree(coh as *mut c_void, 0, mem::MEM_RELEASE), 1);
+            assert!(!physical_page_at(coh + PHYS_PAGE));
+            // Saved home bytes for p0 and p2 survive coherent VirtualFree.
+            let h0 = MapTitlePhysicalPages(std::ptr::null_mut(), 3, 0, 4, pages.as_mut_ptr()) as usize;
+            assert_eq!((*(h0 as *const u32), *((h0 + 2 * PHYS_PAGE) as *const u32)), (0x7777_0001, 0x7777_0002));
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 3, pages.as_mut_ptr()), 1);
         }
     }
