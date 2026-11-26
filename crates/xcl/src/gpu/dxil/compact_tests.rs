@@ -114,6 +114,45 @@ fn gpu_compact_form_spends_the_loop_budget_as_the_plain_form() {
     assert_eq!(&c.sgpr[..2], &p.sgpr[..2]);
 }
 
+/// The direct translator's forms give each loop region its own budget as the HLSL path does
+/// (`recomp::tests::gpu_a_loop_after_a_spin_to_the_budget_still_runs`).
+#[test]
+fn gpu_a_loop_after_a_spin_to_the_budget_still_runs_in_both_forms() {
+    match (runner::adapter(), runner::wave64_programs_supported(), crate::gpu::recomp::dxc::location()) {
+        (Ok(_), Ok(true), Ok(_)) => {}
+        (a, _, d) => return runner::skip_test(if a.is_err() { "no GPU" } else if d.is_err() { "no DXC" } else { "no wave64" }),
+    }
+    let o = KernelOptions { wave64: true, split: runner::split_wave64(), mem_windows: 1, sampler_base: 0 };
+    for (spin, n, nested) in [(0x10000, 3, false), (0xFFF0, 1000, false), (0x10000, 3, true)] {
+        let i = |nm: &str, e: &str, f: &[(&str, u64)], lit: Option<u32>| encode(nm, e, f, lit).unwrap_or_else(|x| panic!("{nm}: {x}"));
+        // a spin of `spin` tries (in an outer loop that runs once when `nested`), a loop of `n`,
+        // then s2 = 7 (as `recomp::tests::spin_then_loop`)
+        let mut v = Vec::new();
+        v.extend(i("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 128)], None));
+        if nested {
+            v.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 3), ("SSRC1", 129)], None));
+        }
+        v.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None));
+        v.extend(i("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 255)], Some(spin)));
+        v.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFC)], None));
+        if nested {
+            v.extend(i("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 3), ("SSRC1", 129)], None));
+            v.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFF9)], None));
+        }
+        v.extend(i("S_MOV_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 128)], None));
+        v.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 129)], None));
+        v.extend(i("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 1), ("SSRC1", 255)], Some(n)));
+        v.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFC)], None));
+        v.extend(i("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 135)], None));
+        v.extend(i("S_ENDPGM", "ENC_SOPP", &[], None));
+        for compact in [true, false] {
+            let k = translate_full_as(&v, o, compact).unwrap_or_else(|e| panic!("compact {compact}: {e}"));
+            let r = runner::run_with_statics(&k.dxil, &KernelState::default(), &[], &[], &[], &k.static_samplers).expect("GPU run");
+            assert_eq!(&r.sgpr[..3], &[spin, n, 7], "spin {spin:#x}, loop {n}, nested {nested}, compact {compact}");
+        }
+    }
+}
+
 fn early_outs(copies: usize) -> Vec<u8> {
     let i = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
     let mut v = Vec::new();

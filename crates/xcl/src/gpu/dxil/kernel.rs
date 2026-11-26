@@ -13,7 +13,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use super::cfg::{Cfg, Term};
 use super::container::Stage;
-use super::lower::{ComputeInit, Init, Lw, Partner, VAR_BUDGET, VAR_SCC, VAR_VGPR};
+use super::lower::{ComputeInit, Init, Lw, Partner, LOOP_BUDGET, VAR_BUDGET, VAR_BUDGET_OWNER, VAR_BUDGET_TOTAL, VAR_SCC, VAR_VGPR};
 use super::module::{Block, Pred, Value};
 use super::shader::{RawUav, Shader};
 use super::ssa::Ssa;
@@ -394,6 +394,7 @@ fn translate_on_this_thread(
             None => super::compact::emit(&mut lw, &cfg, p, h0, exit)?,
         }
     }
+    let regions = crate::gpu::recomp::budget_regions(&crate::gpu::recomp::loop_ranges(&cfg.insts));
     for &b in cfg.rpo.iter().filter(|_| plan.is_none()) {
         let h = head(&mut lw, b);
         lw.s.m.set_block(h);
@@ -409,8 +410,19 @@ fn translate_on_this_thread(
         }
         let end = if es_block { switch.unwrap() } else { exit };
         if cfg.headers.contains(&b) {
-            // a lane's loop iterations are capped (the recompiler's LOOP_GUARD)
-            let left = lw.rd(VAR_BUDGET);
+            // a lane's loop iterations are capped (the recompiler's LOOP_GUARD / loop_guard)
+            let region = crate::gpu::recomp::budget_region(&regions, cfg.blocks[b].pc);
+            let mut left = lw.rd(VAR_BUDGET);
+            if let Some(r) = region {
+                let own = lw.rd(VAR_BUDGET_OWNER);
+                let other = lw.cmpc(Pred::Ne, own, r);
+                left = lw.selc(other, LOOP_BUDGET * crate::gpu::recomp::LOOP_BUDGETS_PER_REGION, left);
+                let rv = lw.c(r);
+                lw.wr(VAR_BUDGET_OWNER, rv);
+                let total = lw.rd(VAR_BUDGET_TOTAL);
+                let spent = lw.cmpc(Pred::Eq, total, 0);
+                left = lw.selc(spent, 0, left);
+            }
             let none = lw.cmpc(Pred::Eq, left, 0);
             let cont = lw.block(Some(1));
             lw.cond_br(none, end, cont);
@@ -418,6 +430,11 @@ fn translate_on_this_thread(
             let one = lw.c(1);
             let l = lw.sub(left, one);
             lw.wr(VAR_BUDGET, l);
+            if region.is_some() {
+                let total = lw.rd(VAR_BUDGET_TOTAL);
+                let t = lw.sub(total, one);
+                lw.wr(VAR_BUDGET_TOTAL, t);
+            }
         }
         for &i in &cfg.blocks[b].insts {
             lw.reload = reloads.get(b, i);

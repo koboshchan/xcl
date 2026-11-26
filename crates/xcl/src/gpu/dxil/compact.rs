@@ -1,7 +1,7 @@
 //! The compact form: each distinct block of a program lowered once, in a loop over a table.
 
 use super::cfg::{Cfg, Term};
-use super::lower::{ext_encoding, LResult, Lw, VAR_BUDGET, VAR_SCC};
+use super::lower::{ext_encoding, LResult, Lw, LOOP_BUDGET, VAR_BUDGET, VAR_BUDGET_OWNER, VAR_BUDGET_TOTAL, VAR_SCC};
 use super::lower_mem::VAR_TMP;
 use super::module::{Block, Pred, Value};
 use std::collections::{BTreeSet, HashMap};
@@ -516,6 +516,8 @@ pub fn plan(cfg: &Cfg, lw: &Lw) -> Option<Plan> {
         vec![ALL_SGPRS_MASK | SCC_LIVE_BIT; mblocks.len()]
     };
 
+    // a loop head's guard names its loop region: heads of two regions are two classes
+    let regions = crate::gpu::recomp::budget_regions(&crate::gpu::recomp::loop_ranges(&cfg.insts));
     let build = |param_lit: bool, param_pc: bool| {
         let mut ids: HashMap<(Vec<u64>, &'static str), u32> = HashMap::new();
         let (mut class, mut rep, mut next, mut blk_lit) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -523,7 +525,8 @@ pub fn plan(cfg: &Cfg, lw: &Lw) -> Option<Plan> {
         for (n, blk) in mblocks.iter().enumerate() {
             let p_lit = if param_lit { single_param_lit(cfg, blk) } else { None };
             blk_lit.push(p_lit);
-            let mut key = vec![blk.is_header as u64, p_lit.is_some() as u64];
+            let region = if blk.is_header { crate::gpu::recomp::budget_region(&regions, blk.pc).unwrap_or(0) as u64 } else { 0 };
+            let mut key = vec![blk.is_header as u64 + region, p_lit.is_some() as u64];
             for &i in &blk.insts {
                 let d = &cfg.insts[i];
                 let mask_lit = p_lit.is_some() && d.literal.is_some();
@@ -798,6 +801,8 @@ pub fn emit_with_nest(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block
 
     let (at, to) = (lw.tmp_var(), lw.tmp_var());
     let (at, to, budget) = (slot(lw, at), slot(lw, to), slot(lw, VAR_BUDGET));
+    let regions = crate::gpu::recomp::budget_regions(&crate::gpu::recomp::loop_ranges(&cfg.insts));
+    let owner = if regions.is_empty() { None } else { Some((slot(lw, VAR_BUDGET_OWNER), slot(lw, VAR_BUDGET_TOTAL))) };
     lw.s.m.set_block(head);
     let b = lw.s.m.load(at, 4);
     let w = lw.c(width);
@@ -909,8 +914,19 @@ pub fn emit_with_nest(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block
         lw.ssa.begin_log();
         let blk = &p.mblocks[r];
         if blk.is_header {
-            // a loop head spends the loop budget
-            let left = lw.s.m.load(budget, 4);
+            // a loop head spends the loop budget (of its region: the recompiler's `loop_guard`)
+            let region = owner.zip(crate::gpu::recomp::budget_region(&regions, blk.pc));
+            let mut left = lw.s.m.load(budget, 4);
+            if let Some(((own_at, total_at), r)) = region {
+                let own = lw.s.m.load(own_at, 4);
+                let other = lw.cmpc(Pred::Ne, own, r);
+                left = lw.selc(other, LOOP_BUDGET * crate::gpu::recomp::LOOP_BUDGETS_PER_REGION, left);
+                let rv = lw.c(r);
+                lw.s.m.store(own_at, rv, 4);
+                let total = lw.s.m.load(total_at, 4);
+                let spent = lw.cmpc(Pred::Eq, total, 0);
+                left = lw.selc(spent, 0, left);
+            }
             let none = lw.cmpc(Pred::Eq, left, 0);
             let (out, body) = (lw.block(Some(1)), lw.block(Some(1)));
             lw.cond_br(none, out, body);
@@ -922,6 +938,11 @@ pub fn emit_with_nest(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block
             let one = lw.c(1);
             let l = lw.sub(left, one);
             lw.s.m.store(budget, l, 4);
+            if let Some(((_, total_at), _)) = region {
+                let total = lw.s.m.load(total_at, 4);
+                let t = lw.sub(total, one);
+                lw.s.m.store(total_at, t, 4);
+            }
         }
         lw.compact_blk_pc = blk_pc.map(|v| (v, blk.pc));
         lw.compact_lit = if p.blk_lit[r].is_some() { blk_lit_val } else { None };

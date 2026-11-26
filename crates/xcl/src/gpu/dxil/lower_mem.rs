@@ -539,13 +539,16 @@ impl Lw {
     }
     /// `st_part`: atomically replace the bits `m` of the dword at `b` by `v`.
     ///
-    /// In compute shaders, coalesces contiguous 16-bit pairs (`lane ^ 1`) and 8-bit quads
-    /// (`lane ^ 2`) targeting the same `(window, dword)` with disjoint masks covering all 32 bits
-    /// into a single plain `raw_store` (eliminating global L2/PCIe atomics on `R8`/`R16` formatted
-    /// buffer writes such as GTA 6 `CS_DepthProcessingHBO`, `CS_ScreenProbes_GenerateShaderBins`,
-    /// and `CS_Primary_GatherCopy`). Partial pairs still merge into one leader per pair, and the
-    /// fallback reads through the same `globallycoherent` L2 handle before emitting only the
-    /// needed `atomicAnd` / `atomicOr` so L1/L2 never alias.
+    /// In compute shaders, runs a 5-stage butterfly reduction (`lane ^ 1, 2, 4, 8, 16`) across the
+    /// active 32-lane sub-wave, merging any two surviving partner lanes targeting the same
+    /// `(window, dword)` whenever their written bits are compatible (`((v ^ pv) & (m & pm)) == 0`).
+    /// This both:
+    /// - coalesces disjoint sub-dword writes (2×16-bit, 4×8-bit, 2D tile strides, out-of-order
+    ///   atomic-slot writes) covering all 32 bits into one plain `raw_store` (zero atomics), and
+    /// - collapses duplicate compatible writes to the same froxel/tile byte (e.g. GTA 6
+    ///   `CS_DepthProcessingHBO`) from up to 32 L2 reads + atomics down to 1 per wave.
+    /// Non-full survivors read through the same `globallycoherent` L2 handle before emitting only
+    /// the needed `atomicAnd` / `atomicOr` so L1/L2 never alias.
     fn st_part(&mut self, b: Value, m: Value, v: Value) {
         let vm = self.and(v, m);
         if self.gfx.is_some() || self.mesh.is_some() || self.geom.is_some() {
@@ -558,6 +561,7 @@ impl Lw {
         self.with_mem_many_tys_coh(None, &[], true, &mut |lw, mem| {
             let entry = lw.cur();
             let btrue = lw.b(true);
+            let bfalse = lw.b(false);
             let lane = lw.s.wave_lane_index();
             let ballot = lw.s.wave_ballot(btrue);
             let active_at = |lw: &mut Lw, target: Value| -> Value {
@@ -571,79 +575,49 @@ impl Lw {
 
             let z = lw.c(0);
             let one = lw.c(1);
-            let two = lw.c(2);
+            let mut cur_m = m;
+            let mut cur_v = vm;
+            let mut alive = btrue;
 
-            // Step 1: 2-lane pair shuffle (`lane ^ 1`) — merges adjacent 16-bit writes into a full
-            // 32-bit store, or adjacent 8-bit writes into a 16-bit pair.
-            let peer1 = lw.xor(lane, one);
-            let p1_act = active_at(lw, peer1);
-            let b1 = lw.s.wave_read_lane_at(b, peer1);
-            let w1 = lw.s.wave_read_lane_at(win, peer1);
-            let m1 = lw.s.wave_read_lane_at(m, peer1);
-            let v1 = lw.s.wave_read_lane_at(vm, peer1);
-            let same_b1 = lw.cmp(Pred::Eq, b1, b);
-            let same_w1 = lw.cmp(Pred::Eq, w1, win);
-            let ov1 = lw.and(m, m1);
-            let disj1 = lw.cmpc(Pred::Eq, ov1, 0);
-            let same1 = lw.land(p1_act, same_b1);
-            let same1 = lw.land(same1, same_w1);
-            let same1 = lw.land(same1, disj1);
+            for stride in [1u32, 2, 4, 8, 16] {
+                let s_val = lw.c(stride);
+                let peer = lw.xor(lane, s_val);
+                let p_act = active_at(lw, peer);
+                let alive_i32 = lw.sel(alive, one, z);
+                let p_alive_i32 = lw.s.wave_read_lane_at(alive_i32, peer);
+                let p_alive = lw.cmpc(Pred::Ne, p_alive_i32, 0);
+                let p_b = lw.s.wave_read_lane_at(b, peer);
+                let p_w = lw.s.wave_read_lane_at(win, peer);
+                let p_m = lw.s.wave_read_lane_at(cur_m, peer);
+                let p_v = lw.s.wave_read_lane_at(cur_v, peer);
 
-            let pm_or = lw.or(m, m1);
-            let pv_or = lw.or(vm, v1);
-            let pm = lw.sel(same1, pm_or, m);
-            let pv = lw.sel(same1, pv_or, vm);
+                let same_b = lw.cmp(Pred::Eq, p_b, b);
+                let same_w = lw.cmp(Pred::Eq, p_w, win);
 
-            let full1 = lw.cmpc(Pred::Eq, m, u32::MAX);
-            let pm_full = lw.cmpc(Pred::Eq, pm, u32::MAX);
-            let not_full1 = lw.lnot(full1);
-            let same1_full = lw.land(same1, pm_full);
-            let full2 = lw.land(not_full1, same1_full);
+                let merge = lw.land(alive, p_act);
+                let merge = lw.land(merge, p_alive);
+                let merge = lw.land(merge, same_b);
+                let merge = lw.land(merge, same_w);
 
-            // Step 2: 4-lane quad shuffle (`lane ^ 2`) — merges two contiguous 16-bit pairs into a
-            // full 32-bit store (4 consecutive lanes writing bytes 0..3 of the same dword).
-            let peer2 = lw.xor(lane, two);
-            let p2_act = active_at(lw, peer2);
-            let same1_i32 = lw.sel(same1, one, z);
-            let same1_p2_i32 = lw.s.wave_read_lane_at(same1_i32, peer2);
-            let same1_p2 = lw.cmpc(Pred::Ne, same1_p2_i32, 0);
-            let b2 = lw.s.wave_read_lane_at(b, peer2);
-            let w2 = lw.s.wave_read_lane_at(win, peer2);
-            let pm2 = lw.s.wave_read_lane_at(pm, peer2);
-            let pv2 = lw.s.wave_read_lane_at(pv, peer2);
+                let bit = lw.andc(lane, stride);
+                let is_lo = lw.cmpc(Pred::Eq, bit, 0);
+                let not_lo = lw.lnot(is_lo);
+                let absorb = lw.land(merge, is_lo);
+                let retire = lw.land(merge, not_lo);
 
-            let same_b2 = lw.cmp(Pred::Eq, b2, b);
-            let same_w2 = lw.cmp(Pred::Eq, w2, win);
-            let ov2 = lw.and(pm, pm2);
-            let disj2 = lw.cmpc(Pred::Eq, ov2, 0);
-            let qm = lw.or(pm, pm2);
-            let qv = lw.or(pv, pv2);
-            let qm_full = lw.cmpc(Pred::Eq, qm, u32::MAX);
-            let full12 = lw.lor(full1, full2);
-            let not_full12 = lw.lnot(full12);
-            let full4 = lw.land(not_full12, same1);
-            let full4 = lw.land(full4, p2_act);
-            let full4 = lw.land(full4, same1_p2);
-            let full4 = lw.land(full4, same_b2);
-            let full4 = lw.land(full4, same_w2);
-            let full4 = lw.land(full4, disj2);
-            let full4 = lw.land(full4, qm_full);
+                // Higher lane (`peer` when `is_lo`) wins on overlapping mask bits; disjoint and
+                // identical bits combine identically (`(cur_v & !p_m) | p_v`).
+                let not_pm = lw.not(p_m);
+                let kept_lo = lw.and(cur_v, not_pm);
+                let merged_m = lw.or(cur_m, p_m);
+                let merged_v = lw.or(kept_lo, p_v);
+                cur_m = lw.sel(absorb, merged_m, cur_m);
+                cur_v = lw.sel(absorb, merged_v, cur_v);
+                alive = lw.sel(retire, bfalse, alive);
+            }
 
-            let lane_mod2 = lw.andc(lane, 1);
-            let is_even = lw.cmpc(Pred::Eq, lane_mod2, 0);
-            let lane_mod4 = lw.andc(lane, 3);
-            let is_q0 = lw.cmpc(Pred::Eq, lane_mod4, 0);
-
-            let full24 = lw.lor(full2, full4);
-            let full_any = lw.lor(full1, full24);
-            let leader24 = lw.sel(full2, is_even, is_q0);
-            let full_leader = lw.sel(full1, btrue, leader24);
-            let val24 = lw.sel(full2, pv, qv);
-            let full_val = lw.sel(full1, vm, val24);
-
-            let do_full = lw.s.m.new_block();
+            let check_full = lw.s.m.new_block();
             let do_full_store = lw.s.m.new_block();
-            let try_part = lw.s.m.new_block();
             let do_part = lw.s.m.new_block();
             let do_store = lw.s.m.new_block();
             let do_and = lw.s.m.new_block();
@@ -651,42 +625,37 @@ impl Lw {
             let do_or = lw.s.m.new_block();
             let done = lw.s.m.new_block();
 
-            lw.s.m.cond_br(full_any, do_full, try_part);
+            lw.s.m.cond_br(alive, check_full, done);
 
-            lw.s.m.set_block(do_full);
-            lw.s.m.cond_br(full_leader, do_full_store, done);
+            lw.s.m.set_block(check_full);
+            let is_full = lw.cmpc(Pred::Eq, cur_m, u32::MAX);
+            lw.s.m.cond_br(is_full, do_full_store, do_part);
 
             lw.s.m.set_block(do_full_store);
-            lw.s.raw_store(mem, b, &[full_val]);
+            lw.s.raw_store(mem, b, &[cur_v]);
             lw.s.m.br(done);
-
-            // Non-full fallback: if paired (`same1`), only the even lane performs one merged
-            // coherent read-before-atomic with `(pm, pv)` instead of two separate atomics.
-            lw.s.m.set_block(try_part);
-            let run_part = lw.sel(same1, is_even, btrue);
-            lw.s.m.cond_br(run_part, do_part, done);
 
             lw.s.m.set_block(do_part);
             let cur = lw.s.raw_load(mem, b, 1)[0];
-            let cur_m = lw.and(cur, pm);
-            let diff = lw.cmp(Pred::Ne, cur_m, pv);
+            let cur_m_bits = lw.and(cur, cur_m);
+            let diff = lw.cmp(Pred::Ne, cur_m_bits, cur_v);
             lw.s.m.cond_br(diff, do_store, done);
 
             lw.s.m.set_block(do_store);
-            let need_and = lw.cmp(Pred::Ne, pv, pm);
-            let need_or = lw.cmpc(Pred::Ne, pv, 0);
-            let npm = lw.not(pm);
+            let need_and = lw.cmp(Pred::Ne, cur_v, cur_m);
+            let need_or = lw.cmpc(Pred::Ne, cur_v, 0);
+            let ncm = lw.not(cur_m);
             lw.s.m.cond_br(need_and, do_and, chk_or);
 
             lw.s.m.set_block(do_and);
-            lw.s.raw_atomic(mem, AtomicOp::And, b, npm);
+            lw.s.raw_atomic(mem, AtomicOp::And, b, ncm);
             lw.s.m.br(chk_or);
 
             lw.s.m.set_block(chk_or);
             lw.s.m.cond_br(need_or, do_or, done);
 
             lw.s.m.set_block(do_or);
-            lw.s.raw_atomic(mem, AtomicOp::Or, b, pv);
+            lw.s.raw_atomic(mem, AtomicOp::Or, b, cur_v);
             lw.s.m.br(done);
 
             lw.ssa.seal_region_join(done, entry, entry, Vec::new());

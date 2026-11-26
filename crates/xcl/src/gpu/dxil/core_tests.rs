@@ -861,6 +861,40 @@ fn gpu_direct_sub_dword_store_fast_paths() {
     assert_eq!(rs.mem[0x104 / 4], 0xDEAD_ABCD, "solo short preserves upper 16 bits (0xDEAD)");
     assert_eq!(rs.mem[0x100 / 4 - 1], 0xDEAD_BEEF, "previous dword untouched");
     assert_eq!(rs.mem[0x108 / 4], 0xDEAD_BEEF, "next dword untouched");
+
+    // 3. 32-lane wave-wide compatible dedup + strided 8-lane butterfly coalescing:
+    //    - lanes 0..16 all write identical byte 0x42 to 0x109 (duplicate froxel write);
+    //    - lanes 16, 20, 24, 28 write bytes 0..3 of 0x10C (stride-4 butterfly coalescing);
+    //    - partner lanes 18, 19 write conflicting values (0x55 vs 0xAA) to byte 0 of 0x110 (higher lane wins cleanly).
+    let code_dup = prog(&[
+        ("GLOBAL_STORE_BYTE", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 2), ("SADDR", 0x7D), ("OFFSET", 0x100)], None),
+    ]);
+    let dxil_dup = runner::direct_kernel(&code_dup, false).unwrap_or_else(|e| panic!("dup direct translation: {e}"));
+    super::validate::validate(&dxil_dup).unwrap_or_else(|e| panic!("dup validator: {e}"));
+    let mut st_d = KernelState::default();
+    for (l, r) in st_d.vgpr.iter_mut().enumerate().take(32) {
+        r[0] = l as u32;
+        match l {
+            0..=15 => {
+                r[1] = 0x09;
+                r[2] = 0x42;
+            }
+            16 => { r[1] = 0x0C; r[2] = 0x11; }
+            20 => { r[1] = 0x0D; r[2] = 0x22; }
+            24 => { r[1] = 0x0E; r[2] = 0x33; }
+            28 => { r[1] = 0x0F; r[2] = 0x44; }
+            18 => { r[1] = 0x10; r[2] = 0x55; }
+            19 => { r[1] = 0x10; r[2] = 0xAA; }
+            _ => {
+                r[1] = 0x09;
+                r[2] = 0x42;
+            }
+        }
+    }
+    let rd = runner::run(&dxil_dup, &st_d, &mem).expect("dup/stride GPU run");
+    assert_eq!(rd.mem[0x108 / 4], 0xDEAD_42EF, "16+ duplicate byte writes collapse cleanly preserving neighbors");
+    assert_eq!(rd.mem[0x10C / 4], 0x4433_2211, "stride-4 butterfly coalesces 4 bytes into full dword");
+    assert_eq!(rd.mem[0x110 / 4], 0xDEAD_BEAA, "conflicting partner lanes resolve cleanly with higher lane winning");
 }
 
 #[test]

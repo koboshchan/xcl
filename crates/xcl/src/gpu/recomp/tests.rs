@@ -1426,6 +1426,75 @@ fn gpu_scalar_loop_and_scc() {
     assert_eq!((r.sgpr[41], r.sgpr[42], r.sgpr[43]), (48, 33, u32::MAX), "flbit_i64 high-then-low scan");
 }
 
+/// A spin of `spin` tries (a retail FSR pass polls a flag up to 0x10000 times, the loop budget),
+/// inside an outer loop that runs once when `nested` (as in that pass), then a loop of `n`
+/// iterations, then `s2 = 7`.
+fn spin_then_loop(spin: u32, n: u32, nested: bool) -> Vec<u8> {
+    let i = |nm: &str, e: &str, f: &[(&str, u64)], lit: Option<u32>| encode(nm, e, f, lit).unwrap_or_else(|x| panic!("{nm}: {x}"));
+    let mut v = i("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 128)], None); // s0 = 0
+    if nested {
+        v.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 3), ("SSRC1", 129)], None)); // outer: s3 += 1
+    }
+    v.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None)); // spin: s0 += 1
+    v.extend(i("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 255)], Some(spin)));
+    v.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFC)], None)); // → spin
+    if nested {
+        v.extend(i("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 3), ("SSRC1", 129)], None)); // until s3 == 1
+        v.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFF9)], None)); // → outer
+    }
+    v.extend(i("S_MOV_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 128)], None)); // s1 = 0
+    v.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 129)], None)); // loop: s1 += 1
+    v.extend(i("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 1), ("SSRC1", 255)], Some(n)));
+    v.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFC)], None)); // → loop
+    v.extend(i("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 135)], None)); // s2 = 7
+    v.extend(i("S_ENDPGM", "ENC_SOPP", &[], None));
+    v
+}
+
+/// A program's own spin that gives up at the loop budget, or just before it, must not leave the
+/// loops after it short of iterations: the FSR pass then published a flag built from a register
+/// its main loop never set, and the pass waiting on it spun for 260 ms a frame. Both HLSL forms.
+#[test]
+fn gpu_a_loop_after_a_spin_to_the_budget_still_runs() {
+    if !gpu_ready() {
+        return;
+    }
+    for (spin, n, nested) in [(0x10000, 3, false), (0xFFF0, 1000, false), (0x10000, 3, true)] {
+        let code = spin_then_loop(spin, n, nested);
+        for structured in [true, false] {
+            let opt = Options { structured, ..runner::options(Mode::Kernel) };
+            let t = translate(&code, &opt).unwrap();
+            let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+            let r = runner::run(&dxil, &KernelState::default(), &[]).unwrap();
+            let what = format!("spin {spin:#x}, loop {n}, nested {nested}, structured {structured}");
+            assert_eq!(r.sgpr[0], spin, "{what}: the spin ran to its own end");
+            assert_eq!((r.sgpr[1], r.sgpr[2]), (n, 7), "{what}: the loop after it ran all its iterations");
+        }
+    }
+}
+
+/// Loops that never end still stop: four budgets in all, then every loop leaves. (The direct
+/// translator ends the program where a budget runs out, so this is the HLSL path's.)
+#[test]
+fn gpu_endless_loops_in_many_regions_stop_after_four_budgets() {
+    if !gpu_ready() {
+        return;
+    }
+    // six regions, each `s0 += 1` until s0 == 0 (2^32 tries); s1 counts the regions reached
+    let mut list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = Vec::new();
+    for _ in 0..6 {
+        list.push(("S_ADD_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 129)], None));
+        list.push(("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None));
+        list.push(("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)], None));
+        list.push(("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None));
+    }
+    let t = translate(&prog(&list), &runner::options(Mode::Kernel)).unwrap();
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let r = runner::run(&dxil, &KernelState::default(), &[]).unwrap();
+    assert_eq!(r.sgpr[1], 6, "every region was reached");
+    assert_eq!(r.sgpr[0], super::LOOP_BUDGETS_IN_ALL << 16, "four budgets of iterations in all");
+}
+
 #[test]
 fn gpu_divergence_through_exec() {
     if !gpu_ready() {
@@ -1811,6 +1880,45 @@ fn gpu_typed_buffer_loads_and_stores() {
 
 fn el(name: &str, index: u32, sv: u32, ct: u32, reg: u32, mask: u8) -> crate::gpu::dxbc::SigElement {
     crate::gpu::dxbc::SigElement { name: name.into(), index, system_value: sv, component_type: ct, register: reg, mask, rw_mask: mask, stream: 0 }
+}
+
+#[test]
+fn gpu_wave32_pixel_carry_preserves_adjacent_mask_at_triangle_edges() {
+    if !gpu_ready() {
+        return;
+    }
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_FLOAT;
+    // GFX1030 wave32. Expected green counts the odd lanes of WQM EXEC. Red
+    // counts the same lanes through s21, after writing the neighboring s20.
+    let words: &[u32] = &[
+        0xbefe097e,                         // s_wqm_b32 exec_lo, exec_lo
+        0x8706ff7e, 0xaaaaaaaa,             // s_and_b32 s6, exec_lo, 0xaaaaaaaa
+        0xbe870f06,                         // s_bcnt1_i32_b32 s7, s6
+        0xd7650002, 0x020100c1,             // v_mbcnt_lo_u32_b32 v2, -1, 0
+        0x36040481,                         // v_and_b32 v2, 1, v2
+        0xd70f1503, 0x020204c1,             // v_add_co_u32 v3, s21, -1, v2
+        0xd70f1403, 0x02020480,             // v_add_co_u32 v3, s20, 0, v2
+        0xd7640004, 0x02010015,             // v_bcnt_u32_b32 v4, s21, 0
+        0x7e080d04, 0x7e0a0c07, 0x7e0c02f2, // convert v4 and s7 to float, set v6 to 1.0
+        0xf800180f, 0x06060504, 0xbf810000, // exp mrt0 v4, v5, v6, v6 done vm; end
+    ];
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let ps = super::PsInterface { inputs: vec![el("SV_Position", 0, 1, 3, 0, 15)],
+        outputs: vec![el("SV_Target", 0, 64, 3, 0, 15)], input_ena: 0x300, attrs: None, early_depth: false };
+    let t = translate(&code, &Options { wave64: false, mode: Mode::Pixel(ps), ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let ps = super::dxc::compile(&t.hlsl, "main", "ps_6_6", &[]).unwrap();
+    let vs = super::dxc::compile("float4 main(float2 p:POSITION):SV_Position { return float4(p,0.5,1); }",
+        "main", "vs_6_6", &[]).unwrap();
+    let layout = [runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 }];
+    let triangles = [-1.,-1., 1.,-1., -1.,1., 1.,-1., 1.,1., -1.,1.];
+    let pixels = runner::draw(&vs, &ps, &layout, &triangles, 8, &[], &[], 32, [-99.; 4]).unwrap();
+    assert_eq!(pixels.len(), 1024);
+    for (i, c) in pixels.iter().enumerate() {
+        assert_eq!((c[2], c[3]), (1., 1.), "raster coverage at {i}");
+        assert!((1.0..=16.0).contains(&c[1]), "odd active lanes at {i}: {c:?}");
+        assert_eq!(c[0], c[1], "mask popcount at {i}");
+    }
 }
 
 /// VS + PS pair recompiled to graphics stages and drawn on the GPU: VS inputs from the
