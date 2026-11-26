@@ -621,6 +621,10 @@ struct Class {
     iface: &'static Iface,
     public: usize,
     scanned: usize,
+    /// When `orig` lies outside any loaded module (e.g., Agility SDK 1.620+ heap-allocated open
+    /// command-list vtables, #2588), snapshot the copied runtime method slots so `class_for` only
+    /// reuses `ext` while the live table at `orig` still holds the exact same methods.
+    copied: Option<Box<[usize]>>,
 }
 
 static CLASSES: Mutex<Vec<Class>> = Mutex::new(Vec::new());
@@ -728,11 +732,25 @@ pub unsafe fn adopt(obj: *mut c_void, kind: Kind) {
     *(obj as *mut usize) = ext;
 }
 
+unsafe fn find_matching_class(classes: &[Class], orig: usize, kind: Kind, ot: *const usize) -> Option<usize> {
+    classes
+        .iter()
+        .rev()
+        .find(|c| {
+            c.orig == orig
+                && c.kind == kind
+                && c.copied.as_ref().is_none_or(|saved| {
+                    saved.iter().enumerate().all(|(i, &want)| *ot.add(i) == want)
+                })
+        })
+        .map(|c| c.ext)
+}
+
 unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
-    if let Some(c) = CLASSES.lock().unwrap().iter().find(|c| c.orig == orig && c.kind == kind) {
-        return c.ext;
-    }
     let ot = orig as *const usize;
+    if let Some(ext) = find_matching_class(&CLASSES.lock().unwrap(), orig, kind, ot) {
+        return ext;
+    }
     // most derived PC interface this object implements
     let chain = layout::chain(kind.base());
     let qi: QiFn = std::mem::transmute(*ot);
@@ -835,6 +853,11 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
             v[1 + i] = super::guard::make_tracer(v[1 + i], name);
         }
     }
+    let copied = (module_of(orig) == 0).then(|| (0..scanned).map(|i| *ot.add(i)).collect::<Vec<usize>>().into_boxed_slice());
+    let mut classes = CLASSES.lock().unwrap();
+    if let Some(ext) = find_matching_class(&classes, orig, kind, ot) {
+        return ext;
+    }
     let leaked: &'static [usize] = Box::leak(v.into_boxed_slice());
     let ext = leaked.as_ptr() as usize + 8;
     EXTS.lock().unwrap().get_or_insert_with(HashSet::new).insert(ext);
@@ -844,7 +867,7 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
         scanned - public,
         crate::modules::describe_address(orig)
     );
-    CLASSES.lock().unwrap().push(Class { orig, kind, ext, iface, public, scanned });
+    classes.push(Class { orig, kind, ext, iface, public, scanned, copied });
     ext
 }
 
@@ -9044,6 +9067,7 @@ mod mesh_stream_tests {
             iface,
             public: iface.methods.len(),
             scanned: iface.methods.len(),
+            copied: None,
         });
         ABI_RS_SAMPLERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(key.clone(), 0x1234_5678);
         let _cleanup = Cleanup { ext: ext_vtbl, key };
@@ -9898,5 +9922,81 @@ mod pso_release_tests {
         }
         assert_eq!(p.known_when_freed, Some(false));
         assert!(!is_translated_compute(this as usize));
+    }
+}
+#[cfg(test)]
+mod heap_vtable_tests {
+    use super::*;
+
+    /// Regression for #2588: when Agility SDK 1.620+ allocates an open command list's vtable in
+    /// heap memory (outside any loaded module) and a later list reuses that same heap address with
+    /// different runtime method slots (e.g., compute list -> direct list `ClearDepthStencilView`),
+    /// `class_for` must not hand back the stale extended vtable.
+    #[test]
+    fn class_for_rebuilds_when_heap_vtable_reused_with_different_methods() {
+        unsafe extern "system" fn fake_qi(_this: *mut c_void, _iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+            if !out.is_null() {
+                *out = std::ptr::null_mut();
+            }
+            -2147467262 // E_NOINTERFACE
+        }
+        unsafe extern "system" fn fake_ref(_this: *mut c_void) -> u32 { 1 }
+        unsafe extern "system" fn method_a(_this: *mut c_void) {}
+        unsafe extern "system" fn method_b(_this: *mut c_void) {}
+
+        let base_iface = layout::find(Kind::CommandList.base()).unwrap();
+        let n = base_iface.methods.len();
+        // Heap-allocated vtable (`module_of(orig) == 0`) with a trailing sentinel `0` so scanning
+        // stops cleanly at `n`.
+        let mut heap_vtbl = vec![method_a as usize; n + 1];
+        heap_vtbl[0] = fake_qi as usize;
+        heap_vtbl[1] = fake_ref as usize;
+        heap_vtbl[2] = fake_ref as usize;
+        heap_vtbl[n] = 0;
+
+        let orig = heap_vtbl.as_ptr() as usize;
+        assert_eq!(module_of(orig), 0, "test vtable must live outside any loaded module");
+
+        struct Cleanup(usize);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let mut exts = Vec::new();
+                CLASSES.lock().unwrap().retain(|c| {
+                    if c.orig == self.0 {
+                        exts.push(c.ext);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if let Some(set) = EXTS.lock().unwrap().as_mut() {
+                    for e in exts {
+                        set.remove(&e);
+                    }
+                }
+            }
+        }
+        let _cleanup = Cleanup(orig);
+
+        let mut obj = orig;
+        let obj_ptr = &mut obj as *mut usize as *mut c_void;
+        unsafe {
+            let ext1 = class_for(obj_ptr, orig, Kind::CommandList);
+            assert_eq!(class_for(obj_ptr, orig, Kind::CommandList), ext1, "unchanged heap vtable reuses cached class");
+
+            // Simulate a released compute list's heap vtable address reused by a direct list
+            // (changing slot 47 `ClearDepthStencilView` and unhooked slot 5 `SetPrivateData`).
+            heap_vtbl[5] = method_b as usize;
+            heap_vtbl[47] = method_b as usize;
+            let ext2 = class_for(obj_ptr, orig, Kind::CommandList);
+            assert_ne!(ext2, ext1, "reused heap vtable with changed runtime methods must not reuse stale ext");
+            assert_eq!(*(ext2 as *const usize).add(5), method_b as usize);
+            assert_eq!(class_for(obj_ptr, orig, Kind::CommandList), ext2, "matching new methods reuse ext2");
+
+            // Restoring original slots hits ext1 again cleanly without unbounded growth.
+            heap_vtbl[5] = method_a as usize;
+            heap_vtbl[47] = method_a as usize;
+            assert_eq!(class_for(obj_ptr, orig, Kind::CommandList), ext1);
+        }
     }
 }
